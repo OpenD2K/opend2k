@@ -137,6 +137,28 @@ desktops); without it the page links to the release. Then:
 
 Without the pack, Enhanced uses the original sprites and 3D shows the built-in models and sprites.
 
+## Controls
+
+The original mouse scheme is the default (Options → Controls: Original / Modern). The most useful keys:
+
+| Input | Action |
+|---|---|
+| Left click / drag | select units; with units selected: move, attack (Original scheme) |
+| Right click | Original: deselect · Modern: move / attack |
+| Ctrl + click | force attack (any unit, building or the ground) |
+| Alt + click | force move (crushers drive over infantry) |
+| S / D | stop / deploy (MCV) |
+| Ctrl+1..9 / 1..9 | assign / recall control groups |
+| Right drag, arrow keys | scroll the map · mouse wheel: zoom |
+| Tab | (Enhanced / 3D) hold to see the original 1998 graphics |
+| Esc / P | pause menu |
+| **Factory rally point** | select one of your factories (barracks, factories, starport) with no units selected, then Alt + click on the ground (Original) or right click (Modern); new units drive there. The same click on the factory clears it. Options → Factory rally points |
+| **Production queue** (Extended, default) | unit icon: left click +1, Shift + left +10, **right click: build forever (∞)**, right click on ∞: stop, Ctrl + right click: one fewer. Options → Production queue: Original for the 1998 behaviour |
+| **3D camera** | Q / E rotate, Page Up / Down or Ctrl + wheel tilt, middle drag rotate + tilt, Home reset |
+
+Touch (iPad / iPhone / Android): tap to select / order, two-finger drag to scroll, pinch to zoom, long press for
+tooltips. All controls and options: [docs/STATUS.md](docs/STATUS.md).
+
 ## Building from source
 
 Short version (every platform, options and packaging in [docs/building.md](docs/building.md)):
@@ -177,6 +199,10 @@ Ghidra) and writing new code that behaves the same — no original code or data 
 repository. Source comments name the original functions and addresses they correspond to. The file
 formats are described in [docs/formats.md](docs/formats.md). The 3D models are our own, built by the
 procedural Blender scripts in `tools/models/`.
+
+OpenD2K was built with heavy help from AI: the owner directed and play-tested it, and Claude Code (Anthropic's AI
+coding assistant) did most of the reverse engineering, programming and the Blender scripts that generate the 3D
+models. No original game assets are included or copied.
 
 ## Credits
 
