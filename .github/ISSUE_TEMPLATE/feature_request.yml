@@ -1,0 +1,13 @@
+name: Idea / feature request
+description: Suggest an improvement (new features always come as an option; the original experience stays)
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes: {label: Your idea, description: What should change and why?}
+    validations: {required: true}
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [Gameplay / controls, Graphics, 3D mode, Interface, Sound / music, Mobile, Modding / community campaigns, Other]

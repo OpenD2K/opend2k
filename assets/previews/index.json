@@ -1,0 +1,684 @@
+{
+  "format": 1,
+  "scene_version": 2,
+  "engine_version": "0.0.1",
+  "language": "en",
+  "map_hash": "e8f91ba9cfb13fb9",
+  "terrain_assets": true,
+  "packs": {
+    "opend2k-redesign": {
+      "fingerprint": "b9d17af8ef98105b",
+      "version": "",
+      "content_sha256": "69fab49f36c37fe0ea023a40a3ba14fcc754787e8a061964cc257264567d9943"
+    }
+  },
+  "pictures": [
+    {
+      "file": "preview-dc9a011720425821.png",
+      "watermark": true,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Original",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|original"
+    },
+    {
+      "file": "preview-81312650afb1a3f0.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Original: Graphics mode = Enhanced",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-c43b87b9aee3a6f9.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Original: Graphics mode = 3D",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d1sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-289bc6cd5024f565.png",
+      "watermark": true,
+      "shot": "terrain",
+      "w": 459,
+      "h": 380,
+      "label": "Original (terrain)",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|original"
+    },
+    {
+      "file": "preview-8d5f9b1b3efb1676.png",
+      "watermark": true,
+      "shot": "battle",
+      "w": 480,
+      "h": 380,
+      "label": "Original (battle)",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|original"
+    },
+    {
+      "file": "preview-38c3b0e4c90e0943.png",
+      "watermark": true,
+      "shot": "base",
+      "w": 480,
+      "h": 380,
+      "label": "Original (base)",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|original"
+    },
+    {
+      "file": "preview-859df44fcac2ad64.png",
+      "watermark": false,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced (terrain)",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-859df74fcac2b27d.png",
+      "watermark": true,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Terrain = Original tiles",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t2d0"
+    },
+    {
+      "file": "preview-859df64fcac2b0ca.png",
+      "watermark": true,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Terrain = Upscaled",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t2d1"
+    },
+    {
+      "file": "preview-859df54fcac2af17.png",
+      "watermark": false,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Terrain = Designed",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t2d2"
+    },
+    {
+      "file": "preview-1bab93ebd1908001.png",
+      "watermark": true,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced: Art = Original",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|original|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-a58fd64a3fc3be39.png",
+      "watermark": true,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced: Art = Upscaled",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|upscaled|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-8f4750de24e746a3.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced (battle)",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-0bad028d3334c8be.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Effects = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx0sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-1d1c8510ebe8b4b2.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced (base)",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-137c2f35ab1e8c9e.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Time of day = Day",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod0li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-e552641a89c1ca19.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Time of day = Dawn",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod1li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-859f42b590d54a88.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Time of day = Dusk",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod2li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-2eefb3a9d9d4ad83.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Time of day = Night",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod3li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-72c832d7d7dac6bb.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Lighting = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li0hdr1|t2d3"
+    },
+    {
+      "file": "preview-811af45497345ffd.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced: Quality = Low",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr0|t2d3"
+    },
+    {
+      "file": "preview-5f0f8159e8dc4117.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: HDR rendering = Off",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr0|t2d3"
+    },
+    {
+      "file": "preview-d28b4361d017d5cb.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced: Shroud = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh0hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-48690153ea8c7fa3.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced: Panel transparency = Light",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt1tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-0563d78cfdb9e18e.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced: Panel transparency = Medium",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt2tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-cf2c6fa8cc78a316.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Health bars = Damaged",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb1pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-99a3e4d1ac6762d5.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced: Health bars = Always",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb2pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-9892c90bb8541ca4.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-d3b76cd1786dec00.png",
+      "watermark": false,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "3D (terrain)",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-12e6738130e1836d.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D: Art = Original",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|original|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-7c2ac59603908555.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D: Art = Upscaled",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|upscaled|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-c1e33ead5ef33b9f.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "3D (battle)",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-1f31e5ff6357d6ae.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Effects = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx0sh1hb0pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-bbe89be2c12cc03a.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "3D (base)",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-7e9b7b51c6c4ab16.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Time of day = Day",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod0li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-fcfe814e3d072495.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Time of day = Dawn",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod1li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-78c67f952f9c8d70.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Time of day = Dusk",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod2li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-20b7a7358ea51397.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Time of day = Night",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod3li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-b9ba6faaaaac086f.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Lighting = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li0hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-af3892220d143eb2.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D: Quality = Low",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr0|t3d2sh1m1a1|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-3dfd7d89fea46ebf.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D: Quality = Medium",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m2a4|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-fa591296b4f8be8b.png",
+      "watermark": false,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "3D: HDR rendering = Off",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr0|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-13a347c965dd1a2a.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Anti-aliasing (3D) = Off",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m1a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-e6e601335be585f1.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Anti-aliasing (3D) = 2x",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m2a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-71a681ebe1ab3ff2.png",
+      "watermark": false,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Texture filtering (3D) = Off",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a1|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-d6d2f6c6317eab25.png",
+      "watermark": false,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Texture filtering (3D) = 4x",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a4|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-a4de97713d6512a3.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D: Shroud = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh0hb0pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-acdbfcd67e9c11a3.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D: Panel transparency = Light",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt1tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-b9fde1ff74ac4f72.png",
+      "watermark": false,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D: Panel transparency = Medium",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt2tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-0ce00e1854e8ec56.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Health bars = Damaged",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb1pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-fcc0a671f8eb963d.png",
+      "watermark": false,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Health bars = Always",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb2pt0tod4li1hdr1|t3d2sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-7e723df8fc825b1e.png",
+      "watermark": true,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "3D: 3D terrain = Original tiles",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d0sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-4b98f84fd9747505.png",
+      "watermark": false,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "3D: 3D terrain = Designed",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d1sh1m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-2c76ea0fcbb819a5.png",
+      "watermark": false,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "3D: Sun shadows = Off",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh0m4a16|models:pack:opend2k-redesign@b9d17af8ef98105b"
+    },
+    {
+      "file": "preview-a1fa2cfc60a03877.png",
+      "watermark": true,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "3D: 3D models = PS1",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|3d|pack:opend2k-redesign@b9d17af8ef98105b|fx1sh1hb0pt0tod4li1hdr1|t3d2sh1m4a16|ps1:disc"
+    },
+    {
+      "file": "preview-1d6d948f4c674a95.png",
+      "watermark": true,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack (terrain)",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|enhanced|original|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-1d6d918f4c67457c.png",
+      "watermark": true,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Terrain = Original tiles",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|enhanced|original|fx1sh1hb0pt0tod4li1hdr1|t2d0"
+    },
+    {
+      "file": "preview-1d6d928f4c67472f.png",
+      "watermark": true,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Terrain = Upscaled",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|enhanced|original|fx1sh1hb0pt0tod4li1hdr1|t2d1"
+    },
+    {
+      "file": "preview-1d6d938f4c6748e2.png",
+      "watermark": true,
+      "shot": "terrain",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Terrain = Designed",
+      "key": "s2|map:e8f91ba9cfb13fb9|terrain|enhanced|original|fx1sh1hb0pt0tod4li1hdr1|t2d2"
+    },
+    {
+      "file": "preview-15bb80eecfb72cb6.png",
+      "watermark": true,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack (battle)",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|original|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-8a45e26a71d924bb.png",
+      "watermark": true,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Effects = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|original|fx0sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-05c4fe135424a22b.png",
+      "watermark": true,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack (base)",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|original|fx1sh1hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-1d3bb88c0966b95f.png",
+      "watermark": true,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Time of day = Day",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|original|fx1sh1hb0pt0tod0li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-340738308dc6dc14.png",
+      "watermark": true,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Time of day = Dawn",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|original|fx1sh1hb0pt0tod1li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-3b751ac233cb9435.png",
+      "watermark": true,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Time of day = Dusk",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|original|fx1sh1hb0pt0tod2li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-426143366c159efa.png",
+      "watermark": true,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Time of day = Night",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|original|fx1sh1hb0pt0tod3li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-079099660ecbda22.png",
+      "watermark": true,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Lighting = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|original|fx1sh1hb0pt0tod4li0hdr1|t2d3"
+    },
+    {
+      "file": "preview-1e8465e7ec65e884.png",
+      "watermark": true,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced without the art pack: Quality = Low",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|original|fx1sh1hb0pt0tod4li1hdr0|t2d3"
+    },
+    {
+      "file": "preview-e722d85692263f36.png",
+      "watermark": true,
+      "shot": "base",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: HDR rendering = Off",
+      "key": "s2|map:e8f91ba9cfb13fb9|base|enhanced|original|fx1sh1hb0pt0tod4li1hdr0|t2d3"
+    },
+    {
+      "file": "preview-6303cc95cf4118ae.png",
+      "watermark": true,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced without the art pack: Shroud = Classic",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|original|fx1sh0hb0pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-ec219344bff80b4e.png",
+      "watermark": true,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced without the art pack: Panel transparency = Light",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|original|fx1sh1hb0pt1tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-e7ee1a6db7b24c63.png",
+      "watermark": true,
+      "shot": "overview",
+      "w": 640,
+      "h": 400,
+      "label": "Enhanced without the art pack: Panel transparency = Medium",
+      "key": "s2|map:e8f91ba9cfb13fb9|overview|enhanced|original|fx1sh1hb0pt2tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-7de16b1a2d99dcc3.png",
+      "watermark": true,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Health bars = Damaged",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|original|fx1sh1hb1pt0tod4li1hdr1|t2d3"
+    },
+    {
+      "file": "preview-1c7c6c8733d49530.png",
+      "watermark": true,
+      "shot": "battle",
+      "w": 480,
+      "h": 400,
+      "label": "Enhanced without the art pack: Health bars = Always",
+      "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|original|fx1sh1hb2pt0tod4li1hdr1|t2d3"
+    }
+  ],
+  "total_bytes": 10219532
+}

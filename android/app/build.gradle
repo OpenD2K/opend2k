@@ -1,0 +1,76 @@
+// OpenD2K Android app (docs/android.md). The native code is the repository's CMakeLists.txt (ANDROID branch:
+// libmain.so) plus SDL3 (libSDL3.so, fetched by cmake/FetchSDL.cmake); the Java side is SDL's own SDLActivity
+// from the SDL source tree (`sdl.dir`), so it always matches the native SDL version.
+plugins {
+    id 'com.android.application'
+}
+
+def localProps = new Properties()
+def lp = rootProject.file('local.properties')
+if (lp.exists()) lp.withInputStream { localProps.load(it) }
+def sdlDirProp = project.findProperty('sdl.dir') ?: localProps.getProperty('sdl.dir') ?: '../build/_deps/sdl3-src'
+def sdlSrc = new File(sdlDirProp).isAbsolute() ? new File(sdlDirProp) : new File(rootProject.projectDir, sdlDirProp)
+sdlSrc = sdlSrc.canonicalFile
+def sdlJava = new File(sdlSrc, 'android-project/app/src/main/java')
+if (!sdlJava.isDirectory()) throw new GradleException("SDL source tree not found: ${sdlSrc} (set sdl.dir; docs/android.md)")
+
+android {
+    namespace = "com.opend2k.app"
+    compileSdk 35
+    ndkVersion = "27.2.12479018"
+    defaultConfig {
+        applicationId "com.opend2k.app"
+        minSdkVersion 26          // Android 8.0; Vulkan is available on most devices from here
+        targetSdkVersion 35
+        versionCode 1
+        versionName "0.0.1"
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_PLATFORM=android-26", "-DANDROID_STL=c++_shared",
+                          "-DD2K_FETCH_SDL=ON", "-DFETCHCONTENT_SOURCE_DIR_SDL3=${sdlSrc.absolutePath.replace('\\', '/')}",
+                          "-DD2K_APP_NAME=OpenD2K"
+                abiFilters 'arm64-v8a', 'x86_64'
+            }
+        }
+    }
+    signingConfigs {
+        release {
+            // tools/release/package_android.sh passes the keystore (never committed) through the environment:
+            // ORG_GRADLE_PROJECT_d2kKeystore / d2kStorePass / d2kKeyAlias / d2kKeyPass (no passwords on command lines).
+            if (project.hasProperty('d2kKeystore')) {
+                storeFile file(project.property('d2kKeystore'))
+                storePassword project.property('d2kStorePass')
+                keyAlias project.property('d2kKeyAlias')
+                keyPassword project.property('d2kKeyPass')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (project.hasProperty('d2kKeystore')) signingConfig signingConfigs.release
+        }
+    }
+    sourceSets.main {
+        java.srcDirs = [sdlJava, 'src/main/java']  // SDL's activity + ours (org.opend2k.HttpBridge)
+        // APK assets: previews/ = the repository's assets/previews (the pre-rendered Graphics / welcome page
+        // previews; the game opens "previews/index.json" through SDL_IOFromFile, platform/preset_previews.cpp).
+        assets.srcDirs = [new File(buildDir, 'd2k-assets')]
+    }
+    externalNativeBuild {
+        cmake {
+            path '../../CMakeLists.txt'
+            version '3.31.6'
+        }
+    }
+    lint {
+        abortOnError = false
+    }
+}
+
+def copyD2kAssets = tasks.register('copyD2kAssets', Copy) {
+    from rootProject.file('../assets/previews')
+    into new File(buildDir, 'd2k-assets/previews')
+}
+preBuild.dependsOn copyD2kAssets

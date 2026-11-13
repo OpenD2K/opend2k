@@ -1,0 +1,107 @@
+# Builds OpenD2K on macOS (arm64), Windows (MSVC) and Linux (Ubuntu), runs the tests that need no
+# game data (formats_test / game_test skip their data tests when the original files are absent -
+# CI never has them) and uploads the builds. No game data is ever downloaded or packaged.
+name: build
+
+# Automatic runs are OFF (owner 2026-11-12: the free GitHub Actions minutes ran out; the macOS job counts 10x).
+# Run it by hand from the Actions tab ("Run workflow") or: gh workflow run build --ref <branch>
+# To turn automatic runs back on, restore the push/pull_request triggers below and `gh workflow enable build`.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  # No game data in CI: point the tests at a folder that does not exist.
+  D2K_TEST_DATA_DIR: ${{ github.workspace }}/no-game-data
+
+jobs:
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: brew install ninja sdl3
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+          -DD2K_TEST_DATA_DIR="$D2K_TEST_DATA_DIR"
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent "build/Dune 2000.app" "dist/OpenD2K-macos-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenD2K-macos-arm64
+          path: dist/OpenD2K-macos-arm64.zip
+
+  windows:
+    name: Windows (MSVC x64)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure
+        shell: pwsh
+        # SDL3 is downloaded and built (cmake/FetchSDL.cmake); dxc from the Windows SDK compiles the
+        # DXIL shaders (D2K_DXIL=ON fails the job if it is missing, so the D3D12 path stays built).
+        run: >
+          cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$env:BUILD_TYPE"
+          -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+          -DD2K_DXIL=ON -DD2K_FETCH_ZLIB=ON
+          "-DD2K_TEST_DATA_DIR=$env:D2K_TEST_DATA_DIR"
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: cmake --install build --prefix dist/OpenD2K
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenD2K-windows-x64
+          path: dist/OpenD2K
+
+  linux:
+    name: Linux (Ubuntu x64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        # SDL3 is built from source (Ubuntu 24.04 has no SDL3 package): its X11 / Wayland / audio
+        # development packages (SDL's docs/README-linux.md), plus glslang for the shader check.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build pkg-config zlib1g-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libjack-dev libsndio-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
+            libxss-dev libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev \
+            libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev \
+            libwayland-dev libdecor-0-dev liburing-dev glslang-tools spirv-tools
+      - name: Shaders (HLSL -> SPIR-V compiles and validates)
+        run: tools/compile_shaders.sh --check
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+          -DD2K_TEST_DATA_DIR="$D2K_TEST_DATA_DIR"
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          cmake --install build --prefix dist/OpenD2K
+          tar -C dist -czf dist/OpenD2K-linux-x64.tar.gz OpenD2K
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenD2K-linux-x64
+          path: dist/OpenD2K-linux-x64.tar.gz

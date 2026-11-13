@@ -1,0 +1,176 @@
+// cheats rows of the UI text table (render/ui_text.cpp): {English, French, German, Spanish, Russian}.
+// Cheat menu (platform/cheat_menu.cpp), including the placement hint on the battlefield (Play font).
+    // Tabs
+    {"Money", "Argent", "Geld", "Dinero", "Деньги"},
+    {"Tech level", "Niveau tech", "Techstufe", "Nivel tec.", "Технологии"},
+    {"Build list", "Constructions", "Bauliste", "Lista", "Список"},
+    {"Delivery", "Livraison", "Lieferung", "Entrega", "Доставка"},
+    {"Reinforce", "Renforts", "Verstärkung", "Refuerzos", "Подкрепл."},
+    {"Spawn", "Créer", "Erschaffen", "Crear", "Создать"},
+    {"Toggles", "Divers", "Sonstiges", "Varios", "Разное"},
+    // Edges
+    {"Nearest", "Le plus proche", "Nächster", "Más cercano", "Ближайший"},
+    {"North", "Nord", "Norden", "Norte", "Север"},
+    {"East", "Est", "Osten", "Este", "Восток"},
+    {"South", "Sud", "Süden", "Sur", "Юг"},
+    {"West", "Ouest", "Westen", "Oeste", "Запад"},
+    // Houses / sides
+    {"Atreides", "Atréides", "Atreides", "Atreides", "Атрейдесы"},
+    {"Harkonnen", "Harkonnen", "Harkonnen", "Harkonnen", "Харконнены"},
+    {"Ordos", "Ordos", "Ordos", "Ordos", "Ордосы"},
+    {"Emperor", "Empereur", "Imperator", "Emperador", "Император"},
+    {"Fremen", "Fremen", "Fremen", "Fremen", "Фримены"},
+    {"Smugglers", "Contrebandiers", "Schmuggler", "Contrabandistas", "Контрабандисты"},
+    {"Mercenaries", "Mercenaires", "Söldner", "Mercenarios", "Наёмники"},
+    {"Sandworm", "Ver des sables", "Sandwurm", "Gusano de arena", "Песчаный червь"},
+    {"Neutral", "Neutre", "Neutral", "Neutral", "Нейтралы"},
+    {" (you)", " (vous)", " (Sie)", " (tú)", " (вы)"},
+    {" (AI)", " (IA)", " (KI)", " (IA)", " (ИИ)"},
+    {" - empty", " - vide", " - leer", " - vacío", " - пусто"},
+    {" - %d bld / %d units", " - %d bât. / %d unités", " - %d Geb. / %d Einh.", " - %d edif. / %d unid.", " - %d зд. / %d юн."},
+    {"Building %d", "Bâtiment %d", "Gebäude %d", "Edificio %d", "Здание %d"},
+    {"Unit %d", "Unité %d", "Einheit %d", "Unidad %d", "Юнит %d"},
+    // Frame
+    {"CHEATS", "TRICHES", "CHEATS", "TRUCOS", "ЧИТЫ"},
+    {"cheats used in this game", "triches utilisées dans cette partie", "Cheats in diesem Spiel benutzt",
+     "trucos usados en esta partida", "в этой игре были читы"},
+    {"Side", "Camp", "Seite", "Bando", "Сторона"},
+    {"Close", "Fermer", "Schließen", "Cerrar", "Закрыть"},
+    // Money
+    {"Credits: %d", "Crédits : %d", "Credits: %d", "Créditos: %d", "Кредиты: %d"},
+    {"   (now %d, applied when the game runs)", "   (actuel %d, appliqué à la reprise)", "   (jetzt %d, gilt, sobald das Spiel läuft)",
+     "   (ahora %d, se aplica al reanudar)", "   (сейчас %d, применится после паузы)"},
+    {"+%d credits", "+%d crédits", "+%d Credits", "+%d créditos", "+%d кредитов"},
+    {"Zero", "Zéro", "Null", "Cero", "Ноль"},
+    {"Credits set to %d", "Crédits fixés à %d", "Credits auf %d gesetzt", "Créditos fijados en %d", "Кредиты: %d"},
+    {"Exact amount", "Montant exact", "Genauer Betrag", "Cantidad exacta", "Точная сумма"},
+    {"Set exactly", "Fixer", "Setzen", "Fijar", "Установить"},
+    {"Credits are cash plus stored spice. Setting an exact amount also drops pending (not yet counted) payouts. "
+     "Left/Right on the slider step by 100.",
+     "Les crédits = argent + épice stockée. Fixer un montant exact annule aussi les gains en attente (pas encore "
+     "comptés). Gauche/Droite sur le curseur : pas de 100.",
+     "Credits = Bargeld + gelagertes Spice. Ein genauer Betrag verwirft auch ausstehende (noch nicht gezählte) "
+     "Auszahlungen. Links/Rechts am Regler: Schritte von 100.",
+     "Créditos = dinero + especia almacenada. Fijar una cantidad exacta también anula los pagos pendientes (aún "
+     "no contados). Izq./Der. en el control: pasos de 100.",
+     "Кредиты = деньги + спайс в хранилищах. Точная сумма также отменяет ещё не начисленные выплаты. "
+     "Влево/вправо на ползунке - шаг 100."},
+    // Tech
+    {"Tech level: %d", "Niveau tech : %d", "Techstufe: %d", "Nivel tecnológico: %d", "Уровень технологий: %d"},
+    {"Tech level %d", "Niveau tech %d", "Techstufe %d", "Nivel tec. %d", "Уровень технологий %d"},
+    {"The tech level gates sidebar options and upgrades (prerequisite buildings are still needed). Campaign missions "
+     "use 1-8; level 9 also unlocks construction yards. Use Build list to force single buildings and units on or off.",
+     "Le niveau tech limite les choix de construction et les améliorations (les bâtiments requis restent nécessaires). "
+     "Les missions de campagne utilisent 1-8 ; le niveau 9 débloque aussi les chantiers de construction. L'onglet "
+     "Constructions force un bâtiment ou une unité.",
+     "Die Techstufe bestimmt Bauoptionen und Aufrüstungen (Voraussetzungsgebäude sind weiter nötig). Kampagnenmissionen "
+     "nutzen 1-8; Stufe 9 schaltet auch Bauhöfe frei. Mit der Bauliste lassen sich einzelne Gebäude und Einheiten "
+     "erzwingen oder sperren.",
+     "El nivel tecnológico limita las opciones de construcción y las mejoras (siguen haciendo falta los edificios "
+     "previos). Las misiones de campaña usan 1-8; el nivel 9 también desbloquea centros de construcción. Usa Lista "
+     "para forzar edificios y unidades sueltas.",
+     "Уровень технологий открывает пункты строительства и улучшения (нужные здания всё равно требуются). Миссии "
+     "кампании используют 1-8; уровень 9 открывает и заводы конструкций. Во вкладке Список можно включить или "
+     "запретить отдельные здания и юниты."},
+    // Build list
+    {"Units", "Unités", "Einheiten", "Unidades", "Юниты"},
+    {"Reset all", "Tout réinitialiser", "Alles zurücksetzen", "Restablecer", "Сбросить всё"},
+    {"All overrides back to the original rules", "Retour aux règles d'origine", "Alles wieder nach Originalregeln",
+     "Todo vuelve a las reglas originales", "Всё снова по исходным правилам"},
+    {"Click: Default -> Allowed (green) -> Blocked (red); blue = on the sidebar now. Allowed ignores prerequisites, "
+     "tech level and house.",
+     "Clic : Défaut -> Autorisé (vert) -> Bloqué (rouge) ; bleu = disponible. Autorisé ignore prérequis, niveau tech et maison.",
+     "Klick: Standard -> Erlaubt (grün) -> Gesperrt (rot); blau = jetzt baubar. Erlaubt ignoriert Voraussetzungen, Techstufe und Haus.",
+     "Clic: Normal -> Permitido (verde) -> Bloqueado (rojo); azul = disponible. Permitido ignora requisitos, nivel y casa.",
+     "Щелчок: Обычно -> Разрешено (зел.) -> Запрещено (красн.); синий = доступно сейчас. Разрешено - без условий, уровня и Дома."},
+    {"ON", "OUI", "AN", "SÍ", "ВКЛ"},
+    {"OFF", "NON", "AUS", "NO", "ВЫКЛ"},
+    {"allowed", "autorisé", "erlaubt", "permitido", "разрешено"},
+    {"blocked", "bloqué", "gesperrt", "bloqueado", "запрещено"},
+    {"default", "défaut", "Standard", "normal", "обычно"},
+    {"default (on the sidebar now)", "défaut (disponible)", "Standard (jetzt baubar)", "normal (disponible)",
+     "обычно (доступно сейчас)"},
+    {"default (not available now)", "défaut (indisponible)", "Standard (jetzt nicht baubar)", "normal (no disponible)",
+     "обычно (сейчас недоступно)"},
+    // Delivery
+    {"By starport frigate (no stock, price or 6-unit limits)", "Par frégate de l'astroport (sans limite de stock, prix ni 6 unités)",
+     "Per Fregatte des Raumhafens (ohne Vorrat-, Preis- oder 6er-Limit)", "Por fragata del astropuerto (sin límite de stock, precio ni 6 unidades)",
+     "Фрегатом космопорта (без запаса, цен и лимита в 6)"},
+    {"By carryall to the base (no starport)", "Par transporteur à la base (pas d'astroport)", "Per Transporter zur Basis (kein Raumhafen)",
+     "Por transporte a la base (sin astropuerto)", "Керриолом на базу (нет космопорта)"},
+    {"  -  %d waiting for a trip", "  -  %d en attente", "  -  %d warten auf Transport", "  -  %d en espera", "  -  ждут отправки: %d"},
+    {"   (click +1, Shift+click -1)", "   (clic +1, Maj+clic -1)", "   (Klick +1, Umschalt+Klick -1)", "   (clic +1, Mayús+clic -1)",
+     "   (щелчок +1, Shift+щелчок -1)"},
+    {"(pick a unit)", "(choisir une unité)", "(Einheit wählen)", "(elige una unidad)", "(выберите юнит)"},
+    {"Clear", "Vider", "Leeren", "Vaciar", "Очистить"},
+    {"Deliver %d unit", "Livrer %d unité", "%d Einheit liefern", "Entregar %d unidad", "Доставить: %d"},
+    {"Deliver %d units", "Livrer %d unités", "%d Einheiten liefern", "Entregar %d unidades", "Доставить: %d"},
+    {"%d units ordered for free (frigate)", "%d unités commandées gratuitement (frégate)", "%d Einheiten gratis bestellt (Fregatte)",
+     "%d unidades pedidas gratis (fragata)", "Бесплатно заказано: %d (фрегат)"},
+    {"%d units ordered for free (carryall)", "%d unités commandées gratuitement (transporteur)", "%d Einheiten gratis bestellt (Transporter)",
+     "%d unidades pedidas gratis (transporte)", "Бесплатно заказано: %d (керриол)"},
+    // Spawn
+    {"Lay concrete", "Poser des dalles", "Beton legen", "Poner hormigón", "Класть бетон"},
+    {"Count per click", "Nombre par clic", "Anzahl pro Klick", "Cantidad por clic", "Штук за щелчок"},
+    {"Pick a type", "Choisir un type", "Typ wählen", "Elige un tipo", "Выберите тип"},
+    {"%s for %s (side %d)", "%s pour %s (camp %d)", "%s für %s (Seite %d)", "%s para %s (bando %d)", "%s - %s (сторона %d)"},
+    {"Place on map", "Placer sur la carte", "Auf Karte setzen", "Colocar en el mapa", "Поставить на карту"},
+    // Placement hint above the cursor on the battlefield
+    {"Spawn %s (side %d) - Shift: keep, right click/Esc: stop", "Créer %s (camp %d) - Maj : continuer, clic droit/Échap : arrêter",
+     "%s erschaffen (Seite %d) - Umschalt: weiter, Rechtsklick/Esc: beenden",
+     "Crear %s (bando %d) - Mayús: seguir, clic derecho/Esc: parar",
+     "Создать: %s (сторона %d) - Shift: ещё, правый щелчок/Esc: стоп"},
+    {"Reinforcement drop point: %d units (side %d) - Shift: keep, right click/Esc: stop",
+     "Point de largage des renforts : %d unités (camp %d) - Maj : continuer, clic droit/Échap : arrêter",
+     "Abwurfpunkt der Verstärkung: %d Einheiten (Seite %d) - Umschalt: weiter, Rechtsklick/Esc: beenden",
+     "Punto de entrega de refuerzos: %d unidades (bando %d) - Mayús: seguir, clic derecho/Esc: parar",
+     "Точка высадки подкрепления: %d юн. (сторона %d) - Shift: ещё, правый щелчок/Esc: стоп"},
+    // Toggles
+    {"Reveal the whole map", "Révéler toute la carte", "Ganze Karte aufdecken", "Revelar todo el mapa", "Открыть всю карту"},
+    {"Map revealed", "Carte révélée", "Karte aufgedeckt", "Mapa revelado", "Карта открыта"},
+    {"Instant build for this side", "Construction instantanée pour ce camp", "Sofortbau für diese Seite",
+     "Construcción instantánea para este bando", "Мгновенная стройка для стороны"},
+    {"Instant build on", "Construction instantanée activée", "Sofortbau an", "Construcción instantánea activada", "Мгновенная стройка: вкл"},
+    {"Instant build off", "Construction instantanée désactivée", "Sofortbau aus", "Construcción instantánea desactivada",
+     "Мгновенная стройка: выкл"},
+    {"Reveal: removes the shroud for you (it does not come back). Instant build: buildings, units and upgrades finish in "
+     "one tick; they are still paid for. Ctrl+Shift+C opens this page during the game.",
+     "Révéler : retire le voile pour vous (il ne revient pas). Construction instantanée : bâtiments, unités et "
+     "améliorations finissent en un tick ; ils restent payants. Ctrl+Maj+C ouvre cette page en jeu.",
+     "Aufdecken: entfernt den Nebel für Sie (er kehrt nicht zurück). Sofortbau: Gebäude, Einheiten und Aufrüstungen "
+     "sind in einem Tick fertig; sie kosten trotzdem. Strg+Umschalt+C öffnet diese Seite im Spiel.",
+     "Revelar: quita la niebla para ti (no vuelve). Construcción instantánea: edificios, unidades y mejoras terminan "
+     "en un tick; se siguen pagando. Ctrl+Mayús+C abre esta página durante la partida.",
+     "Открыть карту: убирает туман войны (он не вернётся). Мгновенная стройка: здания, юниты и улучшения готовы за "
+     "один такт, но оплачиваются. Ctrl+Shift+C открывает эту страницу в игре."},
+    // Reinforcements
+    {"Click a unit: +1, Shift+click: -1", "Clic sur une unité : +1, Maj+clic : -1", "Einheit klicken: +1, Umschalt+Klick: -1",
+     "Clic en unidad: +1, Mayús+clic: -1", "Щелчок по юниту: +1, Shift+щелчок: -1"},
+    {"Now", "Maintenant", "Jetzt", "Ahora", "Сейчас"},
+    {"in %s", "dans %s", "in %s", "en %s", "через %s"},
+    {"When", "Quand", "Wann", "Cuándo", "Когда"},
+    {"From edge", "Depuis le bord", "Vom Rand", "Desde el borde", "С края"},
+    {"No units picked", "Aucune unité choisie", "Keine Einheiten gewählt", "Ninguna unidad elegida", "Юниты не выбраны"},
+    {"%d unit (%d carryall): ", "%d unité (%d transporteur) : ", "%d Einheit (%d Transporter): ", "%d unidad (%d transporte): ",
+     "%d юн. (керриолов: %d): "},
+    {"%d units (%d carryall): ", "%d unités (%d transporteur) : ", "%d Einheiten (%d Transporter): ", "%d unidades (%d transporte): ",
+     "%d юн. (керриолов: %d): "},
+    {"%d units (%d carryalls): ", "%d unités (%d transporteurs) : ", "%d Einheiten (%d Transporter): ", "%d unidades (%d transportes): ",
+     "%d юн. (керриолов: %d): "},
+    {"Order - drop at the %s base", "Commander - largage à la base %s", "Bestellen - Abwurf an der Basis (%s)",
+     "Pedir - soltar en la base (%s)", "Заказать - высадка на базе (%s)"},
+    {"%d units ordered for %s (%s)", "%d unités commandées pour %s (%s)", "%d Einheiten bestellt für %s (%s)",
+     "%d unidades pedidas para %s (%s)", "Заказано %d юн. для: %s (%s)"},
+    {"Order - pick the drop point...", "Commander - choisir le point...", "Bestellen - Abwurfpunkt wählen...",
+     "Pedir - elegir el punto...", "Заказать - выбрать точку..."},
+    {"Pending - none", "En attente - aucun", "Ausstehend - keine", "Pendientes - ninguno", "Ожидают - нет"},
+    {"Pending (%d)", "En attente (%d)", "Ausstehend (%d)", "Pendientes (%d)", "Ожидают (%d)"},
+    {"%s (%d): %d unit", "%s (%d) : %d unité", "%s (%d): %d Einheit", "%s (%d): %d unidad", "%s (%d): %d юн."},
+    {"%s (%d): %d units", "%s (%d) : %d unités", "%s (%d): %d Einheiten", "%s (%d): %d unidades", "%s (%d): %d юн."},
+    {" to %d,%d", " vers %d,%d", " nach %d,%d", " a %d,%d", " в %d,%d"},
+    {"arriving", "en approche", "im Anflug", "llegando", "прибывают"},
+    {"Cancel selected", "Annuler la sélection", "Auswahl abbrechen", "Cancelar selección", "Отменить выбранное"},
+    {"Reinforcement cancelled", "Renfort annulé", "Verstärkung abgebrochen", "Refuerzo cancelado", "Подкрепление отменено"},
+    {" (when the game runs)", " (à la reprise)", " (sobald das Spiel läuft)", " (al reanudar)", " (после паузы)"},
+    {"On", "Oui", "An", "Sí", "Вкл"},
+    {"Off", "Non", "Aus", "No", "Выкл"},

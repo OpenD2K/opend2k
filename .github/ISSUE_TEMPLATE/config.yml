@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ideas and questions (Discussions)
+    url: https://github.com/OpenD2K/opend2k/discussions
+    about: Share ideas for future updates, vote on others' ideas, ask questions about playing or modding.

@@ -1,0 +1,20 @@
+# Original game data (copyrighted) – never commit
+/game/
+# Build output
+/build/
+/build-ios/
+/build-ios-sim/
+# Ghidra projects / analysis caches
+/re/ghidra/
+*.gpr
+*.rep/
+.DS_Store
+/.venv/
+/ref/
+/.cache/
+__pycache__/
+# Generated art packs (derived from the original art) – never commit
+/artpacks/
+/build-*/
+tools/render_sprites/sheets/
+.claude/

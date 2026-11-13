@@ -1,0 +1,40 @@
+name: Bug report
+description: Something works differently from the original game or does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Please never attach original game files (they are copyrighted). Save games and screenshots are welcome."
+  - type: input
+    id: version
+    attributes: {label: OpenD2K version, placeholder: "0.0.1 (Options → Updates)"}
+    validations: {required: true}
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options: [macOS (Apple Silicon), macOS (Intel), Windows, Linux, iPhone / iPad, Android]
+    validations: {required: true}
+  - type: input
+    id: device
+    attributes: {label: Device / GPU, placeholder: "e.g. MacBook Pro M3, RTX 3080, Galaxy A16"}
+  - type: dropdown
+    id: graphics
+    attributes:
+      label: Graphics mode
+      options: [Original, Enhanced, 3D, Custom]
+  - type: dropdown
+    id: artpack
+    attributes: {label: Art pack installed, options: ["Yes", "No"]}
+  - type: input
+    id: where
+    attributes: {label: Mission / map, placeholder: "e.g. Atreides mission 4, skirmish 2PLAY1"}
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Steps, what you expected, what happened instead. Attach screenshots / a save game if you can.
+    validations: {required: true}
+  - type: textarea
+    id: original
+    attributes: {label: How does the original 1998 game behave here? (if known)}

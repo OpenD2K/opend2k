@@ -1,0 +1,14 @@
+# Normalise line endings in the repository (LF); Windows checkouts may convert text to CRLF.
+* text=auto
+# Scripts must keep LF to run on macOS / Linux even when checked out on Windows.
+*.sh text eol=lf
+*.py text eol=lf
+# Binary assets
+*.glb binary
+*.ttf binary
+*.png binary
+*.ico binary
+# Android (android/): the Gradle wrapper script runs under sh, its .bat under cmd; the wrapper jar is binary.
+android/gradlew text eol=lf
+*.bat text eol=crlf
+*.jar binary

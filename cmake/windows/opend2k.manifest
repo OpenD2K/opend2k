@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Windows application manifest for d2k.exe / OpenD2K.exe (merged by the MSVC / clang-cl linker).
+     activeCodePage UTF-8 (Windows 10 1903+): the process "ANSI" code page is UTF-8, so every
+     char-based file API the game uses (std::filesystem::path from std::string, std::ifstream,
+     fopen) understands the UTF-8 paths SDL hands out - folders with Cyrillic / accented names
+     work without wide-character code. longPathAware: paths over 260 characters. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="OpenD2K" version="0.1.0.0"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

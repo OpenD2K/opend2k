@@ -1,0 +1,2 @@
+// OpenD2K's icon in the Windows executables (Explorer, task bar, Alt+Tab); tools/make_icons.py makes it.
+1 ICON "opend2k.ico"

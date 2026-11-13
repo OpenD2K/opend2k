@@ -1,0 +1,2 @@
+// OpenD2K Android app (docs/android.md). Gradle project based on SDL 3.4's android-project template.
+include ':app'
