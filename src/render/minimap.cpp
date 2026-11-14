@@ -56,7 +56,8 @@ void Minimap::rebuild(const game::World& w, int side) {
             if ((c.shroud & 0xF) == 1 || !(c.flags & game::cell_flags::kBuilding)) continue;
             px[static_cast<std::size_t>(y) * w_ + x] = sideColour(int(c.flags & game::cell_flags::kOwnerMask));
         }
-    // Units: on fully revealed cells; enemy cloaked units hidden; flyers only ornithopters.
+    // Units (FUN_00426000): only where the whole shroud byte is 0 (not the low nibble: a "clear"
+    // quirk cell keeping its variant hides them); enemy cloaked units hidden; flyers only ornithopters.
     const formats::Rgba worm = 0xFF000000u | (0xa5u << 16) | (0xb5u << 8) | 0xc6u;
     for (int s = 0; s < int(w.sides().size()); ++s) {
         const auto& sd = w.sides()[s];
@@ -64,7 +65,7 @@ void Minimap::rebuild(const game::World& w, int side) {
         for (int i = sd.firstUnit; i != -1; i = sd.nextObject(i)) {
             const auto& u = sd.units[i];
             const int x = u.tileX(), y = u.tileY();
-            if (!u.alive || x < 0 || y < 0 || x >= w_ || y >= h_ || (w.cell(x, y).shroud & 0xF) != 0) continue;
+            if (!u.alive || x < 0 || y < 0 || x >= w_ || y >= h_ || w.cell(x, y).shroud != 0) continue;
             if (s != side && (u.flags & game::unit_flags::kCloaked)) continue;
             const int beh = w.unitTemplate(u).specialBehavior;
             if (beh == game::behaviour::kSandworm) px[static_cast<std::size_t>(y) * w_ + x] = worm;

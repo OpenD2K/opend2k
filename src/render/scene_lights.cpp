@@ -211,6 +211,7 @@ void SceneLights::pool(float x, float y, float z, float reach, std::uint32_t rgb
     l.b = float(rgb & 0xFF) / 255.0f;
     l.a = a;
     l.priority = prio;
+    l.id = curId_ | (ord_++ & 0xFFu);
     lamps_.push_back(l);
 }
 
@@ -231,6 +232,7 @@ void SceneLights::cone(float x, float y, float z, float len, float dx, float dy,
     l.b = float(rgb & 0xFF) / 255.0f;
     l.a = a;
     l.priority = prio;
+    l.id = curId_ | (ord_++ & 0xFFu);
     lamps_.push_back(l);
 }
 
@@ -268,11 +270,13 @@ void SceneLights::update(const game::World& w, const SceneLight& light, double t
         for (int i = side.firstBuilding; i >= 0; i = side.nextObject(i)) {
             const int ty = side.buildings[std::size_t(i)].type;
             const int re = redesigned && ty >= 0 && std::size_t(ty) < redesigned->size() ? (*redesigned)[std::size_t(ty)] : 0;
+            beginObject(0x80000000u | (std::uint32_t(s & 7) << 20) | (std::uint32_t(i & 0xFFF) << 8));
             addBuilding(w, s, i, k, time, anchors, re, light);
         }
         for (int i = side.firstUnit; i >= 0; i = side.nextObject(i)) {
             const auto& u = side.units[std::size_t(i)];
             if (!u.alive || u.type < 0 || u.type >= formats::kMaxUnitTypes) continue;
+            beginObject(0x40000000u | (std::uint32_t(s & 7) << 20) | (std::uint32_t(i & 0xFFF) << 8));
             const std::uint8_t kind = unitKind_[std::size_t(u.type)];
             if (kind == kUnone) continue;
             if (redesignedUnits && std::size_t(u.type) < redesignedUnits->size() && (*redesignedUnits)[std::size_t(u.type)]) {
@@ -323,7 +327,6 @@ void SceneLights::addVehicle(const game::World& w, int s, int i, float facing, f
     const float bx = x - dx * half, by = y - dy * half;
     flare(bx + px * wide, by + py * wide, hz, 4.5f, kTail, 0.8f * std::max(k, 0.3f));
     flare(bx - px * wide, by - py * wide, hz, 4.5f, kTail, 0.8f * std::max(k, 0.3f));
-    pool(bx - dx * 4, by - dy * 4, 2, 26, kTail, 0.35f * k, 0.5f);
     if (kind == kUharvester || kind == kUmcv) {
         // Rotating amber beacon on the roof; harvesting: work lamps on both sides.
         const float ph = hashPhase(s, i);
@@ -371,15 +374,8 @@ void SceneLights::addModelUnit(const game::World& w, int s, int i, float facing,
         const float reach = unitKind_[std::size_t(u.type)] == kUsmall ? 64.0f : unitKind_[std::size_t(u.type)] == kUmedium ? 80.0f : 92.0f;
         cone(cx / n, cy / n, std::max(2.0f, cz / n), reach, dx, dy, 0.42f, kHead, 0.85f * k, 3);
     }
-    if (named("fx_light_tail", q)) {
-        float cx = 0, cy = 0;
-        for (const auto& p : q) {
-            flare(p.x, p.y, p.z, 3.5f * p.size, kTail, 0.8f * std::max(k, 0.3f), kPull);
-            cx += p.x, cy += p.y;
-        }
-        const float n = float(q.size());
-        pool(cx / n - dx * 4, cy / n - dy * 4, 2, 26, kTail, 0.35f * k, 0.5f);
-    }
+    if (named("fx_light_tail", q))  // small red points, no light thrown on the ground (owner 2026-11-14)
+        for (const auto& p : q) flare(p.x, p.y, p.z, 3.5f * p.size, kTail, 0.8f * std::max(k, 0.3f), kPull);
     if (named("fx_light_beacon", q)) {
         // A rotating amber beacon: the flare pulses as the reflector turns, its light sweeps round.
         const float b = pulse(time, 0.9f, ph);
@@ -424,7 +420,7 @@ void SceneLights::addFlyer(const game::World& w, int s, int i, float k, double t
 }
 
 float buildingGlow(const game::World& w, const formats::Templates& T, int s, int i, float lamps, double time,
-                   bool dayPulse) {
+                   bool dayPulse, int overlayBlink) {
     if (lamps <= 0.001f || s < 0 || s >= int(w.sides().size())) return 0;
     const auto& side = w.sides()[std::size_t(s)];
     const auto& b = side.buildings[std::size_t(i)];
@@ -459,7 +455,73 @@ float buildingGlow(const game::World& w, const formats::Templates& T, int s, int
     } else if (side.powerPercent < 100) {
         k *= 0.22f + 0.22f * blink(time, 0.23f, 0.7f, ph);
     }
+    if (overlayBlink && !windTrap) {
+        // models.ini glow = blink (a redesigned building whose original overlay is off, e.g. the Harkonnen
+        // research centre's lights running round its domes): the emissive surfaces blink twice per cycle
+        // of that overlay (animCounter over frames x animationSpeed ticks, the speed of template index
+        // buildingAnimation as the draw takes it; time interpolates within the tick), only while the
+        // overlay would show (animating, at least half health); a dim steady glow otherwise. Like the wind
+        // trap's day pulse, the peaks also read by day (+0.6 x (1 - lamps)).
+        float p = 0;
+        const int a = t.buildingAnimation;
+        if ((b.flags & 0x30) && (b.flags & 0x40) && b.health * 2 >= std::int32_t(t.hitPoints) && a >= 0 &&
+            a < formats::kMaxBuildingTypes && T.bin.buildingAnimationFrames[a] > 0) {
+            const int speed = std::max(1, int(T.bin.buildings[a].animationSpeed));
+            const double len = double(T.bin.buildingAnimationFrames[a]) * speed;
+            const double frac = std::clamp(time * 20.0 - double(w.gameTicks()), 0.0, 1.0);
+            if (overlayBlink == 2) {
+                // glow = pulse (models.ini; the Atreides / Ordos research centres, whose rims brighten and
+                // dim in the original's overlay): one smooth swell per overlay cycle.
+                const double h = std::fmod((double(b.animCounter) + frac) / len, 1.0);
+                p = 0.5f - 0.5f * float(std::cos(h * 2 * kPi));
+                p = p * p;
+            } else {
+                const double h = std::fmod(2.0 * (double(b.animCounter) + frac) / len, 1.0);  // half a cycle
+                p = h < 0.3 ? 1.0f : h < 0.42 ? float(1.0 - (h - 0.3) / 0.12) : 0.0f;
+            }
+        }
+        k = k * (0.25f + 1.05f * p) + (side.powerPercent < 100 ? 0.25f : 0.6f) * std::clamp(1.0f - lamps, 0.0f, 1.0f) * p;
+    }
     return k;
+}
+
+bool starportLanding(const game::World& w, const formats::Templates& T, int s, int i, double time, int lamps, LandingLights& out) {
+    out = LandingLights{};
+    if (lamps <= 0 || s < 0 || s >= int(w.sides().size())) return false;
+    const auto& side = w.sides()[std::size_t(s)];
+    if (side.primaryBuilding[7] == game::kNoIndex || side.primaryBuilding[7] % side.poolSize() != i) return false;
+    const auto& b = side.buildings[std::size_t(i)];
+    if (!b.alive || b.state == 17 || (b.flags & 0x6) || b.type < 0 || b.type >= formats::kMaxBuildingTypes) return false;
+    if (b.health * 2 < std::int32_t(T.bin.buildings[b.type].hitPoints)) return false;
+    // The drop point (CSide__UpdateDeliveries: posX / 32 + 1, posY / 32 - 2 = the 3 x 3's centre cell).
+    const float px = float(b.tileX * 32 + 48), py = float(b.tileY * 32 + 48);
+    float best = -1;
+    for (int u = side.firstUnit; u >= 0; u = side.nextObject(u)) {
+        const auto& f = side.units[std::size_t(u)];
+        if (!f.alive || f.type < 0 || f.type >= formats::kMaxUnitTypes) continue;
+        if (T.bin.units[f.type].specialBehavior != game::behaviour::kFrigate) continue;
+        // Carrying its cargo (flag 0x100, cleared after the last unit is dropped), not leaving (0x4000).
+        if (!(f.flags & 0x100u) || (f.flags & 0x4000u)) continue;
+        const float dx = float(f.posX) / 65536.0f - px, dy = float(f.posY) / 65536.0f - py;
+        const float d = std::sqrt(dx * dx + dy * dy) / 32.0f;  // tiles
+        if (best < 0 || d < best) best = d;
+    }
+    if (best < 0) return false;
+    out.active = true;
+    // On approach (the last 14 tiles) the lamps come on one by one from the first; over the pad
+    // (descending, unloading) all of them blink.
+    constexpr float kFar = 14, kNear = 1.6f;
+    if (best <= kNear) {
+        out.lit = lamps;
+        out.on = blink(time, 0.5f, 0.55f, 0);
+    } else {
+        const float f = std::clamp((kFar - best) / (kFar - kNear), 0.0f, 1.0f);
+        out.lit = std::clamp(1 + int(f * float(lamps - 1) + 0.5f), 1, lamps);
+        out.on = 1;
+        // The newest lamp pulses, so the sequence reads as running towards the pad.
+        out.lastOn = 0.45f + 0.55f * blink(time, 0.3f, 0.5f, 0);
+    }
+    return true;
 }
 
 void SceneLights::addBuilding(const game::World& w, int s, int i, float k, double time, const EffectAnchors* anchors,
@@ -525,6 +587,17 @@ void SceneLights::addBuilding(const game::World& w, int s, int i, float k, doubl
             const EffectAnchor& an = weld[std::size_t(fl.anchor)];
             pool(an.x, an.y, std::max(4.0f, an.z), 64 * an.size * fl.size, 0xA8C8FF, 0.85f * fl.a * k, 1.8f);
         }
+        // Working lamps (fx_work*, render/weld_fx.hpp): a small amber pool under the lit lamp of the chase.
+        static thread_local std::vector<EffectAnchor> work;
+        float wa[kMaxWorkLamps];
+        if (anchors->buildingAnchors(w, s, i, "fx_work", work) && workLamps(w, b, t_, int(work.size()), wa))
+            for (std::size_t q = 0; q < work.size() && q < std::size_t(kMaxWorkLamps); ++q)
+                if (wa[q] > 0.5f)
+                    pool(work[q].x, work[q].y, std::max(4.0f, work[q].z), 40 * work[q].size, 0xFFA030, 0.6f * wa[q] * k, 1.4f);
+        // Launch flame (fx_launch*): the silo mouth lights its surroundings orange.
+        float la = 0, ls = 1;
+        if (anchors->buildingAnchors(w, s, i, "fx_launch", work) && launchFlame(w, b, t_, la, ls))
+            for (const auto& an : work) pool(an.x, an.y, std::max(8.0f, an.z), 110 * an.size * ls, 0xFF7A20, 1.1f * la * k, 2.0f);
     }
     if (redesigned) {
         // A redesigned building (docs/enhanced-graphics.md "Lamps"): no lamps at the points measured on the
@@ -532,31 +605,33 @@ void SceneLights::addBuilding(const game::World& w, int s, int i, float k, doubl
         // heights, aprons), so those floated in the air or on the empty ground beside it. Its visible lights
         // are its own emissive surfaces (buildingGlow) and fx_light anchors; here only the light they throw:
         // a soft pool from inside the footprint, following the glow (power, damage, the wind trap's pulse).
-        const float gl = buildingGlow(w, t_, s, i, light.lamps, time) / 1.2f;
-        if (gl <= 0.01f) return;
-        // Star port landing lights while the frigate comes in (the original's one-shot building animation of
-        // the primary star port, re/notes/starport.md "Flight"; the 2D pack draws them as its overlay frames):
-        // in 3D the model's fx_landing* anchors (models.ini: the lamp sockets in the pit) light up in sequence
-        // as the overlay frames do, then all blink.
-        if (kind == kBstarport && anchors && (b.flags & 0x30) && (b.flags & 0x40) && b.health * 2 >= std::int32_t(t.hitPoints)) {
+        const float gl = buildingGlow(w, t_, s, i, light.lamps, time, false, anchors ? anchors->buildingGlowBlink(b.type) : 0) / 1.2f;
+        // Star port landing lights while the CHOAM frigate brings a delivery to the primary star port
+        // (re/notes/starport.md "Flight"; render::starportLanding): the model's fx_landing* anchors (models.ini:
+        // the lamp sockets in the pit / on the pad) light up one by one as it approaches, then all blink while it
+        // descends and unloads. Driven by the frigate, not by the building animation the original runs meanwhile,
+        // so the smuggler's star port (no animation in its template) lights too. 3D: every redesigned star port;
+        // 2D Enhanced: the ones without an overlay animation (the pack's overlay frames of the house star ports
+        // are their landing lights already, with their own glow layer).
+        if (kind == kBstarport && anchors && (redesigned == 2 || !(t.flags & 0x40))) {
             static thread_local std::vector<EffectAnchor> pads;
-            pads.clear();
-            const int a = t.buildingAnimation;
-            if (a >= 0 && a < formats::kMaxBuildingTypes && anchors->buildingAnchors(w, s, i, "fx_landing", pads) && !pads.empty()) {
-                const int frames = std::max(1, int(t_.bin.buildingAnimationFrames[a]));
-                const int k = b.animCounter / std::max(1, int(t_.bin.buildings[a].animationSpeed));
+            LandingLights ll;
+            if (anchors->buildingAnchors(w, s, i, "fx_landing", pads) && !pads.empty() &&
+                starportLanding(w, t_, s, i, time, int(pads.size()), ll)) {
                 const int n = int(pads.size());
-                const int lit = std::min(n, 1 + k * n / std::max(1, frames - 2));
-                const float on = k >= frames - 3 ? blink(time, 0.5f, 0.55f, ph) : 1.0f;
-                for (int q = 0; q < lit; ++q) {
+                for (int q = 0; q < ll.lit; ++q) {
                     const auto& p = pads[std::size_t(q)];
                     const std::uint32_t c = q == n - 1 ? kRed : q % 3 == 2 ? kAmber : kGreen;
+                    const float on = ll.on * (q == ll.lit - 1 ? ll.lastOn : 1.0f);
                     flare(p.x, p.y, p.z, 4.5f * p.size, c, 0.95f * on * std::max(kk, 0.35f), 3.0f);
                 }
                 at(0.5f, 0.55f, ax, ay);
-                pool(ax, ay, 14, 0.9f * std::max(W, H), kGreen, 0.25f * on * kk * kB, 1.6f);
+                // (2D: half - the Light blend over the flat pad art washed it out.)
+                pool(ax, ay, 14, 0.9f * std::max(W, H), kGreen,
+                     (redesigned == 2 ? 1.0f : 0.5f) * (0.1f + 0.15f * float(ll.lit) / float(n)) * ll.on * kk * kB, 1.6f);
             }
         }
+        if (gl <= 0.01f) return;
         at(0.5f, 0.55f, ax, ay);
         const float reach = 0.9f * std::max(W, H);
         switch (kind) {
@@ -683,6 +758,7 @@ void SceneLights::draw2D(const Camera& cam, int viewW, int viewH) {
     const float zm = cam.zoom, ox = std::round(cam.x * zm), oy = std::round(cam.y * zm);
     vPool_.clear();
     vCone_.clear();
+    vConeAdd_.clear();
     vFlare_.clear();
     // As the Modern effects' light glows (premultiplied x 1.6). The Light blend multiplies what is
     // drawn (dst * (1 + c)), which the time of day already darkened by the grade: a lamp lights the
@@ -695,7 +771,10 @@ void SceneLights::draw2D(const Camera& cam, int viewW, int viewH) {
         for (int k : order) v.push_back(SDL_Vertex{p[k], c, uv[k]});
     };
     for (const Lamp& l : lamps_) {
-        const float a = std::min(1.0f, l.a) * gain;
+        // Cones: a white beam on orange sand at dusk came out orange (dst x (1 + c) clips red first), so
+        // a beam multiplies less and adds a faint veil of its own colour (ADD, not divided by the grade):
+        // it reads as warm white light on any ground (owner 2026-11-14).
+        const float a = std::min(1.0f, l.a) * gain * (l.kind == Lamp::Cone ? 0.7f : 1.0f);
         float want[3] = {l.r * a * boost_[0], l.g * a * boost_[1], l.b * a * boost_[2]};  // total factor - 1
         const float top = std::max({want[0], want[1], want[2]});
         const int passes = !lightBlendOk_ || top <= 1.0f ? 1 : top <= 3.0f ? 2 : 3;
@@ -716,6 +795,8 @@ void SceneLights::draw2D(const Camera& cam, int viewW, int viewH) {
                                      {sx + fx * R + nx * w, sy + fy * R + ny * w},
                                      {sx + nx * w, sy + ny * w}};
             for (int k = 0; k < passes; ++k) quad(vCone_, p, c);
+            const float va = std::min(1.0f, l.a) * 0.16f;
+            quad(vConeAdd_, p, SDL_FColor{l.r * va, l.g * va, l.b * va, 1});
         }
     }
     for (const Flare& f : flares_) {
@@ -730,6 +811,13 @@ void SceneLights::draw2D(const Camera& cam, int viewW, int viewH) {
     }
     if (!vPool_.empty()) SDL_RenderGeometry(r_, poolTex_, vPool_.data(), int(vPool_.size()), nullptr, 0);
     if (!vCone_.empty()) SDL_RenderGeometry(r_, coneTex_, vCone_.data(), int(vCone_.size()), nullptr, 0);
+    if (!vConeAdd_.empty()) {
+        SDL_BlendMode bm = SDL_BLENDMODE_ADD;
+        SDL_GetTextureBlendMode(coneTex_, &bm);
+        SDL_SetTextureBlendMode(coneTex_, SDL_BLENDMODE_ADD);
+        SDL_RenderGeometry(r_, coneTex_, vConeAdd_.data(), int(vConeAdd_.size()), nullptr, 0);
+        SDL_SetTextureBlendMode(coneTex_, bm);
+    }
     if (!vFlare_.empty()) SDL_RenderGeometry(r_, flareTex_, vFlare_.data(), int(vFlare_.size()), nullptr, 0);
 }
 

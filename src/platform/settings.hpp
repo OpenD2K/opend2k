@@ -93,6 +93,13 @@ struct Settings {
     enum class Effects { Classic, Modern };
     Effects effects = Effects::Modern;
     bool modernEffects() const { return enhanced() && effects == Effects::Modern; }
+    // Enhanced / 3D only (docs/enhanced-graphics.md "Vehicle animation"; render/vehicle_motion.hpp):
+    // Modern = render-only hull motion of ground vehicles (squat / nose dip, roll in turns, suspension
+    // bounce, engine tremble, recoil; dust when setting off with Modern effects); Original = the rigid
+    // sprites. settings.ini "vehicleAnimation" original|modern; the Enhanced / 3D presets use Modern.
+    enum class VehicleAnimation { Original, Modern };
+    VehicleAnimation vehicleAnimation = VehicleAnimation::Modern;
+    bool modernVehicles() const { return enhanced() && vehicleAnimation == VehicleAnimation::Modern; }
     static const char* effectsName(Effects e) { return e == Effects::Modern ? "modern" : "classic"; }
     // Enhanced only: the shroud edge. Classic = the original's tile edge pieces; Soft = a wide
     // blurred gradient into darkness (render/soft_shroud.hpp). settings.ini "shroud"; when the
@@ -137,6 +144,9 @@ struct Settings {
     // The day / night cycle carries over between games (owner 2026-11-13): where the last game left it,
     // in cycle seconds (render/lighting.hpp cycleLength). settings.ini "cyclePhase".
     double cyclePhase = 0;
+    // The battlefield zoom of the last played game (Enhanced / 3D; owner 2026-11-14): the next game starts with
+    // it. 0 = none yet. settings.ini "lastZoom" (in points, i.e. without the display's pixel density).
+    float lastZoom = 0;
     static const char* timeOfDayName(TimeOfDay t) {
         return t == TimeOfDay::Dawn ? "dawn" : t == TimeOfDay::Dusk ? "dusk" : t == TimeOfDay::Night ? "night"
                : t == TimeOfDay::Cycle ? "cycle" : "day";
@@ -167,6 +177,12 @@ struct Settings {
     bool hdrOutput = false;
     int msaa = 4;
     int aniso = 16;
+    // 3D resolution ("resolution3d" auto|100|75|50; not part of Quality): the 3D battlefield is
+    // rendered at this share of the view's pixels per axis and scaled up (the UI stays sharp).
+    // Auto (docs/3d-mode.md "Performance"): 100 % up to a pixel budget, less on very large outputs
+    // (a 5K ultrawide), lowered further while frames miss the display rate. 0 = Auto.
+    int resolution3d = 0;
+    static int resolution3dFrom(const std::string& v) { return v == "100" ? 100 : v == "75" ? 75 : v == "50" ? 50 : 0; }
     enum class Quality { Low, Medium, High, Custom };
     void applyQuality(Quality q);
     Quality quality() const;  // the level the values match, else Custom
@@ -180,6 +196,14 @@ struct Settings {
         return v == "off" || v == "0" ? VSync::Off : v == "adaptive" ? VSync::Adaptive : VSync::On;
     }
     int fpsLimit = 0;
+    // Display adjustments (Enhanced / 3D only, render-only: the last colour pass of the frame,
+    // render/hdr.hpp DisplayAdjust; Original stays byte-identical). Not part of a preset.
+    // "brightness" / "contrast" / "saturation" -50..50 (0 = as rendered), "gamma" 80..140 (x100;
+    // 100 = as rendered, higher = brighter mid tones). Defaults: the picture unchanged.
+    int brightness = 0, contrast = 0, gamma = 100, saturation = 0;
+    static constexpr int kMinDisplayAdjust = -50, kMaxDisplayAdjust = 50, kMinGamma = 80, kMaxGamma = 140;
+    bool displayAdjusted() const { return brightness != 0 || contrast != 0 || gamma != 100 || saturation != 0; }
+    void resetDisplayAdjust() { brightness = contrast = saturation = 0, gamma = 100; }
     // Windows: the GPU backend for the next start ("gpuDriver" auto | vulkan | direct3d12; Auto = Vulkan
     // first, Direct3D 12 without a Vulkan driver - render3d/gpu.cpp). The SDL_GPU_DRIVER variable wins.
     std::string gpuDriver = "auto";
@@ -187,6 +211,18 @@ struct Settings {
     HealthBars healthBars = HealthBars::Selected;  // like the original
     static const char* healthBarsName(HealthBars h) {
         return h == HealthBars::Always ? "always" : h == HealthBars::Damaged ? "damaged" : "selected";
+    }
+    // Enhanced / 3D only (not original): the control-group number (1..9, 0) as a small badge left of
+    // an own unit's health bar (settings.ini "groupNumbers"). Selected = only on selected units.
+    // A UI aid, not part of a graphics preset. Graphics: Original keeps the original's digit (selected
+    // units only, MapRenderer::drawClassicUnitSelection).
+    enum class GroupNumbers { Off, Selected, Always };
+    GroupNumbers groupNumbers = GroupNumbers::Always;
+    static const char* groupNumbersName(GroupNumbers g) {
+        return g == GroupNumbers::Always ? "always" : g == GroupNumbers::Selected ? "selected" : "off";
+    }
+    static GroupNumbers groupNumbersFrom(const std::string& v) {
+        return v == "off" ? GroupNumbers::Off : v == "selected" ? GroupNumbers::Selected : GroupNumbers::Always;
     }
     // Graphics presets (Options -> Graphics; docs/enhanced-graphics.md "Presets"): one tap sets
     // every presentation value above to a known look. Original = graphics Original (the 1998
@@ -231,6 +267,7 @@ struct Settings {
         ClassicView classicView;
         TimeOfDay timeOfDay;
         Lighting lighting;
+        VehicleAnimation vehicleAnimation;
         bool operator==(const PresetValues&) const = default;
     };
     PresetValues presetValues() const;
@@ -294,6 +331,14 @@ struct Settings {
     // controls Alt+left click / Modern controls right click on the ground sets its rally point.
     // settings.ini "rallyPoints".
     bool rallyPoints = true;
+    // Limits (not original when on; default Original in every preset). "Order limit": the
+    // original gives one group order to at most 64 of the selected units (Generate*Order
+    // 0x459450..; re/notes/limits.md), Unlimited = all of them - applies at once. "Unit limit":
+    // the original's 1000 shared object slots per side, Unlimited = the pool grows (up to
+    // game::kMaxObjectsUnlimited) - used by new games (saved with the game).
+    // settings.ini "orderLimit" / "unitLimit" (original|unlimited).
+    bool unlimitedOrders = false;
+    bool unlimitedUnits = false;
     // Cutscenes (platform/movies.hpp): play the VQA movies where the original does (house
     // selection, briefings, endings, ...). settings.ini "cutscenes".
     bool cutscenes = true;

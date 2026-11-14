@@ -47,7 +47,7 @@ void Side::initPool() {
     buildings.assign(kObjectsPerSide, Building{});
     bullets.assign(kObjectsPerSide, Bullet{});
     explosions.assign(kObjectsPerSide, Explosion{});
-    links.fill(ObjectLink{});
+    links.assign(kObjectsPerSide, ObjectLink{});
     firstUnit = lastUnit = firstBuilding = lastBuilding = -1;
     firstBullet = lastBullet = firstExplosion = lastExplosion = -1;
     // CSide::Init chains slots 0..999 and sets the free-list top to slot 999; allocation
@@ -62,12 +62,40 @@ void Side::initPool() {
     }
 }
 
-int Side::allocObject() {
+int Side::allocObject(bool grow) {
+    if (freeList.empty() && grow && poolSize() < kMaxObjectsUnlimited) {
+        // Not original ("Unit limit: Unlimited"): append slots; the free list is empty, so the
+        // new ones are handed out lowest first (1000, 1001, ...). Slots below 1000 keep the
+        // original LIFO order, so a game never needing more is identical to the original.
+        const int from = poolSize(), to = std::min(from + kPoolGrowStep, kMaxObjectsUnlimited);
+        units.resize(static_cast<std::size_t>(to));
+        buildings.resize(static_cast<std::size_t>(to));
+        bullets.resize(static_cast<std::size_t>(to));
+        explosions.resize(static_cast<std::size_t>(to));
+        links.resize(static_cast<std::size_t>(to));
+        for (int i = from; i < to; ++i) {
+            units[i].index = i;
+            buildings[i].index = i;
+            bullets[i].index = i;
+            explosions[i].index = i;
+        }
+        for (int i = to - 1; i >= from; --i) freeList.push_back(i);
+    }
     if (freeList.empty()) return -1;
     const int i = freeList.back();
     freeList.pop_back();
     links[i] = ObjectLink{};
     return i;
+}
+
+void Side::reservePool(int slots) {
+    const auto n = static_cast<std::size_t>(std::max(slots, poolSize()));
+    units.reserve(n);
+    buildings.reserve(n);
+    bullets.reserve(n);
+    explosions.reserve(n);
+    links.reserve(n);
+    freeList.reserve(n);
 }
 
 // LinkObject: append to the kind's list (insertion order = update order).
@@ -119,10 +147,12 @@ void Side::freeObject(int index) {
 // Construction
 
 void World::initSides(const formats::MisFile* mission) {
+    unlimitedObjects_ = rules_.unlimitedObjects;
     for (int s = 0; s < kMaxSides; ++s) {
         auto& side = sides_[s];
         side.id = s;
         side.initPool();
+        if (unlimitedObjects_) side.reservePool(kMaxObjectsUnlimited);
         side.primaryBuilding.fill(kNoIndex);
         side.starportTypes.fill(-1);
         for (auto& d : side.deliveries) d.units.fill(0xff);  // CSide::Init
@@ -223,13 +253,13 @@ void World::initEconomy(bool mission) {
 }
 
 Unit* World::unit(int side, int index) {
-    if (side < 0 || side >= kMaxSides || index < 0 || index >= kObjectsPerSide) return nullptr;
+    if (side < 0 || side >= kMaxSides || index < 0 || index >= sides_[side].poolSize()) return nullptr;
     auto& s = sides_[side];
     return s.links[index].kind == SlotKind::Unit ? &s.units[index] : nullptr;
 }
 
 Building* World::building(int side, int index) {
-    if (side < 0 || side >= kMaxSides || index < 0 || index >= kObjectsPerSide) return nullptr;
+    if (side < 0 || side >= kMaxSides || index < 0 || index >= sides_[side].poolSize()) return nullptr;
     auto& s = sides_[side];
     return s.links[index].kind == SlotKind::Building ? &s.buildings[index] : nullptr;
 }
@@ -313,20 +343,16 @@ SmartOrder World::smartOrder(int side, int px, int py, bool forceAttack, bool fo
     if (!inBounds(tx, ty) || side < 0 || side >= kMaxSides) return SmartOrder::None;
     Side& s = sides_[side];
     // The Generate*Order functions collect at most 64 selected units, in list order.
+    // (orderGroup: max orderUnitLimit(), 64 = the original; the units past it get no order.)
     auto forSelected = [&](auto&& filter, auto&& issue) {
-        int n = 0;
-        for (int i = s.firstUnit; i != -1 && n < 64; i = s.nextObject(i)) {
-            const Unit& u = s.units[i];
-            if (!u.selected || !filter(u)) continue;
-            issue(i);
-            ++n;
-        }
-        return n;
+        const std::vector<int> group = orderGroup(side, filter);
+        for (int i : group) issue(i);
+        return static_cast<int>(group.size());
     };
     // GenerateBuildingAttack{Unit,Building}Order: selected own barrel buildings not dying (max 64).
     auto forSelectedBarrels = [&](auto&& issue) {
         int n = 0;
-        for (int i = s.firstBuilding; i != -1 && n < 64; i = s.nextObject(i)) {
+        for (int i = s.firstBuilding; i != -1 && (orderUnitLimit_ <= 0 || n < orderUnitLimit_); i = s.nextObject(i)) {
             const Building& b = s.buildings[i];
             if (!b.selected || b.state == 17 || buildingTemplate(b).barrelArt == -1) continue;
             issue(i);
@@ -930,7 +956,7 @@ bool World::updateUnit(Unit& u) {
             // A frigate carrying its cargo animates the primary starport.
             if (t.specialBehavior == behaviour::kFrigate && (u.flags & kCarried) &&
                 sides_[sideId].primaryBuilding[7] != kNoIndex)
-                sides_[sideId].buildings[static_cast<std::size_t>(sides_[sideId].primaryBuilding[7]) % kObjectsPerSide].flags |=
+                sides_[sideId].buildings[static_cast<std::size_t>(sides_[sideId].primaryBuilding[7]) % sides_[sideId].buildings.size()].flags |=
                     building_flags::kAnimOnce;
             if (u.flags & 0x200) {
                 const PickupEntry& e = sides_[sideId].pickup[u.byte29 & 31];
@@ -1644,7 +1670,7 @@ void World::homeViewPosition(int side, int& px, int& py) const {
         for (int i = S.firstBuilding; i != -1; i = S.nextObject(i))
             if (!b || buildingTemplate(S.buildings[i]).buildingGroup < buildingTemplate(*b).buildingGroup) b = &S.buildings[i];
     } else {
-        b = &S.buildings[static_cast<std::size_t>(S.primaryBuilding[0]) % kObjectsPerSide];
+        b = &S.buildings[static_cast<std::size_t>(S.primaryBuilding[0]) % S.buildings.size()];
     }
     if (b) {
         // TImage +0xc (hotspot Y) of normal frame 0 when the building has one, else of the base
@@ -1710,7 +1736,7 @@ void World::launchDeathHand(int side, int tileX, int tileY) {
     Side& S = sides_[side & 7];
     const int pi = S.primaryBuilding[9];
     if (pi == kNoIndex) return;
-    Building& pal = S.buildings[static_cast<std::size_t>(pi) % kObjectsPerSide];
+    Building& pal = S.buildings[static_cast<std::size_t>(pi) % S.buildings.size()];
     const auto& bt = buildingTemplate(pal);
     const int bx = pal.posX / 65536 / 32, by = pal.posY / 65536 / 32;
     const int type = static_cast<std::uint8_t>(rules_.templates->bin.groupIds[19]);

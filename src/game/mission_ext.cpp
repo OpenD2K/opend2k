@@ -441,7 +441,7 @@ struct ExtEventRunner {
 
     // Kind of the object in a pool slot: 1 unit, 2 building, else 0.
     int slotKind(int side, int index) const {
-        if (side < 0 || side >= kMaxSides || index < 0 || index >= kObjectsPerSide) return 0;
+        if (side < 0 || side >= kMaxSides || index < 0 || index >= w.sides_[side].poolSize()) return 0;
         const SlotKind k = w.sides_[side].links[index].kind;
         return k == SlotKind::Unit ? 1 : k == SlotKind::Building ? 2 : 0;
     }

@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(CMAKE_CONFIGURATION_TYPES "RelWithDebInfo;Release;Debug" CACHE STRING "Xcode configurations (first = default)" FORCE)
 endif()
-project(d2k VERSION 0.0.1 LANGUAGES C CXX)  # the release version (CHANGELOG.md, docs/release.md)
+project(d2k VERSION 0.0.2 LANGUAGES C CXX)  # the release version (CHANGELOG.md, docs/release.md)
 # Apple: Objective-C++ (platform/http_client_apple.mm) enabled here, before the fetched SDL3 subdirectory is added:
 # enabled only further down, the generate step fails with D2K_FETCH_SDL=ON ("CMAKE_OBJCXX_COMPILE_OBJECT" not set).
 if(APPLE)
@@ -188,6 +188,7 @@ set(D2K_APP_SOURCES
     src/render/effects.cpp
     src/render/effects_weapons.cpp
     src/render/effects_events.cpp
+    src/render/effects_fire.cpp
     src/render/effects_craters.cpp
     src/render/map_renderer.cpp
     src/render/soft_shroud.cpp
@@ -197,6 +198,7 @@ set(D2K_APP_SOURCES
     src/render/bloom.cpp
     src/render/hdr.cpp
     src/render/minimap.cpp
+    src/render/order_feedback.cpp
     src/render/text.cpp
     src/render/ttf_font.cpp
     src/render/ui_text.cpp
@@ -208,6 +210,8 @@ set(D2K_APP_SOURCES
     src/render/image.cpp
     src/render/map_preview.cpp
     src/render/motion.cpp
+    src/render/vehicle_motion.cpp
+    src/render/muzzle_tips.cpp
     src/render/cursor.cpp
     src/render3d/gpu.cpp
     src/render3d/camera3d.cpp
@@ -239,11 +243,12 @@ target_link_libraries(d2k_frontend PUBLIC d2k_core SDL3::SDL3)
 if(APPLE)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 20)
-    target_sources(d2k_frontend PRIVATE src/platform/http_client_apple.mm)
-    set_source_files_properties(src/platform/http_client_apple.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_sources(d2k_frontend PRIVATE src/platform/http_client_apple.mm src/platform/mac_display.mm)
+    set_source_files_properties(src/platform/http_client_apple.mm src/platform/mac_display.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(d2k_frontend PRIVATE D2K_HTTP_HAVE_NATIVE=1)
     target_link_libraries(d2k_frontend PUBLIC "-framework Foundation")
     if(NOT D2K_IOS)
+        target_link_libraries(d2k_frontend PUBLIC "-framework AppKit" "-framework QuartzCore")  # platform/mac_display.mm
         target_sources(d2k_frontend PRIVATE src/platform/http_client_curl.cpp)
         target_compile_definitions(d2k_frontend PRIVATE D2K_HTTP_HAVE_CURL=1)
     endif()

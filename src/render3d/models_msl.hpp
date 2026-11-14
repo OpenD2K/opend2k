@@ -119,7 +119,7 @@ float shadowPCF(depth2d<float> sm, sampler ss, float3 lp, float4 sh) {
 }
 
 fragment float4 model_fs(VOut in [[stage_in]], bool front [[front_facing]], constant FU& u [[buffer(0)]],
-                         constant PointLights& pl [[buffer(1)]],
+                         constant PointLights& pl [[buffer(1)]], const device uint4* plg [[buffer(2)]],
                          texture2d<float> tex [[texture(0)]], texture2d<float> shroud [[texture(1)]],
                          depth2d<float> shadowMap [[texture(2)]],
                          sampler texSamp [[sampler(0)]], sampler shroudSamp [[sampler(1)]],
@@ -174,9 +174,9 @@ fragment float4 model_fs(VOut in [[stage_in]], bool front [[front_facing]], cons
             const float sp = pow(max(dot(n, h), 0.0), 6.0 + 90.0 * in.pbr.x * in.pbr.x) * in.pbr.x * step(0.0, ndl);
             c.rgb += sp * (0.25 + 0.45 * in.pbr.y) * mix(float3(1.0), base, in.pbr.y) * pl.info.y * pl.sunColor.rgb;
         }
-        c.rgb += base * pointLights(pl, in.wpos, n, 0.25);  // dynamic lights
+        c.rgb += base * pointLights(pl, plg, in.wpos, n, 0.25);  // dynamic lights
     } else if (in.params.y > 0.2) {  // flat-shaded parts: the time of day's light, like the billboards
-        c.rgb = satur(pl, c.rgb) * pl.spriteTint.rgb + c.rgb * pointLights(pl, in.wpos, float3(0.0, 1.0, 0.0), 0.8);
+        c.rgb = satur(pl, c.rgb) * pl.spriteTint.rgb + c.rgb * pointLights(pl, plg, in.wpos, float3(0.0, 1.0, 0.0), 0.8);
     }
     c.rgb = min(c.rgb + u.house.a, 1.0);
     c.rgb += glow * emit;  // may exceed 1 (HDR: blooms)

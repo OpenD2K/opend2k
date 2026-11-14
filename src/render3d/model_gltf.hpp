@@ -43,8 +43,13 @@ struct GltfAdjust {
         std::string name;
         float pos[3] = {};
         float size = 1;
+        bool onTurret = false;  // a trailing "turret": turns with the turret part (fx_muzzle)
     };
     std::vector<Anchor> anchors;
+    // models.ini "glow = blink" (buildings): the emission blinks in the rhythm of the original's overlay
+    // animation (render::buildingGlow overlayBlink), e.g. the Harkonnen research centre's dome lights.
+    // ("overlay = off" is read by the 2D pack, render::PackAnchors: the model pass draws no overlays.)
+    std::uint8_t glowBlink = 0;  // glow = blink (1) | pulse (2)
     // Loader flag (not models.ini): geometry only, no texture decode (pose variants that only
     // swap the body mesh, e.g. variants/HARVESTER_unloadNN.glb).
     bool geometryOnly = false;

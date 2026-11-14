@@ -18,6 +18,7 @@
 #include "game/world.hpp"
 #include "render/effect_anchors.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -28,6 +29,8 @@ struct SDL_Texture;
 struct SDL_Vertex;
 
 namespace d2k::render {
+
+class MuzzleTips;
 
 struct Camera;
 class TileAtlas;
@@ -65,6 +68,15 @@ public:
     // leave a part of an object (the refinery's flue tops: "fx_flue*"); nullptr = the 2D offsets.
     // Set before update().
     void setAnchors(const EffectAnchors* a) { anchors_ = a; }
+    // Barrel tips measured on the original sprites (render/muzzle_tips.hpp): where shots start for
+    // the units the anchors above do not cover. nullptr = the old offsets along the aim.
+    void setMuzzleTips(const MuzzleTips* m) { tips_ = m; }
+    // "Vehicle animation: Modern" (Settings::vehicleAnimation): a puff of dust kicked up when a
+    // vehicle sets off. Set before update().
+    void setVehicleAnimation(bool on) { vehicleAnim_ = on; }
+    // Particle density of the continuous emitters (building fires): 1 = High, less on lower Quality
+    // presets (phones). Set before update().
+    void setDetail(float d) { detail_ = std::clamp(d, 0.25f, 1.0f); }
 
     // Screen shake for this frame, world pixels (add to the camera).
     float shakeX() const { return shakeX_; }
@@ -77,6 +89,7 @@ public:
         float x = 0, y = 0;             // last drawn position (world px)
         float treadDist = 0, dustDist = 0;
         float smokeT = 0;
+        float still = 0;                // seconds standing (the dust kick-up on setting off)
         bool moving = false;
     };
     const UnitVisual* unitVisual(int side, int index) const;
@@ -93,11 +106,17 @@ public:
     // (spice bloom mounds).
     enum Tex : std::uint8_t {
         kGlow, kSmoke, kSpark, kDebris, kFlame, kRing, kSoft, kGlowPM, kWave, kGas, kArc, kLine,
-        kFire, kMuzzle, kStreak, kCapsule, kScorch, kShock, kMound, kTexCount
+        kFire, kMuzzle, kStreak, kCapsule, kScorch, kShock, kMound,
+        kTongue, kTongue2,  // flame tongues (building fires): coloured (white-yellow core, orange, dark red tips),
+                            // base at -u, tip at +u (drawn as strips: len along rot, size across)
+        kTexCount
     };
     // Alpha: normal blending; Add: additive (hot cores, sparks); Light: dst * (1 + src), i.e. the
     // light brightens what it falls on instead of washing bright sand out to white (kGlowPM).
-    enum class Blend : std::uint8_t { Alpha, Add, Light };
+    // Glow: normal (over) blending of something that emits its own light (flames): not darkened by
+    // the time of day (2D grade, 3D sprite lighting), and - unlike Add - it replaces the colour
+    // under it, so orange stays orange over the blue night (Add on blue reads pink / purple).
+    enum class Blend : std::uint8_t { Alpha, Add, Light, Glow };
     struct Particle {
         float x, y, z;        // world px; z = height (drawn y - z)
         float vx, vy, vz;     // px / s
@@ -239,6 +258,9 @@ private:
         float lz = 0;                   // bullets: last height
         bool visible = false;           // bullets: in view and unshrouded last frame
         int beam = -1;                  // bullets: SonicBeam id
+        // bullets: drawn offset from the simulated position to the barrel tip at launch (world px),
+        // shrinking to 0 as the bullet nears its target (d0 = its distance to it at launch).
+        float ox = 0, oy = 0, oz = 0, d0 = 0;
     };
     enum class ExClass : std::uint8_t {
         None, Big, Huge, Medium, Small, Muzzle, Trail, Dust, Flame, Spark, Gas, Plasma, Whiten, DhmTrail,
@@ -342,6 +364,44 @@ private:
     void spawnHarvestDust(const game::World& w, const TileAtlas& atlas, float x, float y, int dir, bool burst);
     void spawnDamageSmoke(const game::World& w, float x, float y, float z);
     void spawnFlame(const game::World& w, float x, float y, float z);
+    // ---- Building fires (render/effects_fire.cpp): the original's damage events (EX_SMOKE3 / EX_FLAME
+    // at the BUILEXP.BIN points of a building below half health) feed a fire record per building and
+    // point; the record burns (layered flame tongues, embers, a smoke column lit from below, firelight,
+    // soot on the ground) with the building's damage while the events keep coming, then dies down.
+    struct BurnPoint {
+        float ox = 0, oy = 0;     // the event's drawn point from the building's top-left tile corner (px)
+        bool flame = false;       // an EX_FLAME point (else EX_SMOKE3)
+        float heat = 0;           // 0..1: 1 while the events come, falls off after the last one
+        float since = 99;         // s since the last event
+        float lickAcc[4] = {}, smokeAcc = 0, emberAcc = 0, litAcc = 0;
+        float tx[4] = {}, ty[4] = {};  // tongue offsets (px) around the point
+        int tongues = 0;
+        std::uint32_t seed = 0;
+    };
+    struct BurnSite {
+        int side = 0, index = 0, type = 0, tileX = 0, tileY = 0;
+        int points = 0;
+        BurnPoint pt[8];
+        float hp = 1;             // health fraction (this frame)
+        float scorch = 0;         // 0..1 soot on the ground, builds up while it burns
+        bool alive = true;        // the building still stands (not dying / gone)
+        std::uint32_t seed = 0;
+        // This frame's placement of each point: ground x / y, height z (valid while emitting).
+        float gx[8] = {}, gy[8] = {}, gz[8] = {};
+    };
+    std::vector<BurnSite> burns_;
+    float detail_ = 1;
+    // An EX_SMOKE3 / EX_FLAME event at drawn point (x, y): feeds the burning building's record;
+    // false when no damaged building holds the point (a vehicle's smoke).
+    bool feedBurn(const game::World& w, float x, float y, bool flame);
+    void updateBurns(const game::World& w, float dt, const Camera& cam, int viewW, int viewH, bool showShroud);
+    void burnMarks();
+    // Where point i of a site sits this frame (ground x / y, height): the model's fx_fire anchors, else
+    // the event's point mapped onto the footprint (3D models: onto the model's roof, 3D cards: onto the
+    // card, 2D: the same drawn point, split into ground + height inside the footprint).
+    void burnPlace(const game::World& w, const BurnSite& s, int i, float& gx, float& gy, float& z) const;
+    // One flame tongue leaving (x, y, z): s = size (1 = a building's medium fire).
+    void flameLick(float x, float y, float z, float s, float lean);
     // EX_REF: a refinery's chimneys vent (one burst per unloaded blob) and smoke while it works.
     static constexpr int kMaxVents = 8;  // chimney tops per refinery
     struct RefineryVent {
@@ -400,6 +460,16 @@ private:
     float cardTilt_ = -1;  // setCardTilt
     const EffectAnchors* anchors_ = nullptr;  // setAnchors
     mutable std::vector<EffectAnchor> anchorTmp_;
+    const MuzzleTips* tips_ = nullptr;        // setMuzzleTips
+    bool vehicleAnim_ = false;                // setVehicleAnimation
+    // Per unit slot: the shots fired (alternates between a unit's guns) and where the last one
+    // left (the bullet that follows starts drawn there).
+    struct LastShot { std::uint32_t tick = 0; std::uint16_t count = 0; bool valid = false; EffectAnchor at; };
+    std::array<std::vector<LastShot>, game::kMaxSides> lastShot_;
+    mutable std::vector<EffectAnchor> muzzleTmp_;
+    // The barrel tips of unit `unit` of side `s` as drawn this frame (3D models' / rendered pack's
+    // fx_muzzle anchors, else the measured original sprites, infantry: the rifle); false = unknown.
+    bool muzzlePoints(const game::World& w, int s, int unit, std::vector<EffectAnchor>& out) const;
     float trauma_ = 0, shakeX_ = 0, shakeY_ = 0;
     // Frame vertex batches.
     std::vector<SDL_Vertex> vAlpha_, vAdd_, vLight_, vGround_;

@@ -58,6 +58,9 @@ public:
     bool active() const override { return source_ != Source::Sprites && !models_.empty(); }
     bool hasUnitModel(int unitType) const override;
     bool hasBuildingModel(int buildingType) const override;
+    int buildingGlowBlink(int buildingType) const override;
+    void setVehicleMotion(const render::VehicleMotion* vm) override { vm_ = vm; }
+    void setEffects(const render::Effects* fx) override { fx_ = fx; }
     float unitModelHeight(int unitType) const override;
     float buildingModelHeight(int buildingType) const override;
     float groundOffset(const game::World& w, float wx, float wy) const override;
@@ -66,12 +69,17 @@ public:
                          std::vector<AnchorWorld>& out) const override;
     bool unitAnchors(const game::World& w, const Terrain& terr, int side, int unit, std::string_view prefix,
                      std::vector<AnchorWorld>& out) const override;
+    bool buildingSurface(const game::World& w, const Terrain& terr, int side, int building, float& gx, float& gy,
+                         float& top) const override;
+    float rayBuilding(const game::World& w, const Terrain& terr, int side, int building, const Vec3& o,
+                      const Vec3& d) const override;
+    float rayUnit(const game::World& w, const Terrain& terr, int side, int unit, const Vec3& o, const Vec3& d) const override;
     void prepare(SDL_GPUDevice* dev, SDL_GPUCommandBuffer* cmd, const ModelFrame& f) override;
     int draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const ModelFrame& f) override;
     int drawShadowDepth(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const ModelFrame& f) override;
 
 private:
-    struct Range { std::uint32_t first = 0, count = 0; };
+    struct Range { std::uint32_t first = 0, count = 0; };  // indices into ib_ (first index, index count)
     struct GpuModel {
         formats::Model3D::Anchor anchor = formats::Model3D::Anchor::Centre;
         Range body, turret, shadow, house;
@@ -154,7 +162,35 @@ private:
         int w = 0, h = 0;
         std::vector<float> y;  // highest surface <= kCap per cell, -1 none
     };
+    // Per model: model-space boxes of the parts drawn with the body matrix (body + house) and with
+    // the turret matrix (picking; built lazily). Empty box: lo > hi.
+    struct PickBox {
+        bool built = false;
+        Vec3 bodyLo{1e30f, 1e30f, 1e30f}, bodyHi{-1e30f, -1e30f, -1e30f};
+        Vec3 turretLo{1e30f, 1e30f, 1e30f}, turretHi{-1e30f, -1e30f, -1e30f};
+        // Runs of consecutive triangles with their boxes (meshes are spatially coherent in file
+        // order): the ray tests only the triangles of the runs whose box it crosses.
+        struct Run {
+            std::uint8_t part = 0;  // 0 body, 1 house, 2 turret
+            std::uint32_t first = 0, count = 0;  // triangle (not vertex) indices
+            Vec3 lo, hi;
+        };
+        std::vector<Run> runs;
+    };
+    mutable std::vector<PickBox> pickBoxes_;
+    const PickBox& pickBox(int model) const;
     std::vector<Deck> decks_;  // per model (buildings only)
+    // Per building model: its top surface seen from above (buildingSurface), model space; built lazily
+    // (Deck layout, every surface, no cap; maxY = the tallest).
+    struct Roof {
+        static constexpr float kRes = 3.0f;
+        float x0 = 0, z0 = 0, maxY = 0;
+        int w = 0, h = 0;
+        bool built = false;
+        std::vector<float> y;  // highest surface per cell, -1 none
+    };
+    mutable std::vector<Roof> roofs_;
+    const Roof& roof(int model) const;
     void buildDeck(int model);
     // The deck under (wx, wy) of the building on cell (cx, cy), only on the cells where the original
     // puts units on a building: a refinery's dock, a repair pad, a factory's exit cell (0 elsewhere).
@@ -170,6 +206,11 @@ private:
     std::vector<DockTip> dockTip_;  // per model (units with unloading poses)
 
     const formats::Templates& t_;
+    const render::VehicleMotion* vm_ = nullptr;  // setVehicleMotion
+    const render::Effects* fx_ = nullptr;         // setEffects
+    // The drawn body / turret facing of a unit in 32nds of a turn: eased between the simulation's
+    // steps (Modern effects' Effects::unitVisual; ground vehicles), else the step itself.
+    void drawnFacing(const game::Unit& u, int type, float& body, float& turret) const;
     const formats::HouseColours& colours_;
     Source source_ = Source::Sprites;
     std::vector<formats::Model3D> models_;   // CPU copies until uploaded
@@ -182,6 +223,10 @@ private:
     SDL_GPUSampleCount samples_ = SDL_GPU_SAMPLECOUNT_1;
     int aniso_ = 1;
     SDL_GPUGraphicsPipeline* meshPipe_ = nullptr;
+    // The same without blending (opaque draws: no stealth, no build-up hologram) - blended
+    // fragments are never hidden-surface-removed on tile GPUs (Apple): what lies under an opaque
+    // model would be shaded too.
+    SDL_GPUGraphicsPipeline* meshOpaquePipe_ = nullptr;
     SDL_GPUGraphicsPipeline* shadowPipe_ = nullptr;
     SDL_GPUGraphicsPipeline* projShadowPipe_ = nullptr;
     SDL_GPUGraphicsPipeline* depthPipe_ = nullptr;  // sun shadow map casters (created on first use)
@@ -191,17 +236,22 @@ private:
     SDL_GPUSampler* linear_ = nullptr;
     SDL_GPUTexture* white_ = nullptr;
     SDL_GPUBuffer* vb_ = nullptr;
+    // Indexed meshes: the glTF loader gives triangle lists with every corner its own vertex; the
+    // upload shares equal corners (a ~13k-triangle tank: ~3x fewer vertices to shade, twice a frame).
+    SDL_GPUBuffer* ib_ = nullptr;
     std::vector<GpuModel> gpu_;
     bool uploaded_ = false, pipelineFailed_ = false;
     std::vector<Draw> draws_;
     // Animation.
     std::vector<AnimInfo> anim_;  // per model
+    std::vector<std::uint8_t> glowBlink_;  // per model: models.ini glow = blink (1) | pulse (2)
     bool smoothAnim_ = false;     // "Modern animation" (future setting; D2K_MODERN_ANIM=1): blend between frames
     bool animOff_ = false;        // D2K_ANIM_OFF=1: rest poses only (measurements)
     std::unordered_map<std::uint64_t, std::vector<float>> poseCache_;  // (model, anim, time) -> palette
     std::unordered_map<std::uint64_t, int> frameSlots_;                // this frame: key -> first entry
     std::vector<float> paletteData_;                                   // this frame's palette (16 floats each)
     SDL_GPUBuffer* palette_ = nullptr;                                 // vertex storage buffer 0
+    LightGridBuffer lightFallback_;  // fragment storage buffer 0 when the frame has no light grid
     SDL_GPUTransferBuffer* paletteTb_ = nullptr;
     std::uint32_t paletteCap_ = 0;  // matrices
 };

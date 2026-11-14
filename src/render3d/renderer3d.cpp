@@ -4,6 +4,8 @@
 #include "game/world.hpp"
 #include "render/art_pack.hpp"
 #include "render/bloom.hpp"
+#include "render/frame_probe.hpp"
+#include "render/group_badge.hpp"
 #include "render/hdr.hpp"
 #include "render/effects.hpp"
 #include "render/lighting.hpp"
@@ -12,6 +14,7 @@
 #include "render/soft_shroud.hpp"
 #include "render/sprites.hpp"
 #include "render/tileset.hpp"
+#include "render/vehicle_motion.hpp"
 #include "render/weld_fx.hpp"
 #include "render3d/gpu.hpp"
 #include "render3d/shader_blobs.hpp"
@@ -77,6 +80,7 @@ SDL_GPUColorTargetBlendState blendFor(int pipe) {
     b.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
     switch (pipe) {
     case 0:  // straight alpha
+    case 5:  // straight alpha, unlit (kEmit: flames)
         b.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
         b.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
         break;
@@ -202,9 +206,9 @@ bool Renderer3D::init() {
     }
 
     SDL_GPUShader* tvs = createShader(dev_, ShaderId::TerrainVs, 0, 1);
-    SDL_GPUShader* tfs = createShader(dev_, ShaderId::TerrainFs, 4, 2);
+    SDL_GPUShader* tfs = createShader(dev_, ShaderId::TerrainFs, 4, 2, 1);
     SDL_GPUShader* svs = createShader(dev_, ShaderId::SpriteVs, 0, 1);
-    SDL_GPUShader* sfs = createShader(dev_, ShaderId::SpriteFs, 3, 2);
+    SDL_GPUShader* sfs = createShader(dev_, ShaderId::SpriteFs, 3, 2, 1);
     bool ok = tvs && tfs && svs && sfs;
 
     SDL_GPUColorTargetDescription ctd{};
@@ -638,6 +642,11 @@ bool Renderer3D::buildingAnchors(const game::World& w, int side, int building, s
     return !out.empty();
 }
 
+int Renderer3D::buildingGlowBlink(int type) const {
+    if (models_ && models_->active() && models_->hasBuildingModel(type)) return models_->buildingGlowBlink(type);
+    return packAnchors_ && packAnchors_->buildingGlowBlink(type);
+}
+
 bool Renderer3D::unitAnchors(const game::World& w, int side, int unit, std::string_view prefix,
                              std::vector<render::EffectAnchor>& out) const {
     out.clear();
@@ -647,6 +656,14 @@ bool Renderer3D::unitAnchors(const game::World& w, int side, int unit, std::stri
     for (const auto& p : pts)
         out.push_back(render::EffectAnchor{p.pos.x, p.pos.z, p.pos.y - terrain_.height(p.pos.x, p.pos.z), p.size});
     return !out.empty();
+}
+
+bool Renderer3D::buildingSurface(const game::World& w, int side, int building, float& gx, float& gy, float& z) const {
+    if (!models_ || !models_->active() || !terrainBuilt_) return false;
+    float top = 0;
+    if (!models_->buildingSurface(w, terrain_, side, building, gx, gy, top)) return false;
+    z = std::max(0.0f, top - terrain_.height(gx, gy));
+    return true;
 }
 
 bool Renderer3D::terrainDepthThrough(const Vec3& p, float& depth) const {
@@ -1100,7 +1117,7 @@ void Renderer3D::addEffects(const render::Effects& fx) {
         rgbaF(c, r, g, b, a);
         if (a <= 0.002f) return;
         FX::texRect(p.tex, u0, v0, u1, v1);
-        const Pipe pipe = p.blend == FX::Blend::Add ? kAdd : p.blend == FX::Blend::Light ? kLight : kAlpha;
+        const Pipe pipe = p.blend == FX::Blend::Add ? kAdd : p.blend == FX::Blend::Light ? kLight : p.blend == FX::Blend::Glow ? kEmit : kAlpha;
         const Vec3 base{p.x, terrain_.height(p.x, p.y) + p.z, p.y};
         float w = size, h = size, rot = p.rot * 180 / kPi;
         if (p.streak) {  // stretched along the on-screen velocity
@@ -1124,112 +1141,191 @@ void Renderer3D::addEffects(const render::Effects& fx) {
     for (const auto& p : fx.particles()) one(p);
 }
 
-// The Modern effects' light list (render::Effects::Light: drawn point, height, reach, colour with
-// the intensity in alpha) -> the shaders' point light block: lights on screen and not under the
-// shroud, the strongest (intensity x reach) first, at most kMaxPointLights. Each sits a little
-// above its point so the ground right under it is lit from above.
-void Renderer3D::buildPointLights(const Options& o, int viewW, int viewH) {
+// The frame's dynamic lights -> the light grid (render3d/lights.hpp, docs/3d-mode.md "Dynamic lights"):
+// the Modern effects' light list (render::Effects::Light: drawn point, height, reach, colour with the
+// intensity in alpha) and the lamps of the time of day (render::SceneLights: headlight cones = spot lights,
+// pools = point lights). Lights whose reach touches the view and that are not under the shroud are
+// candidates; within the budget (kMaxGridLights, far above what a battle shows) all of them are drawn, past
+// it the ones covering most of the view win - by screen coverage across the whole view, not by the distance
+// from its centre - and lamps the budget takes or drops fade in / out over ~0.3 s instead of popping.
+void Renderer3D::buildPointLights(const Options& o, int viewW, int viewH, SDL_GPUCommandBuffer* cmd, float dt, bool snap) {
     // (The block's head - the time of day's colours - was set at the start of render().)
-    int n = 0;
-    auto onScreen = [&](const Vec3& p, float reach) {
+    lightCand_.clear();
+    gridLights_.clear();
+    // Screen coverage (px^2) of a light's sphere, clipped to the view; 0 = outside / behind.
+    auto coverage = [&](const Vec3& p, float reach) {
         float sx = 0, sy = 0;
-        if (!cam_.project(p, sx, sy)) return false;
-        const float rpx = reach * cam_.pixelsPerUnit(std::max(1.0f, cam_.depthOf(p)));
-        return !(sx < -rpx || sy < -rpx || sx > float(viewW) + rpx || sy > float(viewH) + rpx);
+        if (!cam_.project(p, sx, sy)) return 0.0f;
+        const float rpx = std::max(1.0f, reach * cam_.pixelsPerUnit(std::max(1.0f, cam_.depthOf(p))));
+        const float w = std::min(float(viewW), sx + rpx) - std::max(0.0f, sx - rpx);
+        const float h = std::min(float(viewH), sy + rpx) - std::max(0.0f, sy - rpx);
+        return w > 0 && h > 0 ? std::max(1.0f, w * h) : 0.0f;
     };
-    // Lamps of the time of day (render/scene_lights.*) take the slots the effects leave, at least
-    // a third of them while lamps are on.
-    const bool lampsOn = o.lamps && !o.lamps->lamps().empty();
-    const int fxCap = lampsOn ? kMaxPointLights * 2 / 3 : kMaxPointLights;
-    if (o.effects) {
-        const auto& list = o.effects->lights();
-        lightPick_.clear();
-        for (int i = 0; i < int(list.size()); ++i) {
-            const auto& l = list[std::size_t(i)];
+    // D2K_MAX_LIGHTS (tests, measurements): the budget instead of kMaxGridLights.
+    static const int maxEnv = SDL_getenv("D2K_MAX_LIGHTS") ? std::atoi(SDL_getenv("D2K_MAX_LIGHTS")) : -1;
+    const int budget = maxEnv >= 0 ? std::min(maxEnv, kMaxGridLights) : kMaxGridLights;
+
+    const std::vector<render::Effects::Light>* fxList = o.effects ? &o.effects->lights() : nullptr;
+    if (fxList) {
+        for (int i = 0; i < int(fxList->size()); ++i) {
+            const auto& l = (*fxList)[std::size_t(i)];
             const float a = float(l.c >> 24) / 255.0f;
             if (a < 0.02f || l.size < 2) continue;
             const float gy = l.y + l.z;  // ground point under the source
             if (pointHidden(l.x, gy)) continue;
-            if (!onScreen(Vec3{l.x, terrain_.height(l.x, gy) + l.z, gy}, l.size * 0.5f)) continue;
-            lightPick_.emplace_back(a * l.size, i);
+            const float cov = coverage(Vec3{l.x, terrain_.height(l.x, gy) + l.z, gy}, l.size * 0.5f);
+            if (cov <= 0) continue;
+            // Explosions and fire are brief and strong: they go before the lamps when the budget is short.
+            lightCand_.push_back({4.0f * a * std::sqrt(cov) * l.size, 0, i});
         }
-        const std::size_t m = std::min<std::size_t>(lightPick_.size(), std::size_t(fxCap));
-        std::partial_sort(lightPick_.begin(), lightPick_.begin() + std::ptrdiff_t(m), lightPick_.end(),
-                          [](const auto& x, const auto& y) { return x.first > y.first; });
-        constexpr float kGain = 1.35f;  // matches the 2D glow (Light blend, premultiplied x 1.6) on flat ground
-        for (std::size_t k = 0; k < m; ++k) {
-            const auto& l = list[std::size_t(lightPick_[k].second)];
+    }
+    // Lamps of the time of day (render/scene_lights.*).
+    static thread_local std::vector<render::Lamp> merged;
+    merged.clear();
+    const bool lampsOn = o.lamps && !o.lamps->lamps().empty();
+    if (lampsOn) {
+        const auto& src = o.lamps->lamps();
+        if (int(src.size()) + int(lightCand_.size()) <= budget * 2) {
+            merged = src;
+        } else {
+            // Far past the budget (a huge army): headlight beams of units driving together (origins within
+            // 56 px, beams within ~30 degrees) first merge into one beam per cluster (the summed beam from
+            // their middle; the first lamp's id).
+            static thread_local std::vector<float> weight;
+            weight.clear();
+            for (const render::Lamp& l : src) {
+                if (l.kind == render::Lamp::Cone) {
+                    bool joined = false;
+                    for (std::size_t q = 0; q < merged.size() && !joined; ++q) {
+                        render::Lamp& m = merged[q];
+                        if (m.kind != render::Lamp::Cone || m.dirX * l.dirX + m.dirY * l.dirY < 0.86f) continue;
+                        if (std::hypot(m.x - l.x, m.y - l.y) > 56.0f) continue;
+                        const float wa = weight[q], wb = l.a, wt = wa + wb;
+                        m.x = (m.x * wa + l.x * wb) / wt;
+                        m.y = (m.y * wa + l.y * wb) / wt;
+                        m.z = (m.z * wa + l.z * wb) / wt;
+                        const float dx = m.dirX * wa + l.dirX * wb, dy = m.dirY * wa + l.dirY * wb, dl = std::hypot(dx, dy);
+                        if (dl > 1e-4f) m.dirX = dx / dl, m.dirY = dy / dl;
+                        m.reach = std::max(m.reach, l.reach) * 1.04f;
+                        m.spread = std::min(0.6f, std::max(m.spread, l.spread) * 1.08f);
+                        m.a = std::min(1.4f, std::max(m.a, l.a) + 0.25f * std::min(m.a, l.a));
+                        weight[q] = wt;
+                        joined = true;
+                    }
+                    if (joined) continue;
+                }
+                merged.push_back(l);
+                weight.push_back(std::max(1e-3f, l.a));
+            }
+        }
+        for (int i = 0; i < int(merged.size()); ++i) {
+            const auto& l = merged[std::size_t(i)];
+            if (pointHidden(l.x, l.y)) continue;
+            // A cone's light lies ahead of the lamp: its middle; a pool around its point.
+            const bool cone = l.kind == render::Lamp::Cone;
+            const float cx = cone ? l.x + l.dirX * l.reach * 0.5f : l.x, cy = cone ? l.y + l.dirY * l.reach * 0.5f : l.y;
+            const float cov = coverage(Vec3{cx, terrain_.height(cx, cy) + l.z, cy}, l.reach * 0.6f);
+            if (cov <= 0) continue;
+            lightCand_.push_back({l.priority * l.a * std::sqrt(cov) * l.reach, 1, i});
+        }
+    }
+    // Highest score first: the grid keeps the first lights when a cell is full, the budget the first `budget`.
+    std::sort(lightCand_.begin(), lightCand_.end(), [](const LightCand& x, const LightCand& y) { return x.score > y.score; });
+    const int nCand = int(lightCand_.size());
+
+    // Lamp fades: a lamp the budget takes fades in (from where it was), one it drops fades out and stays drawn
+    // (past the budget, at most a quarter more) until it is dark. A lamp first seen (it came into view, was
+    // just built) starts at its target: no fade where nothing popped.
+    const float step = snap ? 2.0f : std::clamp(dt, 0.0f, 0.25f) / 0.3f;
+    lampFadeNext_.clear();
+    int extra = 0;
+    const int extraCap = budget / 4;
+    constexpr float kGain = 1.35f;  // effects: matches the 2D glow (Light blend, premultiplied x 1.6) on flat ground
+    for (int k = 0; k < nCand; ++k) {
+        const LightCand& c = lightCand_[std::size_t(k)];
+        const bool inBudget = k < budget;
+        float fade = 1;
+        if (c.src == 1) {
+            const render::Lamp& l = merged[std::size_t(c.index)];
+            const auto it = l.id ? lampFade_.find(l.id) : lampFade_.end();
+            const float target = inBudget ? 1.0f : 0.0f;
+            fade = it == lampFade_.end() ? target
+                   : (target > it->second ? std::min(target, it->second + step) : std::max(target, it->second - step));
+            if (l.id) lampFadeNext_[l.id] = fade;
+            if (fade <= 0.001f) continue;
+            if (!inBudget && extra++ >= extraCap) continue;
+        } else if (!inBudget) {
+            continue;
+        }
+        GridLight g;
+        if (c.src == 0) {
+            const auto& l = (*fxList)[std::size_t(c.index)];
             const float gy = l.y + l.z;
             const float lift = 8 + 0.06f * l.size;
             const float a = float(l.c >> 24) / 255.0f * kGain;
-            lightsU_.posRadius[n][0] = l.x;
-            lightsU_.posRadius[n][1] = terrain_.height(l.x, gy) + l.z + lift;
-            lightsU_.posRadius[n][2] = gy;
-            lightsU_.posRadius[n][3] = l.size * 0.55f + lift;
-            lightsU_.color[n][0] = float(l.c & 0xFF) / 255.0f * a;
-            lightsU_.color[n][1] = float((l.c >> 8) & 0xFF) / 255.0f * a;
-            lightsU_.color[n][2] = float((l.c >> 16) & 0xFF) / 255.0f * a;
-            lightsU_.spot[n][3] = -2;
-            ++n;
-        }
-    }
-    if (lampsOn && n < kMaxPointLights) {
-        // Priority x intensity x reach, falling off with the distance from the view centre.
-        const auto& lamps = o.lamps->lamps();
-        const Vec3 c{cam_.pose().cx, 0, cam_.pose().cy};
-        lightPick_.clear();
-        for (int i = 0; i < int(lamps.size()); ++i) {
-            const auto& l = lamps[std::size_t(i)];
-            if (pointHidden(l.x, l.y)) continue;
-            const Vec3 p{l.x, terrain_.height(l.x, l.y) + l.z, l.y};
-            if (!onScreen(p, l.reach * 0.6f)) continue;
-            const float d = std::hypot(l.x - c.x, l.y - c.z);
-            lightPick_.emplace_back(l.priority * l.a * l.reach / (1.0f + d / 480.0f), i);
-        }
-        // Budget: every lit fragment loops over the whole block, so the lamps get at most 16 slots
-        // at ~1 Mpx, fewer on bigger views (8 at 4 Mpx: a Retina full-screen view); the nearest
-        // to the view centre win, the rest keep their flares. D2K_LAMP_SLOTS overrides (tests).
-        static const int lampSlotsEnv = SDL_getenv("D2K_LAMP_SLOTS") ? std::atoi(SDL_getenv("D2K_LAMP_SLOTS")) : -1;
-        const float mpx = float(viewW) * float(viewH) / 1.0e6f;
-        const int lampSlots = lampSlotsEnv >= 0 ? lampSlotsEnv : std::clamp(int(std::lround(16.0f / std::sqrt(std::max(1.0f, mpx)))), 8, 16);
-        const std::size_t m = std::min<std::size_t>(lightPick_.size(), std::size_t(std::max(0, std::min(lampSlots, kMaxPointLights - n))));
-        std::partial_sort(lightPick_.begin(), lightPick_.begin() + std::ptrdiff_t(m), lightPick_.end(),
-                          [](const auto& x, const auto& y) { return x.first > y.first; });
-        for (std::size_t k = 0; k < m; ++k) {
-            const auto& l = lamps[std::size_t(lightPick_[k].second)];
-            const float g = terrain_.height(l.x, l.y);
+            g.posRadius[0] = l.x;
+            g.posRadius[1] = terrain_.height(l.x, gy) + l.z + lift;
+            g.posRadius[2] = gy;
+            g.posRadius[3] = l.size * 0.55f + lift;
+            g.color[0] = float(l.c & 0xFF) / 255.0f * a;
+            g.color[1] = float((l.c >> 8) & 0xFF) / 255.0f * a;
+            g.color[2] = float((l.c >> 16) & 0xFF) / 255.0f * a;
+            g.boundSphere();
+        } else {
+            const render::Lamp& l = merged[std::size_t(c.index)];
+            const float gh = terrain_.height(l.x, l.y);
+            const float f = fade * fade * (3 - 2 * fade);
             if (l.kind == render::Lamp::Cone) {
                 // A beam from the lamp, tilted down to reach the ground about half way along it.
                 const float ahead = l.reach * 0.5f;
                 const Vec3 d = normalize(Vec3{l.dirX * ahead, -l.z - 2, l.dirY * ahead});
-                lightsU_.posRadius[n][0] = l.x;
-                lightsU_.posRadius[n][1] = g + l.z + 2;
-                lightsU_.posRadius[n][2] = l.y;
-                lightsU_.posRadius[n][3] = l.reach * 1.1f;
-                lightsU_.spot[n][0] = d.x;
-                lightsU_.spot[n][1] = d.y;
-                lightsU_.spot[n][2] = d.z;
-                lightsU_.spot[n][3] = std::cos(std::min(1.3f, l.spread * 1.15f));
-                const float a = l.a * 1.8f;  // a beam is narrow: brighter than a pool
-                lightsU_.color[n][0] = l.r * a;
-                lightsU_.color[n][1] = l.g * a;
-                lightsU_.color[n][2] = l.b * a;
+                g.posRadius[0] = l.x;
+                g.posRadius[1] = gh + l.z + 2;
+                g.posRadius[2] = l.y;
+                g.posRadius[3] = l.reach * 1.1f;
+                g.spot[0] = d.x;
+                g.spot[1] = d.y;
+                g.spot[2] = d.z;
+                g.spot[3] = std::cos(std::min(1.3f, l.spread * 1.15f));
+                const float a = l.a * 1.8f * f;  // a beam is narrow: brighter than a pool
+                g.color[0] = l.r * a;
+                g.color[1] = l.g * a;
+                g.color[2] = l.b * a;
+                g.boundSpot();
             } else {
                 const float lift = 6 + 0.05f * l.reach;
-                lightsU_.posRadius[n][0] = l.x;
-                lightsU_.posRadius[n][1] = g + l.z + lift;
-                lightsU_.posRadius[n][2] = l.y;
-                lightsU_.posRadius[n][3] = l.reach * 0.55f + lift;
-                lightsU_.spot[n][3] = -2;
-                const float a = l.a * 1.05f;
-                lightsU_.color[n][0] = l.r * a;
-                lightsU_.color[n][1] = l.g * a;
-                lightsU_.color[n][2] = l.b * a;
+                g.posRadius[0] = l.x;
+                g.posRadius[1] = gh + l.z + lift;
+                g.posRadius[2] = l.y;
+                g.posRadius[3] = l.reach * 0.55f + lift;
+                const float a = l.a * 1.05f * f;
+                g.color[0] = l.r * a;
+                g.color[1] = l.g * a;
+                g.color[2] = l.b * a;
+                g.boundSphere();
             }
-            ++n;
         }
+        gridLights_.push_back(g);
     }
-    lightsU_.info[0] = float(n);
+    lampFade_.swap(lampFadeNext_);
+
+    lightGrid_.build(gridLights_);
+    lightGrid_.place(lightsU_);
+    if (lightGrid_.lights > 0) {
+        if (!lightBuf_.buffer()) lightBuf_.init(dev_, std::uint32_t(kLightBufferVec4) * 16u);
+        lightBuf_.upload(cmd, lightGrid_.words.data(), std::uint32_t(lightGrid_.words.size() * 4));
+        if (!lightBuf_.buffer()) lightsU_.info[0] = 0;  // no buffer: no lights (the shaders read nothing)
+    }
+    lightStats_[0] = nCand;
+    lightStats_[1] = lightGrid_.lights;
+    lightStats_[2] = lightGrid_.maxInCell;
+    lightStats_[3] = lightGrid_.droppedEntries;
+    static const bool logOn = SDL_getenv("D2K_LIGHT_LOG") != nullptr;
+    static int logFrame = 0;
+    if (logOn && (++logFrame % 60) == 1)
+        SDL_Log("3D lights: %d candidates (%d lamps), %d drawn, grid %dx%d cells of %.0f px, max %d in a cell, %d entries dropped",
+                nCand, int(merged.size()), lightGrid_.lights, lightGrid_.gw, lightGrid_.gh, double(lightGrid_.cell),
+                lightGrid_.maxInCell, lightGrid_.droppedEntries);
 }
 
 // Weld flashes (render/weld_fx.hpp): a blue-white halo and a white core at the anchor the arc is
@@ -1240,8 +1336,41 @@ void Renderer3D::addWeldFlashes(const game::World& w) {
         const auto& side = w.sides()[std::size_t(si)];
         for (int bi = side.firstBuilding; bi >= 0; bi = side.nextObject(bi)) {
             const auto& b = side.buildings[std::size_t(bi)];
-            if (!b.alive || !(b.flags & 0x30) || (b.flags & 0x6) || buildingHidden(b)) continue;
-            if (!models_->hasBuildingModel(b.type) || !buildingAnchors(w, si, bi, "fx_weld", weldTmp_)) continue;
+            static const bool workAll = std::getenv("D2K_WORK_ALL") != nullptr;
+            if (!b.alive || (!(b.flags & 0x30) && !workAll) || (b.flags & 0x6) || buildingHidden(b)) continue;
+            if (!models_->hasBuildingModel(b.type)) continue;
+            if (!weldTex_) weldTex_ = render::makeWeldGlowTexture(r_);
+            SDL_GPUTexture* wt = tex(weldTex_);
+            if (!wt) return;
+            auto lamp = [&](const render::EffectAnchor& an, float size, const float* c, float a) {
+                const Vec3 base{an.x, terrain_.height(an.x, an.y) + an.z, an.y};
+                const float s = size * an.size;
+                pushBillboard(wt, base, -s * 0.5f, -s * 0.5f, s, s, 0, kAdd, c[0], c[1], c[2], std::min(1.0f, a), 0, 10,
+                              an.x - s * 0.5f, an.y - an.z - s * 0.5f, false);
+            };
+            static const float kWhiteHot[3] = {1.0f, 0.93f, 0.75f};
+            // Working lamps (fx_work*) and the launch flame (fx_launch*): render/weld_fx.hpp.
+            if (buildingAnchors(w, si, bi, "fx_work", weldTmp_)) {
+                float a[render::kMaxWorkLamps];
+                bool on = render::workLamps(w, b, t_, int(weldTmp_.size()), a);
+                if (workAll) std::fill(a, a + render::kMaxWorkLamps, 1.0f), on = true;
+                for (std::size_t q = 0; on && q < weldTmp_.size() && q < std::size_t(render::kMaxWorkLamps); ++q)
+                    if (a[q] > 0.01f) {
+                        lamp(weldTmp_[q], 18, render::kWorkLamp, a[q]);
+                        lamp(weldTmp_[q], 7, kWhiteHot, a[q]);
+                    }
+            }
+            if (buildingAnchors(w, si, bi, "fx_launch", weldTmp_)) {
+                float a = 0, s = 1;
+                bool on = render::launchFlame(w, b, t_, a, s);
+                if (workAll) a = 1, s = 1, on = true;
+                for (std::size_t q = 0; on && q < weldTmp_.size(); ++q) {
+                    lamp(weldTmp_[q], 64 * s, render::kLaunchHalo, 0.8f * a);
+                    lamp(weldTmp_[q], 22 * s, render::kLaunchCore, a);
+                }
+            }
+            if (!(b.flags & 0x30)) continue;
+            if (!buildingAnchors(w, si, bi, "fx_weld", weldTmp_)) continue;
             render::WeldFlash fl;
             static const bool all = std::getenv("D2K_WELD_ALL") != nullptr;  // check: every anchor lit, steady
             if (all) fl = render::WeldFlash{0, 1, 1};
@@ -1423,7 +1552,7 @@ void Renderer3D::addBuilding(const game::World& w, const game::Building& bld) {
     // of the original overlay (render/weld_fx.hpp; as MapRenderer::drawBuilding).
     if (animSp && !(bld.flags & 0x6) && !collapsing && packAnchors_ &&
         packAnchors_->buildingAnchors(w, bld.side, bld.index, "fx_weld", weldTmp_)) {
-        animSp = nullptr;
+        if (!packAnchors_->buildingOverlayKeep(bld.type)) animSp = nullptr;  // models.ini overlay = keep
         render::WeldFlash fl;
         if (render::weldFlash(w, bld, t_, int(weldTmp_.size()), fl)) {
             if (!weldTex_) weldTex_ = render::makeWeldGlowTexture(r_);
@@ -1443,7 +1572,38 @@ void Renderer3D::addBuilding(const game::World& w, const game::Building& bld) {
             }
         }
     }
+    // models.ini overlay = off (render::PackAnchors): no original overlay on the redesigned card.
+    if (animSp && !(bld.flags & 0x6) && packAnchors_ && packAnchors_->buildingOverlayOff(bld.type)) animSp = nullptr;
     if (animSp) lay(animSp, anchorX, anchorY, animAdditive ? kAdd : kAlpha, animAdditive ? 0.0f : flash, 0.04f);
+    // Working lamps / launch flame on the card (fx_work*, fx_launch*: render/weld_fx.hpp; as MapRenderer).
+    if (!(bld.flags & 0x6) && !collapsing && packAnchors_) {
+        static const float kWhiteHot[3] = {1.0f, 0.93f, 0.75f};
+        auto cardGlow = [&](const render::EffectAnchor& an, float s, const float* c, float a) {
+            if (!weldTex_) weldTex_ = render::makeWeldGlowTexture(r_);
+            SDL_GPUTexture* t = tex(weldTex_);
+            if (!t || a <= 0.01f) return;
+            const float gx = an.x, gy = an.y - an.z;  // the point on the 2D art
+            const std::size_t n0 = insts_.size();
+            pushBillboard(t, Vec3{ax3, top, ay3}, gx - cxw - s * 0.5f, gy - (bld.tileY * 32.0f + fh * 32.0f) - s * 0.5f, s, s, 0,
+                          kAdd, c[0], c[1], c[2], std::min(1.0f, a), 0, 4.05f, gx - s * 0.5f, gy - s * 0.5f, true);
+            if (insts_.size() > n0) insts_.back().depth = centreDepth - 0.05f;
+        };
+        if (packAnchors_->buildingAnchors(w, bld.side, bld.index, "fx_work", weldTmp_)) {
+            float a[render::kMaxWorkLamps];
+            if (render::workLamps(w, bld, t_, int(weldTmp_.size()), a))
+                for (std::size_t q = 0; q < weldTmp_.size() && q < std::size_t(render::kMaxWorkLamps); ++q) {
+                    cardGlow(weldTmp_[q], 18 * weldTmp_[q].size, render::kWorkLamp, a[q]);
+                    cardGlow(weldTmp_[q], 7 * weldTmp_[q].size, kWhiteHot, a[q]);
+                }
+        }
+        float la = 0, ls = 1;
+        if (packAnchors_->buildingAnchors(w, bld.side, bld.index, "fx_launch", weldTmp_) &&
+            render::launchFlame(w, bld, t_, la, ls))
+            for (const auto& an : weldTmp_) {
+                cardGlow(an, 64 * ls * an.size, render::kLaunchHalo, 0.8f * la);
+                cardGlow(an, 22 * ls * an.size, render::kLaunchCore, la);
+            }
+    }
     if ((bld.flags & 0x1) && ((static_cast<std::uint32_t>(bld.index) + w.gameTicks()) & 0x20)) {
         const render::Sprite* ref = mainSp ? mainSp : objSprite(first);
         const render::Sprite* icon = sprite(3, -1);  // repair wrench
@@ -1461,8 +1621,17 @@ void Renderer3D::addUnit(const game::World& w, const game::Unit& unit, const Opt
     const auto& u = t_.bin.units[unit.type];
     if (u.specialBehavior == 5) return;  // sandworms: no sprite (see MapRenderer::drawUnit)
     const int house = w.sides()[unit.side].house;
-    const float gx = float(game::fixToPixel(unit.posX)), gy = float(game::fixToPixel(unit.posY));
-    const float z = float(game::fixToPixel(unit.posZ));
+    float gx = float(game::fixToPixel(unit.posX)), gy = float(game::fixToPixel(unit.posY));
+    float z = float(game::fixToPixel(unit.posZ));
+    // Vehicle animation: Modern - a sprite card bounces and recoils with the hull (no pitch / roll).
+    float kickX = 0, kickY = 0;
+    if (const render::VehicleMotion::Pose* vp = vm_ ? vm_->pose(unit.side, unit.index) : nullptr) {
+        gx -= vp->shotX * vp->recoil;
+        gy -= vp->shotY * vp->recoil;
+        z += vp->lift + vp->tremble;
+        kickX = -vp->shotX * vp->turretRecoil;
+        kickY = -vp->shotY * vp->turretRecoil;
+    }
     float flash = (unit.flicker & 2) ? 0.43f : 0.0f, alpha = 1;
     if (unit.flags & 0x4) {
         if (unit.side != o.playerSide) return;
@@ -1514,7 +1683,7 @@ void Renderer3D::addUnit(const game::World& w, const game::Unit& unit, const Opt
         if (t_.bin.unitArtDirectionFrames[u.barrelArt] != 32) rot = 0;
         const int frame = t_.unitArtFirstFrame[u.barrelArt] + u.directionFrames[(f32 - yawSteps_) & 31];
         if (const render::Sprite* sp = objectSprite(frame, house, "unit turret", unit.type, t_.bin.unitNames[unit.type]))
-            billboard(sp, gx, gy, z + deck, -float(sp->frame->x), -float(sp->frame->y), kAlpha, alpha, flash,
+            billboard(sp, gx + kickX, gy + kickY, z + deck, -float(sp->frame->x), -float(sp->frame->y), kAlpha, alpha, flash,
                       0.5f + deckBias, 1, 1, 1, rot);
     }
 }
@@ -1569,7 +1738,18 @@ bool Renderer3D::ensureDesigned() {
 void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW, int viewH, float dt, const Options& o) {
     const Uint64 t0 = SDL_GetTicksNS();
     drawCalls_ = 0;
-    if (!ensureTargets(viewW, viewH)) return;
+    // 3D resolution (docs/3d-mode.md "Performance"): the pass at a fraction of the view (whole
+    // pixels), scaled up. The targets have the size of the largest scale expected; a smaller one
+    // renders into their top-left part (viewport), so the scale can change every frame for free.
+    const float rsMax = std::clamp(std::max(o.renderScaleMax, o.renderScale), 0.25f, 1.0f);
+    const float rs = std::clamp(o.renderScale, 0.25f, rsMax);
+    auto px = [](int v, float s) { return s >= 0.999f ? v : std::max(1, int(std::lround(float(v) * s))); };
+    const int rw = std::min(px(viewW, rs), px(viewW, rsMax)), rh = std::min(px(viewH, rs), px(viewH, rsMax));
+    if (!ensureTargets(px(viewW, rsMax), px(viewH, rsMax))) return;
+    if (models_) models_->setEffects(o.effects);
+    rw_ = rw;
+    rh_ = rh;
+    SDL_SetTextureScaleMode(sceneSdl_, rw == viewW && rh == viewH ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR);
     bool snap = o.snapCamera;
     const bool designed = o.designedTerrain && ensureDesigned();
     const TerrainStyle style = designed && o.faithfulTerrain ? TerrainStyle::Faithful : TerrainStyle::Designed;
@@ -1666,7 +1846,10 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
     // Scene.
     newTextures_ = false;
     lamps_ = o.lamps;
-    collect(w, o);
+    {
+        render::FrameProbe::Scope ps("3dCollect");
+        collect(w, o);
+    }
     SDL_GPUTexture* shroudTex = clearMask_;
     if (o.showShroud && shroud_) {
         if (SDL_Texture* m = shroud_->mask(w)) {
@@ -1729,7 +1912,14 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
     if (atlasDirty_) buildTileArray();  // its own command buffers, submitted before this frame's
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(dev_);
     if (!cmd) return;
-    if (designed) designed_->prepare(cmd);
+    // The sun's view (the shadow pass below) is known now: the rocks are culled to it and to the camera.
+    const bool shadowPass = o.shadowMap && terrainVB_ && terrainIB_;
+    float lightRange = 1;
+    const Mat4 lightFit = shadowPass ? fitLight(float(w.width() * 32), float(w.height() * 32), lightRange) : Mat4{};
+    if (designed) {
+        designed_->cullRocks(cam_.viewProj(), shadowPass ? &lightFit : nullptr);
+        designed_->prepare(cmd);
+    }
 
     // Uploads: one copy pass with temporary transfer buffers for the rare ones.
     std::vector<SDL_GPUTransferBuffer*> temps;
@@ -1871,6 +2061,7 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
         // before prepare(): it collects the draws, and a building's emission strength needs these two
         mf.lamps = o.light && !o.light->identity ? o.light->lamps : 0.0f;
         mf.time = double(w.gameTicks()) / 20.0;
+        render::FrameProbe::Scope ps("3dModelPrep");
         models_->prepare(dev_, cmd, mf);
     }
     // Sun shadow map (docs/3d-mode.md "Sun shadows"): a depth pass from the sun over the terrain,
@@ -1879,10 +2070,10 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
     float shadowU[4] = {0, 1.0f / float(kShadowSize), kShadowKeep, 0};
     Mat4 lightVP;
     shadowMs_ = 0;
-    if (o.shadowMap && terrainVB_ && terrainIB_) {
+    if (shadowPass) {
         const Uint64 ts = SDL_GetTicksNS();
-        float range = 1;
-        lightVP = fitLight(mapW, mapH, range);
+        const float range = lightRange;
+        lightVP = lightFit;
         shadowU[0] = 1;
         shadowU[3] = 1.0f / range;  // 1 world px of extra depth bias
         mf.lightViewProj = lightVP;
@@ -1905,19 +2096,27 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
             SDL_BindGPUIndexBuffer(sp, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
             SDL_DrawGPUIndexedPrimitives(sp, terrainIndexCount_, 1, 0, 0, 0);
             ++drawCalls_;
-            if (designed) drawCalls_ += designed_->drawShadow(sp, cmd, lightVP, shadowFmt_);
+            if (designed) drawCalls_ += designed_->drawShadow(sp, cmd, lightVP, shadowFmt_, designed_->shadowRocks());
             if (drawModels) drawCalls_ += models_->drawShadowDepth(sp, cmd, mf);
             SDL_EndGPURenderPass(sp);
         }
         shadowMs_ = double(SDL_GetTicksNS() - ts) / 1e6;
+        if (render::FrameProbe::get().on) render::FrameProbe::get().add("3dShadowRec", SDL_GetTicksNS() - ts);
     }
     mf.shadowMap = shadowTex_;
     mf.shadowSampler = shadowSampler_;
     std::memcpy(mf.shadow, shadowU, sizeof shadowU);
     const bool shadowOn = shadowU[0] > 0.5f;
-    buildPointLights(o, viewW, viewH);
+    buildPointLights(o, viewW, viewH, cmd, dt, snap);
     mf.lights = &lightsU_;
+    mf.lightGrid = lightBuf_.buffer();
     SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &cti, 1, &dti);
+    if (pass && (rw != tw_ || rh != th_)) {
+        const SDL_GPUViewport vpt{0, 0, float(rw), float(rh), 0, 1};
+        SDL_SetGPUViewport(pass, &vpt);
+        const SDL_Rect sc{0, 0, rw, rh};
+        SDL_SetGPUScissor(pass, &sc);
+    }
     if (pass) {
         // Dynamic point lights: fragment uniform buffer 1 of terrain_fs / sprite_fs (the designed
         // terrain and the models push theirs from the same block).
@@ -1941,9 +2140,11 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
             std::memcpy(df.shadow, shadowU, sizeof shadowU);
             if (shadowOn) df.darkest = kShadowKeep;
             df.lights = &lightsU_;
-            drawCalls_ += designed_->draw(pass, cmd, terrainVB_, terrainIB_, terrainIndexCount_, df);
+            df.lightGrid = lightBuf_.buffer();
+            drawCalls_ += designed_->draw(pass, cmd, terrainVB_, terrainIB_, terrainIndexCount_, df, 0, designed_->viewRocks());
         } else if (terrainVB_ && terrainIB_ && tileArray_ && tileMap_) {
             SDL_BindGPUGraphicsPipeline(pass, terrainPipe_);
+            bindLightGrid(pass, lightBuf_.buffer(), lightFallback_, dev_);
             TerrainVU tvu;
             std::memcpy(tvu.viewProj, vp.m, sizeof tvu.viewProj);
             SDL_PushGPUVertexUniformData(cmd, 0, &tvu, sizeof tvu);
@@ -1989,9 +2190,10 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
                 if (in.pipe != curPipe) {
                     curPipe = in.pipe;
                     SDL_BindGPUGraphicsPipeline(pass, spritePipe_[curPipe]);
+                    bindLightGrid(pass, lightBuf_.buffer(), lightFallback_, dev_);
                     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                     SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
-                    const float mode = curPipe == kAlpha ? 0.0f : curPipe == kMul ? 2.0f : 1.0f;  // kLight: as additive
+                    const float mode = curPipe == kAlpha ? 0.0f : curPipe == kMul ? 2.0f : 1.0f;  // kLight / kEmit: unlit, as additive
                     SpriteFU sfu{{mode, o.showShroud ? 1.0f : 0.0f, mapW, mapH}, {fogRgb_[0], fogRgb_[1], fogRgb_[2], 1},
                                  {shadowU[0], shadowU[1], spriteFloor, shadowU[3]}};
                     SDL_PushGPUFragmentUniformData(cmd, 0, &sfu, sizeof sfu);
@@ -2030,23 +2232,26 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
             n = 0;
         }
     } else {
+        render::FrameProbe::Scope ps("3dSubmit");
         SDL_SubmitGPUCommandBuffer(cmd);
     }
 
+    render::FrameProbe::Scope postScope("3dPost");
     const SDL_FRect dst{0, 0, float(viewW), float(viewH)};
+    const SDL_FRect src{0, 0, float(rw), float(rh)};
     const bool bloomOn = o.bloom && o.light && o.light->bloom > 0.001f;
     if (hdrScene() && o.hdr) {
         // HDR scene: bloom from the unclamped values, both through the tone map (render/hdr.*);
         // without the Modern lighting just clamped (the picture from before).
-        SDL_Texture* glow = bloomOn ? o.bloom->compute(sceneSdl_, viewW, viewH, o.light->bloomThreshold) : nullptr;
-        if (!o.hdr->compose(sceneSdl_, viewW, viewH, glow, bloomOn ? o.light->bloom : 0.0f, dst, o.light != nullptr))
-            SDL_RenderTexture(r_, sceneSdl_, nullptr, &dst);
+        SDL_Texture* glow = bloomOn ? o.bloom->compute(sceneSdl_, rw, rh, o.light->bloomThreshold) : nullptr;
+        if (!o.hdr->compose(sceneSdl_, rw, rh, glow, bloomOn ? o.light->bloom : 0.0f, dst, o.light != nullptr))
+            SDL_RenderTexture(r_, sceneSdl_, &src, &dst);
         drawPostRefraction(viewW, viewH);
     } else {
-        SDL_RenderTexture(r_, sceneSdl_, nullptr, &dst);
+        SDL_RenderTexture(r_, sceneSdl_, &src, &dst);
         drawPostRefraction(viewW, viewH);
         // Modern lighting: bloom around the brightest parts of the picture (render/bloom.*).
-        if (bloomOn) o.bloom->apply(sceneSdl_, viewW, viewH, dst, o.light->bloom, o.light->bloomThreshold);
+        if (bloomOn) o.bloom->apply(sceneSdl_, rw, rh, dst, o.light->bloom, o.light->bloomThreshold);
     }
     drawSunGlare(viewW, viewH, o);
     cpuMs_ = double(SDL_GetTicksNS() - t0) / 1e6;
@@ -2144,17 +2349,21 @@ float Renderer3D::drawSunGlare(int viewW, int viewH, const Options& o) {
 // exact for that linear map (nearest sampling keeps the pixels crisp) - and the Modern beams'
 // heat haze (Effects::buildHaze; the beam is in the picture, so its own line is bent less).
 void Renderer3D::drawPostRefraction(int viewW, int viewH) {
-    if (!sceneSdl_ || tw_ <= 0 || th_ <= 0) return;
-    const float iw = 1.0f / float(tw_), ih = 1.0f / float(th_);
+    if (!sceneSdl_ || tw_ <= 0 || th_ <= 0 || rw_ <= 0 || rh_ <= 0 || viewW <= 0 || viewH <= 0) return;
+    // Texture coordinates of view points: the picture fills rw_ x rh_ of the tw_ x th_ targets
+    // (renderScale).
+    const float iw = float(rw_) / (float(viewW) * float(tw_)), ih = float(rh_) / (float(viewH) * float(th_));
     if (fx_ && fx_->hasHaze()) {
         fx_->buildHaze(
             postV_, postI_,
-            [&](float wx, float wy, float& sx, float& sy) { return worldToScreen(wx, wy, 2, sx, sy); }, float(tw_),
-            float(th_), true);
+            [&](float wx, float wy, float& sx, float& sy) { return worldToScreen(wx, wy, 2, sx, sy); }, 1.0f / iw,
+            1.0f / ih, true);
         if (!postI_.empty()) {
+            SDL_ScaleMode prev = SDL_SCALEMODE_NEAREST;
+            SDL_GetTextureScaleMode(sceneSdl_, &prev);
             SDL_SetTextureScaleMode(sceneSdl_, SDL_SCALEMODE_LINEAR);
             SDL_RenderGeometry(r_, sceneSdl_, postV_.data(), int(postV_.size()), postI_.data(), int(postI_.size()));
-            SDL_SetTextureScaleMode(sceneSdl_, SDL_SCALEMODE_NEAREST);
+            SDL_SetTextureScaleMode(sceneSdl_, prev);
         }
     }
     if (lenses_.empty()) return;
@@ -2188,29 +2397,136 @@ bool Renderer3D::screenToGround(float sx, float sy, float& wx, float& wy) const 
     return true;
 }
 
+// Picking (docs/3d-mode.md "Picking"): the object drawn under the cursor wins, nearest first along
+// the eye ray; the terrain point only when no object is hit (or the ground is nearer).
+//  - Building models: ray against their triangles (ModelHook::rayBuilding). A hit returns the centre
+//    of one of the building's cells (the one nearest the hit point, preferring cells without a unit
+//    on them), so the World's cell queries (smartOrder, buildingAt) see the building exactly as a
+//    click on its footprint in 2D - also where the model overhangs its cells or rises over the
+//    ground behind it.
+//  - Units: their model's box (ModelHook::rayUnit), else (billboards, and as a forgiving margin) a
+//    screen radius around their ground point; returns the unit's position.
+// D2K_PICK_LOG=1 logs every pick.
+static bool pickLog() {
+    static const bool on = [] {
+        const char* e = std::getenv("D2K_PICK_LOG");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
 bool Renderer3D::pick(const game::World& w, float sx, float sy, float& wx, float& wy) const {
-    if (!screenToGround(sx, sy, wx, wy)) return false;
-    // A unit drawn under the cursor wins over the terrain point behind it.
-    float best = 1e9f;
-    for (const auto& side : w.sides())
+    if (!terrainBuilt_) return false;
+    Vec3 o, d;
+    cam_.ray(sx, sy, o, d);
+    Vec3 ground;
+    const bool groundHit = terrain_.raycast(o, d, ground);
+    const float best = groundHit ? dot(ground - o, d) : 1e30f;
+    if (groundHit) wx = ground.x, wy = ground.z;
+    const bool models = models_ && models_->active();
+    // Cheap cull before the per-object model tests: the object's ground point (world px, x / z)
+    // farther from the ray than its bounding radius r cannot be hit.
+    auto nearRay = [&](float gx, float gy, float r) {
+        const Vec3 p{gx, terrain_.height(gx, gy), gy};
+        const Vec3 v = p - o;
+        const float along = dot(v, d);
+        const Vec3 off = v - d * along;
+        return dot(off, off) <= r * r;
+    };
+    // Units: the model box hit nearest along the ray; else the unit nearest on screen within its radius.
+    float unitT = 1e30f, unitScreen = 1e9f;
+    float ux = 0, uy = 0;
+    bool unitBox = false, unitAny = false;
+    for (std::size_t si = 0; si < w.sides().size(); ++si) {
+        const auto& side = w.sides()[si];
         for (int i = side.firstUnit; i >= 0; i = side.nextObject(i)) {
             const auto& u = side.units[i];
             if (!u.alive || (u.flags & 0x600000)) continue;
-            const bool inf = t_.bin.units[u.type].isInfantry;
             const float gx = float(game::fixToPixel(u.posX)), gy = float(game::fixToPixel(u.posY));
+            if (models && models_->hasUnitModel(u.type) &&
+                nearRay(gx, gy, 48.0f + std::max(0.0f, models_->unitModelHeight(u.type)) +
+                                    float(game::fixToPixel(u.posZ) & 0xff))) {
+                const float t = models_->rayUnit(w, terrain_, int(si), i, o, d);
+                if (t > 0 && (!unitBox || t < unitT)) {
+                    unitBox = unitAny = true;
+                    unitT = t;
+                    ux = gx, uy = gy;
+                }
+            }
+            if (unitBox) continue;  // a box hit beats any radius hit
+            const bool inf = t_.bin.units[u.type].isInfantry;
             const float z = float(game::fixToPixel(u.posZ) & 0xff);
             const Vec3 p{gx, terrain_.height(gx, gy) + z, gy};
             float px = 0, py = 0;
             if (!cam_.project(p, px, py)) continue;
-            const float r = (inf ? 8.0f : 14.0f) * cam_.pixelsPerUnit(cam_.depthOf(p));
-            const float d = std::hypot(px - sx, py - sy);
-            if (d < r && d < best) {
-                best = d;
-                wx = gx;
-                wy = gy;
+            const float rw = inf ? 8.0f : 14.0f;
+            const float r = rw * cam_.pixelsPerUnit(cam_.depthOf(p));
+            const float dd = std::hypot(px - sx, py - sy);
+            if (dd < r && dd < unitScreen) {
+                unitScreen = dd;
+                unitAny = true;
+                // Depth of the hit: the unit's point, pulled towards the eye by its size (it stands
+                // on a deck / in front of the wall it touches).
+                unitT = std::max(0.0f, dot(p - o, d) - rw * 1.5f);
+                ux = gx, uy = gy;
             }
         }
-    return true;
+    }
+    // Buildings: the model triangles nearest along the ray.
+    int hitSide = -1, hitIdx = -1;
+    float buildT = 1e30f;
+    if (models) {
+        for (std::size_t si = 0; si < w.sides().size(); ++si) {
+            const auto& side = w.sides()[si];
+            for (int i = side.firstBuilding; i >= 0; i = side.nextObject(i)) {
+                const auto& b = side.buildings[i];
+                if (!b.alive || (b.flags & 0x100000) || !models_->hasBuildingModel(b.type)) continue;
+                if (t_.bin.buildings[b.type].specialBehavior == game::building_behaviour::kConcrete) continue;
+                const auto& bt = t_.bin.buildings[b.type];
+                const float fw = float(std::max(1, int(bt.artWidth) / 32)), fh = float(std::max(1, int(bt.artHeight) / 32));
+                if (!nearRay(b.tileX * 32.0f + fw * 16, b.tileY * 32.0f + fh * 16,
+                             std::hypot(fw, fh) * 16 + 32 + std::max(0.0f, models_->buildingModelHeight(b.type))))
+                    continue;
+                if (frameWorld_ && buildingHidden(b)) continue;
+                const float t = models_->rayBuilding(w, terrain_, int(si), i, o, d);
+                if (t > 0 && t < buildT) buildT = t, hitSide = int(si), hitIdx = i;
+            }
+        }
+    }
+    // The ground in front of an object hides it (a ridge); small slack for parts sunk into the ground.
+    constexpr float kSlack = 2.0f;
+    if (unitAny && unitT <= best + kSlack && unitT <= buildT) {
+        wx = ux, wy = uy;
+        if (pickLog()) SDL_Log("pick (%.0f,%.0f): unit at (%.0f,%.0f)%s", sx, sy, ux, uy, unitBox ? " [model box]" : " [radius]");
+        return true;
+    }
+    if (hitIdx >= 0 && buildT <= best + kSlack) {
+        const Vec3 h = o + d * buildT;
+        const auto& b = w.sides()[std::size_t(hitSide)].buildings[std::size_t(hitIdx)];
+        const auto& t = t_.bin.buildings[b.type];
+        const int fw = std::max(1, int(t.artWidth) / 32), fh = std::max(1, int(t.artHeight) / 32);
+        float bestD = 1e30f;
+        int cx = -1, cy = -1;
+        for (int y = b.tileY; y < b.tileY + fh; ++y)
+            for (int x = b.tileX; x < b.tileX + fw; ++x) {
+                int bs = -1, bi = -1, us = -1, ui = -1;
+                if (!w.buildingAt(x, y, bs, bi) || bs != hitSide || bi != hitIdx) continue;
+                const float mx = float(x * 32 + 16), my = float(y * 32 + 16);
+                float dd = (mx - h.x) * (mx - h.x) + (my - h.z) * (my - h.z);
+                if (w.unitAt(int(mx), int(my), us, ui, false)) dd += 1e6f;  // a unit there would take the click
+                if (dd < bestD) bestD = dd, cx = x, cy = y;
+            }
+        if (cx >= 0) {
+            wx = float(cx * 32 + 16);
+            wy = float(cy * 32 + 16);
+            if (pickLog())
+                SDL_Log("pick (%.0f,%.0f): building %d:%d %s, model hit (%.0f,%.0f) -> cell (%d,%d); ground under cursor (%.0f,%.0f)",
+                        sx, sy, hitSide, hitIdx, t_.bin.buildingNames[b.type], h.x, h.z, cx, cy, ground.x, ground.z);
+            return true;
+        }
+    }
+    if (pickLog()) SDL_Log("pick (%.0f,%.0f): ground (%.0f,%.0f)", sx, sy, wx, wy);
+    return groundHit;
 }
 
 bool Renderer3D::worldToScreen(float wx, float wy, float above, float& sx, float& sy) const {
@@ -2306,7 +2622,11 @@ void Renderer3D::drawOverlays(const game::World& w, const Options& o) {
         for (int i = side.firstUnit; i >= 0; i = side.nextObject(i)) {
             const auto& u = side.units[i];
             if (!u.alive || (u.flags & 0x1200100) || u.state == game::UnitState::Dead) continue;
-            if (!u.selected && o.healthBars != 2) continue;
+            const bool own = u.side == o.playerSide;
+            const bool badge = own && o.groupNumbers > 0 && o.groupFont && u.groupId >= 1 && u.groupId <= 10 &&
+                               (u.selected || o.groupNumbers == 2);
+            const bool showBar = u.selected || o.healthBars == 2;
+            if (!showBar && !badge) continue;
             if ((u.flags & 0x4) && u.side != o.playerSide) continue;
             if (pointHidden(float(game::fixToPixel(u.posX)), float(game::fixToPixel(u.posY)))) continue;
             const auto& t = t_.bin.units[u.type];
@@ -2323,8 +2643,13 @@ void Renderer3D::drawOverlays(const game::World& w, const Options& o) {
             const float mh = models_ && models_->active() ? models_->unitModelHeight(u.type) : -1.0f;
             float tx = 0, ty = 0;
             if (mh >= 0 && cam_.project(Vec3{base.x, base.y + mh + 3, base.z}, tx, ty)) lift = std::max(lift, sy - ty + 2 * z);
-            bar(sx, sy - lift - 3 * z, h * ppw, std::round(3 * z),
-                std::clamp(float(u.health) / float(t.hitPoints), 0.f, 1.f));
+            if (showBar)
+                bar(sx, sy - lift - 3 * z, h * ppw, std::round(3 * z),
+                    std::clamp(float(u.health) / float(t.hitPoints), 0.f, 1.f));
+            // Control-group badge left of the bar (render/group_badge.hpp).
+            if (badge)
+                render::drawGroupBadge(r_, o.groupFont, u.groupId, std::round(sx - h * ppw) - std::round(2 * z),
+                                       std::round(sy - lift - 3 * z) + std::round(1.5f * z), z);
             if (u.selected && t.specialBehavior == 1 && u.side == o.playerSide) {  // harvester load
                 const int load = std::min<int>(u.byte29, 7);
                 const float gap = std::round(z), segW = (2 * h * ppw - 6 * gap) / 7.f;

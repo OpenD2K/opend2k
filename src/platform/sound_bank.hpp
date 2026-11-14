@@ -3,7 +3,9 @@
 // sample index -> (name, file); files live in GAMESFX/SOUND.RS (*.wav) or as
 // GAMESFX[Eng]/*.AUD. The speech language (platform/language.hpp) puts its own folder (GAMESFXFre,
 // the Russian translation's GAMESFX) or the Russian PS1 disc's speech banks first. Clips are
-// decoded lazily and cached.
+// decoded lazily and cached; startPrefetch() decodes every sample of the table on a worker thread
+// (a PS1 speech bank is a few MB read from the disc image - from an SD card that took 50-150 ms on
+// the main thread the first time a unit answered an order, and froze the game and its cursor).
 
 #include "formats/aud.hpp"
 #include "formats/ps1_sound.hpp"
@@ -11,16 +13,26 @@
 #include "formats/uib.hpp"
 #include "game/sound_system.hpp"
 
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 namespace d2k::platform {
 
 class SoundBank {
 public:
     explicit SoundBank(const std::string& dataDir);
+    ~SoundBank();
+    SoundBank(const SoundBank&) = delete;
+    SoundBank& operator=(const SoundBank&) = delete;
+    // Decodes every sample of the current table (and overlay) in the background (~0.3-0.5 s, under
+    // 20 MB of PCM). byId / byName meanwhile still work (a clip the worker has not reached yet is
+    // decoded at once, as before).
+    void startPrefetch();
     const formats::AudClip* byId(int id);
     const formats::AudClip* byName(const std::string& sampleName);  // e.g. "S_MANDYING1"
     // Where the sample's clip comes from (file path, "SOUND.RS", "ps1:<bank>#<slot>"; "" = missing).
@@ -30,10 +42,15 @@ public:
     // Community missions: a mods folder's data/ (GAMESFX*, UI_DATA/samples.uib) is searched
     // before the game's while set ("" = none; docs/community-campaigns.md). Clips stay cached
     // per folder, so sounds still playing keep their data.
-    void setOverlay(const std::string& modsData);
+    bool setOverlay(const std::string& modsData);  // true = changed
 
 private:
     const formats::AudClip* resolve(const std::string& file);
+    const formats::AudClip* resolveLocked(const std::string& file);
+    void stopPrefetch();
+    std::recursive_mutex mutex_;  // everything below (the worker and the main thread)
+    std::thread worker_;
+    std::atomic<bool> stop_{false};
     std::string dataDir_;
     std::string voicesDir_;  // the speech language's GAMESFX folder (searched first; "" = none)
     std::unique_ptr<formats::ps1::SpeechBanks> ps1_;  // Русский (PS1): the disc's speech banks

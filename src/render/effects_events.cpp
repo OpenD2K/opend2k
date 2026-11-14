@@ -997,6 +997,37 @@ void Effects::updateWeldSparks(const game::World& w, float dt, const Camera& cam
             if (bx + 128 < vx0 || bx > vx1 || by + 128 < vy0 || by > vy1) continue;
             if (showShroud && w.inBounds(b.tileX + 1, b.tileY + 1) && (w.cell(b.tileX + 1, b.tileY + 1).shroud & 0xF) == 1)
                 continue;
+            // A launch (fx_launch*, render/weld_fx.hpp launchFlame): exhaust smoke billowing out of the silo
+            // mouth, light grey lit warm from below, and a few embers.
+            float la = 0, ls = 1;
+            if (anchors_->buildingAnchors(w, s, i, "fx_launch", anchorTmp_) && launchFlame(w, b, t_, la, ls))
+                for (const EffectAnchor& an : anchorTmp_) {
+                    const float want = dt * 40.0f * la * load();
+                    int n = int(want);
+                    if (rnd() < want - float(n)) ++n;
+                    for (int k = 0; k < n; ++k) {
+                        Particle p{};
+                        const float a = rnd(0, 6.2831853f), r = rnd(0, 3) * an.size;
+                        p.x = an.x + std::cos(a) * r;
+                        p.y = an.y + std::sin(a) * r * 0.7f;
+                        p.z = an.z + rnd(0, 4);
+                        p.vx = std::cos(a) * rnd(8, 22) + kWindX;
+                        p.vy = std::sin(a) * rnd(6, 16) + kWindY;
+                        p.vz = rnd(10, 40);
+                        p.drag = 0.9f;
+                        p.life = rnd(1.4f, 2.4f);
+                        p.size0 = rnd(7, 10) * an.size;
+                        p.size1 = rnd(30, 44) * an.size;
+                        const int g = int(rnd(150, 190));
+                        p.c0 = rgba(std::min(255, g + 60), g, std::max(0, g - 60), int(rnd(150, 190)));
+                        p.c1 = rgba(g - 20, g - 22, g - 24, 0);
+                        p.tex = kSmoke;
+                        p.blend = Blend::Alpha;
+                        p.rot = rnd(0, 2 * kPi);
+                        p.vrot = rnd(-0.6f, 0.6f);
+                        add(p);
+                    }
+                }
             if (!anchors_->buildingAnchors(w, s, i, "fx_weld", anchorTmp_) || anchorTmp_.empty()) continue;
             WeldFlash fl;
             if (!weldFlash(w, b, t_, int(anchorTmp_.size()), fl)) continue;
@@ -1356,7 +1387,7 @@ void Effects::spawnWormStrike(const game::World& w, const TileAtlas& atlas, floa
     addScorch(x, y, 230, 1.5f, 3, 0.8f, lerpColour(sand, light, 0.4f));
     addScorch(x, y, 64, 12.0f, 6, 1.0f, sand);
     if (!scorch_.empty()) scorch_.back().rot = rnd(0, 2 * kPi);
-    addTrauma(x, y, 0.22f, cam, viewW, viewH);
+    // (no screen shake: the original shakes the screen only for destroyed buildings - owner 2026-11-14)
 }
 
 // EX_WORMDUST (with the maw): the dust of the swallow hanging over the spot and settling - slow

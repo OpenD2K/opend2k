@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <string>
 
 namespace d2k::render {
@@ -63,12 +64,14 @@ void Effects::reset() {
     sonic_.clear();
     wrecks_.clear();
     fires_.clear();
+    burns_.clear();
     vents_.clear();
     flashes_.clear();
     scorch_.clear();
     worms_.clear();
     marks_.clear();
     pending_.clear();
+    for (auto& v : lastShot_) v.clear();
     for (auto& v : seenEx_) v.clear();
     for (auto& v : seenBullet_) v.clear();
     for (auto& v : units_) v.clear();
@@ -98,6 +101,7 @@ void Effects::buildTextures() {
                 const float u = (float(x) + 0.5f) / kTexCell * 2 - 1, v = (float(y) + 0.5f) / kTexCell * 2 - 1;
                 const float r = std::sqrt(u * u + v * v);
                 float a = 0, lum = 1;
+                float rgb[3] = {-1, -1, -1};  // >= 0: a coloured cell (flame tongues), else grey lum
                 switch (t) {
                 case kGlow: a = std::exp(-r * r * 4.5f) * std::clamp((1 - r) * 4, 0.0f, 1.0f); break;
                 case kSmoke: {
@@ -218,6 +222,36 @@ void Effects::buildTextures() {
                     a = std::clamp((1 - rr) * 6, 0.0f, 1.0f);
                     break;
                 }
+                case kTongue:
+                case kTongue2: {
+                    // A flame tongue: base at u = -1 (round, widest), tip at u = +1 (ragged, wavy), the
+                    // colour baked in by heat - white-yellow in the core near the base, yellow, orange,
+                    // dark red at the edges and the tip (the vertex colour cools / fades it).
+                    const int sd = t == kTongue ? 0 : 40;
+                    const float h = std::clamp((u + 0.82f) / 1.74f, 0.0f, 1.0f);  // 0 base .. 1 tip
+                    const float wave = (noise2(h * 2.6f + 3 + float(sd), 1.7f, 151 + sd) - 0.5f) * 0.55f * h;
+                    const float n = 0.6f * noise2(u * 4 + 5 + float(sd), v * 4 + 2, 157 + sd) + 0.4f * noise2(u * 9 + 1, v * 9 + 7 + float(sd), 163 + sd);
+                    float wd = 0.58f * std::pow(1 - h, 0.62f) * (0.82f + 0.36f * n);
+                    if (u < -0.62f) wd *= std::sqrt(std::max(0.0f, 1 - std::pow((-0.62f - u) / 0.3f, 2.0f)));  // round base
+                    const float dd = wd > 0.001f ? 1 - std::abs(v - wave) / wd : 0.0f;  // 1 on the axis .. 0 at the edge
+                    a = std::clamp(dd / 0.55f, 0.0f, 1.0f);
+                    a = a * a * (3 - 2 * a) * std::clamp((1 - h) * 3.2f + 0.15f, 0.0f, 1.0f);
+                    // heat: hottest on the axis low down
+                    const float heat = std::clamp(dd * (1.15f - 1.05f * h) + 0.12f * (n - 0.5f), 0.0f, 1.0f);
+                    struct Stop { float k, r, g, b; };
+                    static constexpr Stop kRamp[] = {{0.0f, 0.42f, 0.06f, 0.02f}, {0.22f, 0.78f, 0.18f, 0.03f},
+                                                     {0.45f, 1.0f, 0.46f, 0.07f}, {0.68f, 1.0f, 0.72f, 0.24f},
+                                                     {0.86f, 1.0f, 0.92f, 0.62f}, {1.0f, 1.0f, 0.98f, 0.88f}};
+                    for (int q = 0; q + 1 < int(std::size(kRamp)); ++q)
+                        if (heat <= kRamp[q + 1].k || q + 2 == int(std::size(kRamp))) {
+                            const float f = std::clamp((heat - kRamp[q].k) / (kRamp[q + 1].k - kRamp[q].k), 0.0f, 1.0f);
+                            rgb[0] = kRamp[q].r + (kRamp[q + 1].r - kRamp[q].r) * f;
+                            rgb[1] = kRamp[q].g + (kRamp[q + 1].g - kRamp[q].g) * f;
+                            rgb[2] = kRamp[q].b + (kRamp[q + 1].b - kRamp[q].b) * f;
+                            break;
+                        }
+                    break;
+                }
                 default: break;
                 }
                 // 1px transparent border per cell so linear filtering never bleeds between cells.
@@ -225,7 +259,9 @@ void Effects::buildTextures() {
                 if (((x == 0 || x == kTexCell - 1) && t != kLine) || y == 0 || y == H - 1) a = 0;
                 if (t == kGlowPM) lum = a;  // premultiplied: the Light blend ignores alpha
                 const int A = std::clamp(int(a * 255 + 0.5f), 0, 255), L = std::clamp(int(lum * 255 + 0.5f), 0, 255);
-                px[static_cast<std::size_t>(y) * W + t * kTexCell + x] = rgba(L, L, L, A);
+                auto ch = [](float c) { return std::clamp(int(c * 255 + 0.5f), 0, 255); };
+                px[static_cast<std::size_t>(y) * W + t * kTexCell + x] =
+                    rgb[0] >= 0 ? rgba(ch(rgb[0]), ch(rgb[1]), ch(rgb[2]), A) : rgba(L, L, L, A);
             }
     atlasTex_ = SDL_CreateTexture(r_, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, W, H);
     if (atlasTex_) {
@@ -495,12 +531,42 @@ void Effects::emitContinuous(const game::World& w, const TileAtlas& atlas, float
             approach(v.facing, u.facing);
             approach(v.turret, u.facingTurret);
             v.moving = dist > 0.02f;
+            const bool setOff = v.moving && v.still > 0.6f;  // after standing a while
+            v.still = v.moving ? 0.0f : v.still + dt;
             const bool wheels = wheeled_[u.type] != 0;
             if (!inView(x, y) || shrouded(x, y)) continue;
             const int tx = int(x) >> 5, ty = int(y) >> 5;
             const std::uint32_t cf = w.inBounds(tx, ty) ? w.cell(tx, ty).flags : 0;
             const bool concrete = (cf & game::cell_flags::kConcrete) != 0;
             const bool sand = (cf & game::cell_flags::kSand) && !concrete;
+            if (setOff && vehicleAnim_) {
+                // Vehicle animation: Modern - the tracks / wheels kick up a puff of dust as the
+                // vehicle sets off (behind it and to the sides; less on rock, little on concrete).
+                const float ux = dx / dist, uy = dy / dist;
+                const int n = concrete ? 2 : sand ? 9 : 5;
+                const std::uint32_t sandC = scaleRgb(terrainColour(w, atlas, x, y), 1.08f);
+                for (int k = 0; k < n; ++k) {
+                    const float side = (k & 1) ? 1.0f : -1.0f;
+                    Particle p{};
+                    p.x = x - ux * 9 - uy * side * rnd(3, 7);
+                    p.y = y - uy * 9 + ux * side * rnd(3, 7);
+                    p.z = 1;
+                    p.vx = -ux * rnd(14, 30) - uy * side * rnd(4, 12) + kWindX * 0.5f;
+                    p.vy = -uy * rnd(14, 30) + ux * side * rnd(4, 12);
+                    p.vz = rnd(4, 10);
+                    p.drag = 2.0f;
+                    p.life = rnd(0.7f, 1.3f);
+                    p.size0 = rnd(5, 8);
+                    p.size1 = rnd(16, 24);
+                    p.c0 = withAlpha(sandC, concrete ? 60 : 105);
+                    p.c1 = withAlpha(sandC, 0);
+                    p.tex = kSmoke;
+                    p.blend = Blend::Alpha;
+                    p.rot = rnd(0, 6.28f);
+                    p.vrot = rnd(-0.8f, 0.8f);
+                    add(p);
+                }
+            }
             if (v.moving && !concrete) {
                 const float ux = dx / dist, uy = dy / dist;
                 if (!wheels && sand) {
@@ -830,14 +896,8 @@ void Effects::updateWrecks(const game::World& w, const TileAtlas& atlas, float d
             p.life = rnd(0.28f, 0.5f);
             p.size0 = rnd(8, 12) * sz;
             p.size1 = rnd(3, 5) * sz;
-            const bool hot = rnd() < 0.35f;
-            p.tex = kFlame;
-            p.blend = hot ? Blend::Add : Blend::Alpha;
-            p.c0 = hot ? rgba(255, 210, 120, 220) : rgba(255, 150, 60, 190);
-            p.c1 = hot ? rgba(220, 60, 10, 0) : rgba(140, 40, 10, 0);
-            p.rot = rnd(0, 6.28f);
-            p.vrot = rnd(-2, 2);
-            add(p);
+            // The same flame tongues as the building fires (render/effects_fire.cpp).
+            flameLick(p.x, p.y, 1, std::max(0.3f, sz * 0.75f), 0.3f);
             if (rnd() < f.smoke) {  // a little smoke (burning wrecks: a column)
                 Particle q = p;
                 q.tex = kSmoke;
@@ -1091,6 +1151,7 @@ void Effects::buildMarks() {
     marks_.clear();
     bloomMarks();  // spice bloom mounds (under every other mark)
     wormMarks();   // the sand humps of moving worms
+    burnMarks();   // soot around burning buildings (render/effects_fire.cpp)
     for (const Wreck& k : wrecks_) {
         const float e = time_ - k.start;
         const float cx = (k.x0 + k.x1) * 0.5f, cy = (k.y0 + k.y1) * 0.5f;
@@ -1469,6 +1530,7 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
     updateWorms(w, atlas, dt, cam, viewW, viewH, showShroud);  // (render/effects_events.cpp)
     updateRefineryVents(w, dt, cam, viewW, viewH, showShroud);  // (render/effects_events.cpp)
     updateWeldSparks(w, dt, cam, viewW, viewH, showShroud);     // (render/effects_events.cpp)
+    updateBurns(w, dt, cam, viewW, viewH, showShroud);          // (render/effects_fire.cpp)
     // The death explosions of a wrecked building (EX_BUILDING, 2 per solid tile) do not shake on
     // their own: the wreck shakes by the building's size.
     auto inWreck = [&](float x, float y) -> const Wreck* {
@@ -1538,6 +1600,11 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
             }
             if (fresh && c != ExClass::None) {
                 // Original non-weapon events (render/effects_events.cpp).
+                // A damaged building's smoke / flame point feeds its fire (render/effects_fire.cpp).
+                if ((c == ExClass::Smoke || c == ExClass::Flame) && feedBurn(w, x, y - z, c == ExClass::Flame)) {
+                    ss.done = true;
+                    continue;
+                }
                 if (c == ExClass::Smoke) {
                     spawnDamageSmoke(w, x, y, z);
                     continue;
@@ -1589,7 +1656,7 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
                     spawnExplosion(ExClass::Big, x + rnd(-4, 4), y + rnd(-4, 4), z + rnd(0, 10), age, cam, viewW, viewH, atlas, w,
                                    crowd(bursts, x, y) && rnd() < 0.6f, side.house, rnd(0.7f, 1.05f), 0.0f);
                 } else {
-                    spawnExplosion(c, x, y, z, age, cam, viewW, viewH, atlas, w, big && crowd(bursts, x, y), side.house, scale, 1.0f);
+                    spawnExplosion(c, x, y, z, age, cam, viewW, viewH, atlas, w, big && crowd(bursts, x, y), side.house, scale, 0.0f);  // no shake: the original shakes only for buildings (owner 2026-11-14)
                 }
             }
             if (ss.done) continue;
@@ -1636,8 +1703,43 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
             if (!b.alive || b.type < 0 || b.type >= formats::kMaxWeapons) continue;
             SlotSeen& ss = seenB[i];
             const std::int32_t key = b.type + 1;
-            const float x = float(b.posX) / 65536.0f, y = float(b.posY) / 65536.0f, z = float(b.posZ) / 65536.0f;
-            if (ss.key != key || b.moveSteps > ss.a) {
+            float x = float(b.posX) / 65536.0f, y = float(b.posY) / 65536.0f, z = float(b.posZ) / 65536.0f;
+            const bool fresh = ss.key != key || b.moveSteps > ss.a;
+            if (fresh) {
+                // Barrel tips (docs/enhanced-graphics.md "Barrel tips"): the bullet starts inside
+                // the firer (its position + ShootOffset); it is drawn from the gun's end instead,
+                // the offset shrinking to nothing by the time it reaches its target.
+                ss.ox = ss.oy = ss.oz = ss.d0 = 0;
+                if (!first && b.firerIndex >= 0 && b.firerIndex < int(side.links.size()) &&
+                    side.links[std::size_t(b.firerIndex)].kind == game::SlotKind::Unit) {
+                    const auto& ls = lastShot_[std::size_t(s)];
+                    const std::uint32_t now = w.gameTicks();
+                    EffectAnchor m;
+                    bool have = false;
+                    if (b.firerIndex < int(ls.size()) && ls[std::size_t(b.firerIndex)].valid &&
+                        ls[std::size_t(b.firerIndex)].tick + 2 >= now) {
+                        m = ls[std::size_t(b.firerIndex)].at;
+                        have = true;
+                    } else if (muzzlePoints(w, s, b.firerIndex, muzzleTmp_)) {
+                        m = muzzleTmp_[0];
+                        have = true;
+                    }
+                    const float d0 = std::hypot(float(b.targetX) - x, float(b.targetY) - y);
+                    if (have && d0 > 4 && std::hypot(m.x - x, m.y - y) < 48) {
+                        ss.ox = m.x - x;
+                        ss.oy = m.y - y;
+                        ss.oz = m.z - z;
+                        ss.d0 = d0;
+                    }
+                }
+            }
+            if (ss.d0 > 0) {
+                const float k = std::clamp(std::hypot(float(b.targetX) - x, float(b.targetY) - y) / ss.d0, 0.0f, 1.0f);
+                x += ss.ox * k;
+                y += ss.oy * k;
+                z = std::max(0.0f, z + ss.oz * k);
+            }
+            if (fresh) {
                 if (ss.key >= 0) ended(ss);
                 ss.done = first;  // the first frame shows bullets mid-flight: no muzzle flash
                 ss.lx = x;
@@ -2130,8 +2232,10 @@ void Effects::drawAir(const Camera& cam) {
                                                : lerpColour(p.c0, p.c1, (p.fx & kFxHot) ? t * t : t);
         float am = 1;
         if (p.tex == kSmoke && t < 0.12f) am = t / 0.12f;  // soft fade-in for smoke
+        // (Glow: over-blended like Alpha, in the same batch so the draw order holds, but not graded.)
         auto& dst = p.blend == Blend::Add ? vAdd_ : p.blend == Blend::Light ? vLight_ : vAlpha_;
         if (p.blend == Blend::Light) c = premultiplied(c, 1.0f);
+        const std::size_t first = dst.size();
         if (p.len > 0) {
             quad(dst, sx, sy, p.len * z * 0.5f, size * 0.5f, p.rot, c, am, p.tex);
         } else if (p.streak) {
@@ -2142,14 +2246,41 @@ void Effects::drawAir(const Camera& cam) {
         } else {
             quad(dst, sx, sy, size * 0.5f, size * 0.5f, p.rot, c, am, p.tex);
         }
+        // The time of day's grade on what only reflects light (smoke, dust), as the battlefield got it.
+        if (graded_ && p.blend == Blend::Alpha)
+            for (std::size_t k = first; k < dst.size(); ++k) {
+                dst[k].color.r *= grade_[0];
+                dst[k].color.g *= grade_[1];
+                dst[k].color.b *= grade_[2];
+            }
     };
     for (const auto& p : beams_) one(p);
     for (const auto& p : particles_) one(p);
+    // The light glows: dst * (1 + c) over the picture the time of day already darkened by the grade.
+    // A light lights the ground's own colour, so its colour is divided by the grade (as the lamps do,
+    // render/scene_lights.cpp) - in up to three passes of at most x2 (vertex colours stop at 1).
+    // Without this, a warm light at night multiplied the blue-graded ground: red doubled, green
+    // barely, blue kept - fires and explosions lit the night pink / purple.
+    float boost[3] = {1, 1, 1};
+    if (graded_)
+        for (int i = 0; i < 3; ++i) boost[i] = 1.0f / std::max(0.25f, grade_[i]);
     for (const auto& l : lights_) {
         const float s = l.size * z;
         const float sx = l.x * z - ox, sy = l.y * z - oy;
         if (sx < -s || sy < -s || sx > vw + s || sy > vh + s) continue;
-        quad(vLight_, sx, sy, s * 0.5f, s * 0.5f, 0, premultiplied(l.c, 1.6f), 1, kGlowPM);
+        const std::uint32_t pc = premultiplied(l.c, 1.6f);
+        if (!graded_) {
+            quad(vLight_, sx, sy, s * 0.5f, s * 0.5f, 0, pc, 1, kGlowPM);
+            continue;
+        }
+        float want[3] = {float(pc & 0xFF) / 255.0f * boost[0], float((pc >> 8) & 0xFF) / 255.0f * boost[1],
+                         float((pc >> 16) & 0xFF) / 255.0f * boost[2]};
+        const float top = std::max({want[0], want[1], want[2]});
+        const int passes = !lightBlendOk_ || top <= 1.0f ? 1 : top <= 3.0f ? 2 : 3;
+        for (float& v : want)
+            v = std::min(1.0f, passes == 1 ? v : std::pow(1.0f + std::min(v, 7.0f), 1.0f / float(passes)) - 1.0f);
+        const std::uint32_t gc = rgba(int(want[0] * 255 + 0.5f), int(want[1] * 255 + 0.5f), int(want[2] * 255 + 0.5f), 255);
+        for (int k = 0; k < passes; ++k) quad(vLight_, sx, sy, s * 0.5f, s * 0.5f, 0, gc, 1, kGlowPM);
     }
     flush(vAlpha_, Blend::Alpha, atlasTex_);
     flush(vLight_, Blend::Light, atlasTex_);

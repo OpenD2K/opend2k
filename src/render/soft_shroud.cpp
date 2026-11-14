@@ -19,6 +19,9 @@ constexpr float kSigma = 2.0f;
 constexpr int kRadius = 6;
 // Blurred-mask values mapped to black .. full light (see rebuild step 4).
 constexpr float kDark = 0.35f, kLight = 0.95f;
+// A clear cell with at most this many clear cells (itself included) in its 5 x 5 neighbourhood
+// is a small opening (a shooter's cell revealed by FireAt) and keeps full light.
+constexpr int kHoleCells = 4;
 
 struct Kernel {
     float w[2 * kRadius + 1];
@@ -168,10 +171,42 @@ void SoftShroud::rebuild(const game::World&, int cx0, int cy0, int cx1, int cy1)
         const float v = std::clamp((b - lo) / (hi - lo), 0.0f, 1.0f);
         return v * v * (3 - 2 * v);
     };
+    // Small reveals (FireAt clears the cell of a shooter attacking the player - one clear cell
+    // with edge pieces around it, re/notes/shroud.md §6): their blurred masks never get above
+    // 0.5, so the hole stayed black while the radar showed it. A clear cell (low nibble 0) with
+    // at most kHoleCells clear cells in its 5 x 5 neighbourhood keeps full light, and the
+    // non-hidden texels of the edge pieces next to it keep the original piece's brightness
+    // (base_), so the hole looks like the original's cell + edge ring. Ordinary boundaries have
+    // many clear cells around their first clear cell and are untouched.
+    auto clearCell = [&](int cx, int cy) {
+        return cx >= 0 && cy >= 0 && cx < cw_ && cy < ch_ && (last_[std::size_t(cy) * cw_ + cx] & 0xF) == 0;
+    };
+    auto holeCell = [&](int cx, int cy) {
+        if (!clearCell(cx, cy)) return false;
+        int n = 0;
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx) n += clearCell(cx + dx, cy + dy);
+        return n <= kHoleCells;
+    };
     for (int y = oy0; y < oy1; ++y)
         for (int x = ox0; x < ox1; ++x) {
             const std::size_t i = std::size_t(y) * tw + x;
-            const float v = hidden_[i] ? 0.0f : ramp(blur_[i], kDark, kLight) * ramp(open_[i], 0.5f, kLight);
+            float v = hidden_[i] ? 0.0f : ramp(blur_[i], kDark, kLight) * ramp(open_[i], 0.5f, kLight);
+            if (!hidden_[i]) {
+                const int cx = x / K, cy = y / K;
+                if (clearCell(cx, cy)) {
+                    if (holeCell(cx, cy)) v = 1.0f;
+                } else {
+                    // The cells of the 8 neighbouring texels (an edge texel touches at most 3 other cells).
+                    bool h = false;
+                    for (int dy = -1; dy <= 1 && !h; ++dy)
+                        for (int dx = -1; dx <= 1 && !h; ++dx) {
+                            const int nx = (x + dx) / K, ny = (y + dy) / K;
+                            if (x + dx >= 0 && y + dy >= 0 && (nx != cx || ny != cy)) h = holeCell(nx, ny);
+                        }
+                    if (h) v = std::max(v, base_[i]);
+                }
+            }
             const auto a = std::uint32_t(std::lround((1.0f - v) * 255.0f));
             px_[i] = a << 24;  // black, alpha = darkness
         }

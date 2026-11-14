@@ -646,7 +646,7 @@ void World::updatePickupQueue(Side& s) {
         PickupEntry& e = s.pickup[i];
         if (e.state == 3) e.state = 0;
         if (e.state == 0) continue;
-        Unit& v = s.units[static_cast<std::size_t>(e.unitIndex) % kObjectsPerSide];
+        Unit& v = s.units[static_cast<std::size_t>(e.unitIndex) % s.units.size()];
         if (v.state == UnitState::Dead) {
             e.state = 3;
             unitAdjustState(v, e.origState);
@@ -755,7 +755,7 @@ void World::updateDeliveries(Side& s) {
                 starportRefund(s);
                 return;
             }
-            const Building& sp = s.buildings[static_cast<std::size_t>(pi) % kObjectsPerSide];
+            const Building& sp = s.buildings[static_cast<std::size_t>(pi) % s.buildings.size()];
             const int sx = div32(px16(sp.posX)) + 1, sy = div32(px16(sp.posY)) - 2;
             ex = sx;
             ey = sy;
@@ -1027,7 +1027,7 @@ void World::updateFlyingDown(Unit& u) {
                 return;
             }
             // The primary starport moved (destroyed / another one made primary): fly there.
-            const Building& sp = s.buildings[static_cast<std::size_t>(pi) % kObjectsPerSide];
+            const Building& sp = s.buildings[static_cast<std::size_t>(pi) % s.buildings.size()];
             const int sx = (div32(px16(sp.posX)) + 1) & 0xff, sy = (div32(px16(sp.posY)) - 2) & 0xff;
             if (sx != (u.blockToX & 0xff) || sy != (u.blockToY & 0xff)) {
                 unitAdjustState(u, UnitState::FlyingUp);
@@ -1077,7 +1077,7 @@ void World::updateFlyingDown(Unit& u) {
             return;
         }
     }
-    Unit& v = s.units[static_cast<std::size_t>(u.enemyIndex) % kObjectsPerSide];
+    Unit& v = s.units[static_cast<std::size_t>(u.enemyIndex) % s.units.size()];
     if (u.posZ == 0x3c0000 && !(f & kCarrying) && !rotateFlyerBody(u, v.facing)) return;
     if (u.posZ >= 0xa0001) {
         u.posZ -= 0x10000;
@@ -1125,7 +1125,7 @@ void World::updateFlyingUp(Unit& u) {  // case 0x14
 void World::dragCargo(Unit& c) {
     if (unitTemplate(c).specialBehavior != behaviour::kCarryall || (c.flags & kDelivery) || !(c.flags & kCarrying)) return;
     if (c.enemyIndex == kNoIndex) return;  // DebugFatal
-    Unit& v = sides_[c.side].units[static_cast<std::size_t>(c.enemyIndex) % kObjectsPerSide];
+    Unit& v = sides_[c.side].units[static_cast<std::size_t>(c.enemyIndex) % sides_[c.side].units.size()];
     if (!(v.flags & kCarrying)) return;
     v.blockToX = c.blockToX;
     v.blockToY = c.blockToY;

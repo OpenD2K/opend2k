@@ -41,6 +41,17 @@ namespace d2k::game {
 constexpr int kMaxSides = 8;
 constexpr int kObjectsPerSide = 1000;     // CSide::objects[1000], shared by all object kinds
 constexpr int kMaxUnitsPerSide = kObjectsPerSide;  // UpdateUnit 0x497b90 assert
+// "Unit limit: Unlimited" (not original, Rules::unlimitedObjects): a full pool grows by
+// kPoolGrowStep slots up to this ceiling (Cell::buildingIndex and the AI's records keep indices
+// in 16 bits). The capacity is reserved at game start, so growing never moves an object.
+constexpr int kMaxObjectsUnlimited = 10000;
+constexpr int kPoolGrowStep = 1000;
+// The Generate*Order functions (0x459450..0x459c40) put at most 0x40 unit indices into one
+// order; "Order limit: Unlimited" (not original) lifts it (World::setOrderUnitLimit).
+constexpr int kOrderUnitsOriginal = 64;
+// MissionMessage::textId of ModelAddUnit / ModelAddBuilding's "ReachedUnitLimit" message (a
+// text key, not an index: the frontend looks the key up in Text.UIB).
+constexpr int kTextReachedUnitLimit = -2;
 constexpr int kRouteLength = 12;
 constexpr int kNoIndex = 0xFFFF;          // "no object" in 16-bit index fields
 
@@ -402,7 +413,8 @@ struct Side {
     // CSide object pool (CSide::Init 0x46b990, AllocObject 0x46bd40, LinkObject 0x46bd60,
     // FreeObject 0x46bdb0): one LIFO free list over all 1000 slots (first allocation = 999)
     // and per-kind doubly linked lists in insertion order (update order follows them).
-    std::array<ObjectLink, kObjectsPerSide> links{};
+    // kObjectsPerSide entries (more when the pool grew: "Unit limit: Unlimited").
+    std::vector<ObjectLink> links;
     int firstUnit = -1, lastUnit = -1, firstBuilding = -1, lastBuilding = -1;
     int firstBullet = -1, lastBullet = -1, firstExplosion = -1, lastExplosion = -1;
     std::vector<int> freeList;  // top = back()
@@ -449,7 +461,11 @@ struct Side {
     bool starportInitialised = false;                                  // not original
 
     void initPool();                   // CSide::Init
-    int allocObject();                 // -1 when the pool is exhausted
+    // -1 when the pool is exhausted (CSide::AllocObject returns null); `grow` (Unlimited, not
+    // original): a full pool first grows by kPoolGrowStep slots up to kMaxObjectsUnlimited.
+    int allocObject(bool grow = false);
+    void reservePool(int slots);       // capacity for `slots` (no reallocation while growing)
+    int poolSize() const { return static_cast<int>(links.size()); }
     void linkObject(int index, SlotKind kind);
     void freeObject(int index);
     int nextObject(int index) const { return links[index].next; }
@@ -543,6 +559,7 @@ struct Rules {
     // Null = the same masks built in (shroud.cpp).
     const std::vector<std::uint8_t>* circles = nullptr;
     const RulesExt* ext = nullptr;  // null = the defaults (vanilla behaviour)
+    bool unlimitedObjects = false;  // "Unit limit: Unlimited" (not original), see kMaxObjectsUnlimited
 };
 
 // --- Economy / production API types (see production.cpp and re/notes/economy.md) ---
@@ -759,6 +776,30 @@ public:
     std::uint32_t gameTicks() const { return gameTicks_; }
     Random& rng() { return rng_; }
     const Rules& rules() const { return rules_; }
+    // "Unit limit" (not original): false = the original 1000 shared slots per side; chosen when
+    // the game starts (Rules::unlimitedObjects) and saved with it.
+    bool unlimitedObjects() const { return unlimitedObjects_; }
+    // "Order limit" (not original; a UI setting, not saved): how many selected units one group
+    // order reaches - kOrderUnitsOriginal like the original's Generate*Order, 0 = all of them.
+    int orderUnitLimit() const { return orderUnitLimit_; }
+    void setOrderUnitLimit(int n) { orderUnitLimit_ = n < 0 ? 0 : n; }
+    // The units a group order of `side` reaches (Generate*Order 0x459450..0x459c40): the selected
+    // units that are not dead (state 0x11), in the side's list order, passing `filter`, at most
+    // orderUnitLimit() of them. The original stops collecting at 0x40 - the rest get no order.
+    template <class F> std::vector<int> orderGroup(int side, F&& filter) const {
+        std::vector<int> out;
+        if (side < 0 || side >= kMaxSides) return out;
+        const Side& s = sides_[side];
+        for (int i = s.firstUnit; i != -1; i = s.nextObject(i)) {
+            if (orderUnitLimit_ > 0 && static_cast<int>(out.size()) >= orderUnitLimit_) break;
+            const Unit& u = s.units[static_cast<std::size_t>(i)];
+            if (u.selected && u.state != UnitState::Dead && filter(u)) out.push_back(i);
+        }
+        return out;
+    }
+    std::vector<int> orderGroup(int side) const {
+        return orderGroup(side, [](const Unit&) { return true; });
+    }
     int mySide() const { return mySide_; }
     std::uint8_t diplomacy(int observer, int other) const { return diplomacy_[observer & 7][other & 7]; }
     void setDiplomacy(int observer, int other, std::uint8_t v) { diplomacy_[observer & 7][other & 7] = v; }
@@ -1425,6 +1466,8 @@ private:
     Random rng_;
     Rules rules_;
     int mySide_ = 0;
+    bool unlimitedObjects_ = false;              // saved (v8)
+    int orderUnitLimit_ = kOrderUnitsOriginal;   // UI setting, not saved
     std::vector<Order> orders_;
     PathFinder pathFinder_;
     std::vector<SoundEvent> sounds_;

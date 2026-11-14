@@ -9,6 +9,7 @@
 #include "platform/options.hpp"
 #include "platform/settings.hpp"
 #include "game/sound_system.hpp"
+#include "render/hdr.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -58,6 +59,7 @@ private:
     std::string previewStage_;  // --render-previews: the temporary art pack folder (removed at exit)
     void persistSettings();
     void drawCursor();
+    bool systemCursorFailed_ = false;  // SDL could not make the game's cursor a system cursor: drawn instead
     // Frame-time overlay (Settings::perfOverlay; iPad: four-finger tap): the last second's fps,
     // frame and CPU (update + render, before present) times, the output size and the device.
     void drawPerfOverlay();
@@ -85,10 +87,19 @@ private:
     int hdrCheckFrames_ = 0;  // frames until the backbuffer format is checked
     std::unique_ptr<render::Hdr> hdrOut_;
     SDL_Texture* canvas_ = nullptr;
+    bool hdrWanted_ = false;  // EDR output asked for and possible (the swapchain follows the display)
+    int restoreHeight_ = 0;
+    std::uint64_t presents_ = 0;   // retargetHdr: the window height to restore after one frame
     bool setHdrSwapchain(bool hdr);
+    bool edrDisplay(bool log);
+    void retargetHdr();
     void updateHdrHeadroom(bool log);
     void beginFrame();
+    void resolveFrame();
     void presentFrame();
+    bool canvasFrame_ = false;    // this frame is drawn into canvas_ (EDR, or SDR with display adjustments)
+    bool frameResolved_ = false;  // canvas_ already drawn into the backbuffer (resolveFrame)
+    render::DisplayAdjust displayAdjust() const;
     bool renderFull_ = false;  // window created with SDL_WINDOW_HIGH_PIXEL_DENSITY (Settings::fullPixelDensity)
     Uint64 nextFrameNs_ = 0;   // manual pacing deadline (no vsync)
     std::unique_ptr<Ui> ui_;

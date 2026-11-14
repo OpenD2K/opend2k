@@ -58,11 +58,12 @@ SceneLight fixedTime(TimeOfDay t, LightingStyle s) {
         // Cool blue moonlight, still readable: the moon high, a dark blue sky.
         l.dAz = 12;
         l.elK = 1.1f;
-        set3(l.sun, 0.28f, 0.37f, 0.58f);
-        set3(l.amb, 0.25f, 0.31f, 0.48f);
-        set3(l.fog, 0.22f, 0.28f, 0.42f);
+        // (owner 2026-11-14: a little more moonlight so units read better; slightly less blue.)
+        set3(l.sun, 0.36f, 0.44f, 0.62f);
+        set3(l.amb, 0.31f, 0.36f, 0.50f);
+        set3(l.fog, 0.24f, 0.29f, 0.42f);
         l.lamps = 1.0f;
-        l.sat = 0.55f;
+        l.sat = 0.62f;
         break;
     }
     l.identity = false;
@@ -141,6 +142,7 @@ SpriteShadowWarp spriteShadowWarp(const SceneLight& l) {
     // Long shadows fade (up to a quarter at twice the length) - the softer penumbra of a low sun.
     const float fade = 1 - 0.25f * std::clamp(w.k - 1, 0.0f, 1.0f);  // (the pack frames: the same fade)
     w.strength = std::clamp(ratio, 0.55f, 1.0f) * fade;
+    w.silhouette = std::clamp(std::max(std::fabs(l.dAz) / 15.0f, std::fabs(w.kPack - 1) / 0.3f), 0.0f, 1.0f);
     w.active = true;
     return w;
 }

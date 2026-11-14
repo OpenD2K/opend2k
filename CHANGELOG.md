@@ -3,6 +3,51 @@
 All notable changes to OpenD2K. Versions follow `MAJOR.MINOR.PATCH`; while the major version is 0,
 any release may change settings or save games (old saves keep loading where possible).
 
+## 0.0.2 — 2026-11-14
+
+### Original game behaviour
+- **Order feedback as in 1998**: the small circle where you send units, and the attacked unit or building
+  blinks grey (units too, not only buildings); the blink no longer runs too fast on 120 Hz screens.
+- **Radar orders**: with units selected, a click on the radar sends them there (Original controls), with
+  the radar's ring cursor; Modern controls: right click on the minimap orders, left click moves the camera.
+- **Right click always deselects** with Original controls, even if the mouse moves a little.
+- **Enemy shooters are revealed** in Enhanced / 3D like in the original: a turret firing at your carryall
+  or ornithopter becomes visible on the battlefield, not only on the radar.
+- Only destroyed buildings shake the screen (no shake on unit explosions), as in the original.
+- New options **Order limit** and **Unit limit** (Original: 64 units obey an order, 1000 objects per side
+  — the exact 1998 limits; Unlimited is the default in the Enhanced / 3D presets).
+
+### Graphics
+- **Real building fire**: flames, embers, smoke lit from below, firelight and soot; the purple tint of
+  fire at night is fixed.
+- **Building working animations** on the redesigned art: welding in the factories, repair sparks, door
+  and palace lamps, the Death Hand launch, star port landing lights, research centre lights.
+- **New build-up**: in Enhanced the building rises out of a heap of rocks like in 1998; 3D keeps its
+  glowing construction effect.
+- **Vehicle animation** (Modern): tanks squat when starting, dip when stopping, roll in turns, recoil;
+  shots start at the real gun barrel.
+- **Shadows follow the sun** for units and buildings; dawn and dusk shadows are long and point the right
+  way; headlights are warm white, tail lights small and red, and large armies keep their lights.
+- **Many more lights in 3D**: every vehicle's headlights at night, even in big armies (hundreds of lights
+  instead of 10–20), and lights no longer switch off at the sides of wide screens.
+- A slightly brighter night; the day / night cycle and your zoom carry over to the next mission.
+- **Display settings**: Brightness, Contrast, Gamma and Saturation (Enhanced / 3D); a softer picture on
+  non-HDR monitors.
+- **Group numbers** next to units in control groups (Options → Graphics → Custom → Interface).
+- **Instant Custom previews**: Options → Graphics → Custom now compares each option on a standard scene, so
+  its pictures come pre-rendered whatever your other settings are (no "Rendering…").
+
+### Performance and smoothness
+- No more micro-freezes from loading unit art and voices during play; the cursor stays smooth.
+- **3D is much faster** (about 2–3× on a MacBook Pro: 100+ fps on a 5K ultrawide display) and units turn
+  smoothly; new "3D resolution" option (Auto scales the 3D view only when needed).
+- Smaller fixes: the selection box stays put while the view scrolls; in 3D, clicking any visible part of
+  a building or unit targets it; Direct3D 12 works on Windows (Vulkan stays the default).
+
+### Other
+- Update check shows "Checking…" and the time of the last check.
+- The art pack is updated to 0.0.2 (the game offers the update in Options → Art pack).
+
 ## 0.0.1 — 2026-11-13
 
 The first public release: the complete single-player *Dune 2000*, rebuilt natively, plus optional

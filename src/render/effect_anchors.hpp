@@ -29,6 +29,23 @@ public:
                                  std::vector<EffectAnchor>& out) const = 0;
     virtual bool unitAnchors(const game::World& w, int side, int unit, std::string_view prefix,
                              std::vector<EffectAnchor>& out) const = 0;
+    // The top surface of the model drawn for building `building` near ground point (gx, gy) (world
+    // px): (gx, gy) moves to the nearest point within a few px where the model stands tall (its roof,
+    // a tank, a chimney - not the low apron), z = that surface's height above the terrain there.
+    // Effects that sit ON a building (fires) use it; false = no model (2D, sprite cards).
+    virtual bool buildingSurface(const game::World& /*w*/, int /*side*/, int /*building*/, float& /*gx*/, float& /*gy*/,
+                                 float& /*z*/) const {
+        return false;
+    }
+    // models.ini switches of a redesigned building type (docs/3d-models.md "models.ini"):
+    // `overlay = off` - the original animation overlay (painted for the 1998 art) is not drawn over
+    // the redesigned art; `glow = blink` - its emissive surfaces blink in the rhythm of that overlay
+    // (render::buildingGlow). False for a type drawn with the original art.
+    virtual bool buildingOverlayOff(int /*buildingType*/) const { return false; }
+    // (an int: 0 steady, 1 blink, 2 `glow = pulse` - a smooth swell once per overlay cycle)
+    virtual int buildingGlowBlink(int /*buildingType*/) const { return 0; }
+    // `overlay = keep`: the pack's own overlay frames stay drawn next to the fx_weld flashes (the repair pad).
+    virtual bool buildingOverlayKeep(int /*buildingType*/) const { return false; }
 };
 
 }  // namespace d2k::render

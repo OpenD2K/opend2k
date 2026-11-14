@@ -431,7 +431,8 @@ void ClassicSidebar::drawRadar(const game::World& w, int side, float camX, float
             else col = kRock;
             radarPx_[std::size_t(y) * mw + x] = col;
         }
-    // Units: side colour (sandworms their own), on fully revealed cells, enemy cloaked units
+    // Units: side colour (sandworms their own), only where the whole shroud byte is 0 (cell +8 == 0,
+    // not the low nibble), enemy cloaked units
     // hidden, flying units only when ornithopters.
     for (int s = 0; s < int(w.sides().size()); ++s) {
         const auto& sd = w.sides()[s];
@@ -439,7 +440,7 @@ void ClassicSidebar::drawRadar(const game::World& w, int side, float camX, float
         for (int i = sd.firstUnit; i != -1; i = sd.nextObject(i)) {
             const auto& u = sd.units[i];
             const int x = u.tileX(), y = u.tileY();
-            if (x < 0 || y < 0 || x >= mw || y >= mh || (w.cell(x, y).shroud & 0xF) != 0) continue;
+            if (x < 0 || y < 0 || x >= mw || y >= mh || w.cell(x, y).shroud != 0) continue;
             if (s != side && (u.flags & game::unit_flags::kCloaked)) continue;
             const int beh = w.unitTemplate(u).specialBehavior;
             if (beh == game::behaviour::kSandworm) radarPx_[std::size_t(y) * mw + x] = kWorm;

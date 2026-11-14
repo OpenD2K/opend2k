@@ -64,11 +64,15 @@ struct Options {
     // --hdr on|off (HDR rendering), --hdr-output on|off (EDR output; windowed runs only),
     // --msaa 1|2|4, --aniso 1|4|16, --vsync on|off|adaptive, --fps-limit 0|30|60|120.
     std::string quality, hdr, hdrOutput, vsync;
+    std::string display;  // --display B,C,G,S: brightness, contrast, gamma x100, saturation (Settings)
     int msaa = 0, aniso = 0, fpsLimit = -1;
+    std::string resolution3d;  // --resolution3d auto|100|75|50 (Settings::resolution3d)
     std::string graphics;  // --graphics original|enhanced|3d (empty = the saved setting);
                            // --hq = enhanced, --classic-ui = original
     std::string artPack;   // --art-pack NAME (original|upscaled|<pack folder>; empty = the saved setting)
     std::string effects;   // --effects classic|modern (empty = the saved setting)
+    std::string controls;          // --controls original|modern (empty = the saved setting)
+    std::string vehicleAnimation;  // --vehicle-animation original|modern (empty = the saved setting)
     std::string panelTransparency;  // --panel-transparency off|light|medium (Enhanced panel; empty = saved)
     std::string shroud;    // --shroud classic|soft (Enhanced shroud edge; empty = the saved setting)
     bool reveal = false;   // --reveal: draw without shroud

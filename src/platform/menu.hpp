@@ -17,6 +17,7 @@
 #include <SDL3/SDL.h>
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -173,6 +174,14 @@ private:
     MenuResult pageUpdates();
     std::string updatesRowLabel() const;
     bool openUpdatesPreview(const std::string& name);  // --menu-page updates[-available|-checking|-failed|-disabled|-live]
+    // Update checks (Updates and Art pack pages): a press of Check now / Retry shows "Checking..." with a
+    // spinner for at least kCheckShowMs even when the answer is back at once, then the result and
+    // "Checked at HH:MM" (local time) under it.
+    static constexpr std::uint64_t kCheckShowMs = 650;
+    static bool checkingShown(bool checking, std::uint64_t startedMs);
+    static std::string checkedAtText(std::int64_t checkedAt);  // "" when never checked
+    void checkingSpinner(float x, float y, float size);       // page units: top-left, side
+    bool artPackCheckingShown() const;  // the art pack's manifest check, held as above (menu_artpack.cpp)
     void loadCommunityProgress();
     void saveCommunityProgress();
     void openOriginal(const std::vector<std::string>& stack);

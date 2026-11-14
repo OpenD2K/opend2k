@@ -20,9 +20,13 @@ struct SDL_Texture;
 namespace d2k::render {
 
 class Effects;
+class MuzzleTips;
+class VehicleMotion;
 class SoftShroud;
+class TtfFont;
 class SceneLights;
 class Bloom;
+class OrderFeedback;
 class Hdr;
 struct SceneLight;
 
@@ -63,6 +67,10 @@ public:
     // only), 1 Damaged (also buildings below full health), 2 Always (every building and unit).
     // A selected building always shows corner brackets and its bar.
     int healthBars = 2;
+    // Enhanced (Settings::groupNumbers): own units' control-group badges. 0 off, 1 selected units,
+    // 2 every grouped unit; drawn with groupFont (the UI's Play font; nullptr = none).
+    int groupNumbers = 0;
+    TtfFont* groupFont = nullptr;
     // Enhanced "Modern" effects (render/effects.hpp): particles, glows, treads, shake, smooth
     // turning. Off = the original presentation (always off in the Original graphics mode).
     void setModernEffects(bool on);
@@ -76,6 +84,11 @@ public:
     // draw(); effects advance by its difference (paused = no change = frozen).
     void setEffectClock(double ticks) { effectClock_ = ticks; }
     void resetEffects();
+    // Art preparation off the main thread (SpriteCache::setPrefetchGroups): the art groups of the
+    // templates, then (each call) the groups of every unit / building in the world for its house.
+    void enableArtPrefetch();
+    // view (world px x0, y0, x1, y1; nullptr = everything): only the objects there (touch profiles).
+    void prefetchArt(const game::World& w, const float* view = nullptr);
     int effectParticles() const;
     // Time of day / Modern lighting (render/lighting.hpp; Enhanced only, nullptr = none - always
     // in the Original mode): the grade over the battlefield before the lights (the baked terrain
@@ -91,6 +104,13 @@ public:
     // HDR rendering (Settings::hdr, render/hdr.*; with the bloom path only): the offscreen copy is
     // half-float and goes back through the tone map. nullptr = the 8-bit path.
     Hdr* hdr = nullptr;
+    // "Vehicle animation: Modern" (render/vehicle_motion.hpp; Enhanced only, nullptr = the original
+    // rigid sprites): ground vehicles drawn with their hull pose - a small shear / offset of the
+    // body and turret sprites, the turret pushed back on firing. The shadow stays on the ground.
+    const VehicleMotion* vehicleMotion = nullptr;
+    // Order feedback (render/order_feedback.hpp): the original's cursor puffs, drawn when
+    // classicSelection is on (Graphics: Original), after the projectiles and before the shroud.
+    const OrderFeedback* orderFeedback = nullptr;
     ~MapRenderer();
 
 private:
@@ -151,6 +171,7 @@ private:
                   float degrees = 0);
     void blitScreen(const Sprite& sp, float sx, float sy, float zoom, Blend mode, float degrees, SDL_FPoint centre);
     void drawExplosions(const game::World& w, const Camera& cam, bool high);
+    void drawCursorPuffs(const Camera& cam);
     void drawBullets(const game::World& w, const Camera& cam);
     void drawFlyers(const game::World& w, const Camera& cam, int pass);  // 0x42a5d0 pass 0 / 1
     // The sonic shot's lens (Image__SetLensImage 0x42ada0, bullet flag 0x800): fills lensTex_ with
@@ -163,6 +184,8 @@ private:
     int lensTexSize_ = 0;
     // Weld flashes at a redesigned building's fx_weld anchors (render/weld_fx.hpp); true if drawn.
     bool drawWeldFlashes(const game::World& w, const game::Building& b, const Camera& cam);
+    // Working lamps / launch flame at fx_work* / fx_launch* anchors (render/weld_fx.hpp).
+    void drawWorkLamps(const game::World& w, const game::Building& b, const Camera& cam);
     SDL_Texture* weldTex_ = nullptr;
     std::vector<EffectAnchor> weldTmp_;
     void drawShroud(const game::World& w, const Camera& cam, int viewW, int viewH);
@@ -204,6 +227,20 @@ private:
                           bool rendered3d);
     std::vector<SDL_Vertex> shadowV_;
     std::vector<int> shadowI_;
+    // Units drawn from 3D-rendered pack frames cast their silhouette (shadowWarp_.silhouette > 0;
+    // docs/enhanced-graphics.md "Sun-following sprite shadows"). drawUnit fills this from the body frame
+    // (screen px): the ground line yB (its lowest opaque row), rho = the share of the screen rise above
+    // it that is ground depth (the rest is height), the cast vector v and the footprint's extent
+    // [mn, mx] along v's direction (vx, vy unit). packShadowK_ weights the pack's own (warped) shadow
+    // meanwhile: 1 - the silhouette's share.
+    struct SilhouetteShadow { float yB = 0, rho = 1, vx = 0, vy = 0, ux = 0, uy = 0, mn = 0, mx = 1; } silhouette_;
+    float packShadowK_ = 1;
+    void drawSilhouetteShadow(const Sprite& sp, float anchorX, float anchorY, const Camera& cam, float degrees);
+    // The hull pose of the unit being drawn (drawUnit, vehicleMotion): blitScreen moves every point
+    // P of the sprite (not its shadow) by (tx, ty + a (P.x - ax) + b (P.y - ay) + c), screen px.
+    struct BodyWarp { bool on = false; float a = 0, b = 0, c = 0, tx = 0, ty = 0, ax = 0, ay = 0; } warp_;
+    // Barrel tips measured on the original sprites, for the Modern effects (render/muzzle_tips.hpp).
+    std::unique_ptr<MuzzleTips> muzzleTips_;
     struct GlowDraw { SDL_Texture* tex; float x, y, w, h; float k; };
     std::vector<GlowDraw> glows_;
     float glowK_ = 0;

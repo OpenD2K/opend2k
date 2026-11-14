@@ -214,6 +214,8 @@ std::unique_ptr<DesignedTerrain> DesignedTerrain::create(SDL_GPUDevice* dev, SDL
 }
 
 DesignedTerrain::~DesignedTerrain() {
+    for (SDL_GPUBuffer* b : {viewVB_, shadowVB_})
+        if (b) SDL_ReleaseGPUBuffer(dev_, b);
     for (SDL_GPUTexture* t : {albedoArr_, normalArr_, rockArr_, splatATex_, splatBTex_, spiceTex_, guideTex_})
         if (t) SDL_ReleaseGPUTexture(dev_, t);
     if (faithPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, faithPipe_);
@@ -341,9 +343,9 @@ bool DesignedTerrain::init(SDL_GPUTextureFormat color, SDL_GPUTextureFormat dept
     depthFormat_ = depth;
     samples_ = samples;
     SDL_GPUShader* tvs = createShader(dev_, ShaderId::TerrainVs, 0, 1);
-    SDL_GPUShader* tfs = createShader(dev_, ShaderId::Terrain2Fs, 7, 2);
+    SDL_GPUShader* tfs = createShader(dev_, ShaderId::Terrain2Fs, 7, 2, 1);
     SDL_GPUShader* rvs = createShader(dev_, ShaderId::RockVs, 0, 1);
-    SDL_GPUShader* rfs = createShader(dev_, ShaderId::RockFs, 3, 2);
+    SDL_GPUShader* rfs = createShader(dev_, ShaderId::RockFs, 3, 2, 1);
     bool ok = tvs && tfs && rvs && rfs;
     SDL_GPUColorTargetDescription ctd{};
     ctd.format = color;
@@ -460,7 +462,7 @@ bool DesignedTerrain::ensureFaithPipeline() {
     if (faithPipe_) return true;
     if (faithPipeFailed_) return false;
     SDL_GPUShader* vs = createShader(dev_, ShaderId::TerrainVs, 0, 1);
-    SDL_GPUShader* fs = createShader(dev_, ShaderId::Terrain3Fs, 8, 3);
+    SDL_GPUShader* fs = createShader(dev_, ShaderId::Terrain3Fs, 8, 3, 1);
     if (vs && fs) {
         SDL_GPUColorTargetDescription ctd{};
         ctd.format = colorFormat_;
@@ -537,6 +539,21 @@ void DesignedTerrain::build(const game::World& w, const Terrain& t, const std::v
     buildSplat(0, 0, cw_ - 1, ch_ - 1);
     if (faith) placeStones(t);
     else placeRocks(w, t);
+    reliefNear_.clear();
+    if (faith && guide_.valid() && !guide_.texels().empty()) {
+        // terrain3_fs: relief (guide height > 0) within 2 cells of each cell (its slope / rim taps
+        // reach a few px; the bilinear read of the flag blends the 4 nearest cells).
+        const int gw = guide_.width(), gh = guide_.height();
+        std::vector<std::uint8_t> has(std::size_t(cw_) * ch_, 0);
+        const auto& tx = guide_.texels();
+        for (int gy = 0; gy < gh; ++gy)
+            for (int gx = 0; gx < gw; ++gx)
+                if ((tx[std::size_t(gy) * gw + gx] >> 8) & 0xFF) {
+                    const int cx = std::min(cw_ - 1, gx * cw_ / gw), cy = std::min(ch_ - 1, gy * ch_ / gh);
+                    has[std::size_t(cy) * cw_ + cx] = 1;
+                }
+        reliefNear_ = dilateCells(has, cw_, ch_, 2);
+    }
     if (faith) {  // the guide texture (with mips: the blurred relief, minification in 3D)
         if (guide_.width() != guideW_ || guide_.height() != guideH_ || !guideTex_) {
             if (guideTex_) SDL_ReleaseGPUTexture(dev_, guideTex_);
@@ -556,7 +573,7 @@ void DesignedTerrain::build(const game::World& w, const Terrain& t, const std::v
         }
         splatATex_ = makeTexture(dev_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, sw, sh, 1, 1);
         splatBTex_ = makeTexture(dev_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, sw, sh, 1, 1);
-        spiceTex_ = makeTexture(dev_, SDL_GPU_TEXTUREFORMAT_R8G8_UNORM, cw_, ch_, 1, 1);
+        spiceTex_ = makeTexture(dev_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, cw_, ch_, 1, 1);
         splatW_ = sw;
         splatH_ = sh;
     }
@@ -599,13 +616,33 @@ void DesignedTerrain::update(const game::World& w, std::vector<int>* changed) {
 // the 7 levels) per cell; richness = what lies above thin (thick spice: 2 more levels, blooms
 // more), blurred with a 5 x 5 binomial kernel so thick spice forms soft patches with denser
 // cores instead of cell blocks.
+// Cells within r cells (Chebyshev) of a set cell.
+std::vector<std::uint8_t> DesignedTerrain::dilateCells(const std::vector<std::uint8_t>& in, int w, int h, int r) {
+    std::vector<std::uint8_t> tmp(in.size(), 0), out(in.size(), 0);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            std::uint8_t v = 0;
+            for (int k = std::max(0, x - r); k <= std::min(w - 1, x + r) && !v; ++k) v = in[std::size_t(y) * w + k];
+            tmp[std::size_t(y) * w + x] = v;
+        }
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            std::uint8_t v = 0;
+            for (int k = std::max(0, y - r); k <= std::min(h - 1, y + r) && !v; ++k) v = tmp[std::size_t(k) * w + x];
+            out[std::size_t(y) * w + x] = v;
+        }
+    return out;
+}
+
 void DesignedTerrain::buildSpiceTex() {
     const std::size_t n = std::size_t(cw_) * ch_;
-    spiceTexCpu_.assign(n * 2, 0);
+    spiceTexCpu_.assign(n * 4, 0);
     std::vector<float> rich(n), tmp(n);
+    std::vector<std::uint8_t> any(n, 0);
     for (std::size_t i = 0; i < n; ++i) {
         const int levels = (int(spice_[i]) * 7 + 127) / 255;
-        spiceTexCpu_[i * 2] = std::uint8_t(std::min(levels, 2) * 127);
+        any[i] = levels > 0;
+        spiceTexCpu_[i * 4] = std::uint8_t(std::min(levels, 2) * 127);
         rich[i] = float(std::max(levels - 2, 0)) / 2.0f;  // 1 = thick spice
     }
     static constexpr float kW[5] = {1 / 16.0f, 4 / 16.0f, 6 / 16.0f, 4 / 16.0f, 1 / 16.0f};
@@ -619,8 +656,15 @@ void DesignedTerrain::buildSpiceTex() {
         for (int x = 0; x < cw_; ++x) {
             float s = 0;
             for (int k = -2; k <= 2; ++k) s += tmp[std::size_t(std::clamp(y + k, 0, ch_ - 1)) * cw_ + x] * kW[k + 2];
-            spiceTexCpu_[(std::size_t(y) * cw_ + x) * 2 + 1] = std::uint8_t(std::clamp(s * 0.5f, 0.0f, 1.0f) * 255.0f + 0.5f);
+            spiceTexCpu_[(std::size_t(y) * cw_ + x) * 4 + 1] = std::uint8_t(std::clamp(s * 0.5f, 0.0f, 1.0f) * 255.0f + 0.5f);
         }
+    // B: spice within 3 cells (terrain3_fs: spiceField's warp + kernel + filter reach < 2 cells;
+    // the richness blur 2 more). A: relief within 2 cells (reliefNear_; 255 without a guide).
+    const std::vector<std::uint8_t> nearSpice = dilateCells(any, cw_, ch_, 3);
+    for (std::size_t i = 0; i < n; ++i) {
+        spiceTexCpu_[i * 4 + 2] = nearSpice[i] ? 255 : 0;
+        spiceTexCpu_[i * 4 + 3] = reliefNear_.size() == n ? (reliefNear_[i] ? 255 : 0) : 255;
+    }
 }
 
 void DesignedTerrain::computeTints(const game::World& w, const std::vector<float>& tileRgb) {
@@ -999,7 +1043,109 @@ void DesignedTerrain::placeRocks(const game::World& w, const Terrain& t) {
     SDL_Log("3D terrain: %zu rocks", inst_.size());
 }
 
+// Frustum culling of the rock instances (left / right / bottom / top planes of the clip space;
+// the depth range holds the whole map in both views): a bounding sphere per instance.
+void DesignedTerrain::cullRocks(const Mat4& viewProj, const Mat4* lightVP) {
+    culled_ = culledShadow_ = false;
+    if (inst_.empty() || instDirty_) return;  // (the full set until it is uploaded)
+    auto planes = [](const Mat4& m, Vec4 (&pl)[4]) {
+        for (int i = 0; i < 4; ++i) {
+            const int row = i / 2;
+            const float sgn = (i & 1) ? -1.0f : 1.0f;
+            Vec4 p{m.at(3, 0) + sgn * m.at(row, 0), m.at(3, 1) + sgn * m.at(row, 1), m.at(3, 2) + sgn * m.at(row, 2),
+                   m.at(3, 3) + sgn * m.at(row, 3)};
+            const float len = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+            if (len > 0) p = Vec4{p.x / len, p.y / len, p.z / len, p.w / len};
+            pl[i] = p;
+        }
+    };
+    auto cull = [&](const Mat4& m, std::vector<RockInst>& out, RockSet& set) {
+        Vec4 pl[4];
+        planes(m, pl);
+        out.clear();
+        for (int t = 0; t < kRockTypes; ++t) {
+            set.first[t] = std::uint32_t(out.size());
+            for (std::uint32_t k = instFirst_[t]; k < instFirst_[t] + instCount_[t] && k < inst_.size(); ++k) {
+                const RockInst& ri = inst_[k];
+                const float h = std::max(0.0f, ri.top - ri.pos[1]);
+                const float cx = ri.pos[0], cy = ri.pos[1] + h * 0.5f, cz = ri.pos[2];
+                const float r = kRockReach * std::max(1.0f, std::max(ri.scale[0], ri.scale[2])) + h;
+                bool in = true;
+                for (const Vec4& p : pl)
+                    if (p.x * cx + p.y * cy + p.z * cz + p.w < -r) {
+                        in = false;
+                        break;
+                    }
+                if (in) out.push_back(ri);
+            }
+            set.count[t] = std::uint32_t(out.size()) - set.first[t];
+        }
+    };
+    cull(viewProj, viewInst_, viewSet_);
+    culled_ = true;
+    if (lightVP) {
+        cull(*lightVP, shadowInst_, shadowSet_);
+        culledShadow_ = true;
+    }
+    cullUpload_ = true;
+}
+
+void DesignedTerrain::uploadCulled(SDL_GPUCommandBuffer* cmd) {
+    if (!cullUpload_) return;
+    cullUpload_ = false;
+    struct Job { std::vector<RockInst>* v; SDL_GPUBuffer** vb; std::uint32_t* cap; RockSet* set; bool on; };
+    Job jobs[2] = {{&viewInst_, &viewVB_, &viewCap_, &viewSet_, culled_}, {&shadowInst_, &shadowVB_, &shadowCap_, &shadowSet_, culledShadow_}};
+    Uint32 total = 0;
+    for (Job& j : jobs) {
+        if (!j.on) continue;
+        const std::uint32_t n = std::uint32_t(j.v->size());
+        if (n > *j.cap || !*j.vb) {
+            if (*j.vb) SDL_ReleaseGPUBuffer(dev_, *j.vb);
+            std::uint32_t cap = std::max<std::uint32_t>(64, *j.cap);
+            while (cap < n) cap *= 2;
+            SDL_GPUBufferCreateInfo bi{};
+            bi.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
+            bi.size = Uint32(cap * sizeof(RockInst));
+            *j.vb = SDL_CreateGPUBuffer(dev_, &bi);
+            *j.cap = *j.vb ? cap : 0;
+        }
+        j.set->vb = *j.vb;
+        total += Uint32(n * sizeof(RockInst));
+    }
+    if (!viewVB_ && culled_) culled_ = false;
+    if (!shadowVB_ && culledShadow_) culledShadow_ = false;
+    if (total == 0) return;
+    SDL_GPUTransferBufferCreateInfo tbi{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, total, 0};
+    SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(dev_, &tbi);
+    auto* p = tb ? static_cast<std::uint8_t*>(SDL_MapGPUTransferBuffer(dev_, tb, false)) : nullptr;
+    if (!p) {
+        culled_ = culledShadow_ = false;  // draw them all
+        if (tb) SDL_ReleaseGPUTransferBuffer(dev_, tb);
+        return;
+    }
+    Uint32 off = 0;
+    for (Job& j : jobs)
+        if (j.on && !j.v->empty()) {
+            std::memcpy(p + off, j.v->data(), j.v->size() * sizeof(RockInst));
+            off += Uint32(j.v->size() * sizeof(RockInst));
+        }
+    SDL_UnmapGPUTransferBuffer(dev_, tb);
+    SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+    off = 0;
+    for (Job& j : jobs)
+        if (j.on && !j.v->empty() && *j.vb) {
+            const Uint32 bytes = Uint32(j.v->size() * sizeof(RockInst));
+            SDL_GPUTransferBufferLocation src{tb, off};
+            SDL_GPUBufferRegion reg{*j.vb, 0, bytes};
+            SDL_UploadToGPUBuffer(cp, &src, &reg, false);
+            off += bytes;
+        }
+    SDL_EndGPUCopyPass(cp);
+    SDL_ReleaseGPUTransferBuffer(dev_, tb);
+}
+
 void DesignedTerrain::prepare(SDL_GPUCommandBuffer* cmd) {
+    uploadCulled(cmd);
     if (staticUploaded_ && !splatDirty_ && !spiceDirty_ && !instDirty_ && !guideDirty_) return;
     std::vector<SDL_GPUTransferBuffer*> temps;
     SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
@@ -1108,6 +1254,7 @@ int DesignedTerrain::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, SD
     const bool faith = faithfulActive() && faithPipe_ && guideTex_;
     if (vb && ib && indexCount > 0) {
         SDL_BindGPUGraphicsPipeline(pass, faith ? faithPipe_ : terrainPipe_);
+        bindLightGrid(pass, f.lightGrid, lightFallback_, dev_);
         SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof vu);
         Terrain2FU fu{};
         common(fu.sunDir, fu.light, fu.fogColor, fu.fog, fu.fog2);
@@ -1152,6 +1299,7 @@ int DesignedTerrain::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, SD
     const std::uint32_t* icount = rocks ? rocks->count : instCount_;
     if (!inst_.empty() && ivb && rockVB_) {
         SDL_BindGPUGraphicsPipeline(pass, rockPipe_);
+        bindLightGrid(pass, f.lightGrid, lightFallback_, dev_);
         SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof vu);
         RockFU fu{};
         common(fu.sunDir, fu.light, fu.fogColor, fu.fog, fu.fog2);

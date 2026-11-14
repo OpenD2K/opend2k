@@ -342,8 +342,8 @@ int World::newBestBullet(int p, int s, std::uint32_t dist2, int targetSide, int 
     const auto& W = rules_.templates->bin.weapons;
     int armour = 0;
     bool flying = false;
-    if (targetIndex != kNoIndex && targetIndex >= 0 && targetIndex < kObjectsPerSide && targetSide >= 0 &&
-        targetSide < kMaxSides) {
+    if (targetIndex != kNoIndex && targetIndex >= 0 && targetSide >= 0 && targetSide < kMaxSides &&
+        targetIndex < sides_[targetSide].poolSize()) {
         const Side& ts = sides_[targetSide];
         if (targetKind == 1) {
             // The original reads the slot as a unit whatever it holds; ours keeps the last unit data.
@@ -700,7 +700,7 @@ bool World::deviatedOwnerAlive(const Unit& u) const {
 // new unit forgets selection/attacker/enemy/group, moves to its BlockTo (unless keepState) and
 // re-marks BlockTo; the old unit dies (flags 0x600000: not drawn, gone).
 Unit* World::changeUnitOwner(int fromSide, int toSide, int index, bool keepState) {
-    Unit& u = sides_[fromSide & 7].units[static_cast<std::size_t>(index) % kObjectsPerSide];
+    Unit& u = sides_[fromSide & 7].units[static_cast<std::size_t>(index) % sides_[fromSide & 7].units.size()];
     if (u.flags & kGone) return nullptr;
     auto release = [](std::uint32_t& c) {
         c &= ~kVehicle;
@@ -754,7 +754,7 @@ Unit* World::changeUnitOwner(int fromSide, int toSide, int index, bool keepState
 bool World::captureBuilding(int fromSide, int toSide, int index) {
     Side& F = sides_[fromSide & 7];
     Side& Tt = sides_[toSide & 7];
-    Building& b = F.buildings[static_cast<std::size_t>(index) % kObjectsPerSide];
+    Building& b = F.buildings[static_cast<std::size_t>(index) % F.buildings.size()];
     if (b.flags & (building_flags::kSelling | building_flags::kSold)) return false;
     const auto& bt = buildingTemplate(b);
     const int x = b.posX / 65536 / 32, y = (b.posY / 65536 - bt.artHeight) / 32;
@@ -1031,7 +1031,7 @@ void World::destroyUnit(Unit& u) {
         for (int k = 0; k < S.pickupCount && k < static_cast<int>(S.pickup.size()); ++k) {
             PickupEntry& pe = S.pickup[k];
             if (pe.state != 2 || static_cast<std::int16_t>(pe.carryallIndex) != static_cast<std::int16_t>(u.index)) continue;
-            if (pe.unitIndex != kNoIndex) unitAdjustState(S.units[static_cast<std::size_t>(pe.unitIndex) % kObjectsPerSide], pe.origState);
+            if (pe.unitIndex != kNoIndex) unitAdjustState(S.units[static_cast<std::size_t>(pe.unitIndex) % S.units.size()], pe.origState);
             pe.state = 3;
         }
     }

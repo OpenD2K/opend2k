@@ -125,7 +125,8 @@ game type → Practice = the original skirmish page with name, house, colour, ma
 unit count, tech level, credits, AI players, crates and worms; Game Options = the settings box
 (fullscreen, smooth motion, mouse controls, cutscenes, *Graphics:* preset button cycling Original → Enhanced → 3D —
 Enhanced / 3D apply the preset and open the modern Graphics page; Custom is shown when the values are mixed —, resolution, Game Settings = game speed /
-scroll rate / music / SFX volume + our Extended queue, Cheats, Modern effects, HD art and Rally points check boxes → music selection, data
+scroll rate / music / SFX volume + our Extended queue, Cheats, Modern effects, HD art, Rally points, Unlimited orders and
+Unlimited units check boxes → music selection, data
 folder — our rows are additions), Exit
 Game, the Westwood logo → scrolling credits); after a skirmish the original result table (score.uil)
 → the lobby, a lost skirmish first asks "Replay mission?". In game, Esc opens the original Options
@@ -188,7 +189,9 @@ Cheats button (when the Cheats option is on).
   language, game speed (original GameSpeed 0..100, default 75 = 20 ticks/s; 95+ = 60 ticks/s), scroll speed (original
   ScrollRate 4..40, default 20), mouse controls (Original / Modern), smooth unit motion | frame time, production queue
   (Original / Extended, default Extended — see Controls), cheats (On / Off, default On) | factory rally points (On /
-  Off, default On), game data folder. The rows scroll inside the panel (mouse wheel, draggable scroll bar, the keyboard
+  Off, default On), order limit (Original = a group order reaches the first 64 selected units like the original /
+  Unlimited, applies at once) | unit limit (Original = 1000 objects per side / Unlimited = up to 10000, for new games;
+  both default Original, re/notes/limits.md), game data folder. The rows scroll inside the panel (mouse wheel, draggable scroll bar, the keyboard
   focus is scrolled into view); Back stays fixed below it.
 - **Graphics page** (Options → Graphics; `--menu-page graphics|graphics-original|graphics-enhanced|graphics-3d|graphics-custom[-end]`):
   tabs Original / Enhanced / 3D / Custom at the top (big enough to tap). The first three are one-tap presets — a tap
@@ -202,7 +205,7 @@ Cheats button (when the Cheats option is on).
   values + graphics 3D, 3D terrain Faithful, sun shadows on, 3D models New (the OpenD2K 3D art pack; never the
 original sprites — without the pack the 3D tab only shows "needs the OpenD2K 3D art pack" and `--graphics 3d` runs as
 Enhanced, docs/3d-mode.md "Objects: models only"). **Custom** lists every graphics
-  value grouped: Mode, Terrain, Art, Effects, Shroud, Interface (panel transparency, health bars), 3D (terrain,
+  value grouped: Mode, Terrain, Art, Effects, Shroud, Interface (panel transparency, health bars, group numbers), 3D (terrain,
   shadows, models), Display, Classic view; changing any of them (here or in the pause menu) makes the setup Custom.
   Display (resolution in Original / UI scale in Enhanced and 3D, fullscreen, render resolution) is not part of a
   preset and shows under every tab. The active preset is underlined; settings.ini `graphicsPreset`
@@ -287,7 +290,11 @@ with the Enhanced preset; one-frame / screenshot / simtest runs keep the built-i
   arrows scroll by one (right click: a page; the wheel works too); repair / sell toggle a click
   mode for your buildings (repair also sends a damaged vehicle to a repair pad); guard / retreat act
   on the selected units; radar click centres the view (with units selected: moves them there),
-  right click deselects; OPTIONS opens the pause menu. The view has the fixed original scale.
+  right click deselects (Modern controls: left = camera, right = order there - also on the Enhanced /
+  3D minimap); OPTIONS opens the pause menu. The view has the fixed original scale.
+  **Order feedback** as in the original (re/notes/ui.md "Order feedback"): the EX_PUFF ring at a
+  move / attack-ground click, the attacked unit / building blinks grey twice; Enhanced / 3D: green /
+  red ground rings at the target and a red ring pulsing around the attacked object.
   **Tooltips** as in the original (FUN_0044b5c0): over the build strips / starport / upgrade
   pages at once (name + price, yellow boxes left of the icon column); after the mouse rests ~18
   frames over repair / sell / guard / retreat (and the radar button's MapToggle in skirmish), the
@@ -300,8 +307,11 @@ with the Enhanced preset; one-frame / screenshot / simtest runs keep the built-i
   show the arrow. Chosen like the original every frame (`src/render/cursor.*`, re/notes/ui.md
   "Cursors"); with Modern controls they describe the right-click order. Original: UI scale,
   pixel-exact (one game pixel per cursor pixel); Enhanced: Scale2x frames at the original size in
-screen points (like a system cursor; not scaled by the window or the zoom). `--cursor-at X Y` / `--cursor-mode N`
-  place a virtual cursor for `--screenshot` runs.
+screen points (like a system cursor; not scaled by the window or the zoom). On the desktop the chosen
+  cursor is handed to the OS as an animated system cursor (`CursorRenderer::showSystem`), so the pointer
+  keeps moving when a frame is late; the iPad, one-frame runs and the fullscreen notch band draw it.
+  The radar-move ring also shows over the Enhanced / 3D minimap while units are selected. `--cursor-at X Y` /
+  `--cursor-mode N` place a virtual cursor for `--screenshot` runs.
 - **Enhanced**: Scale2x-upscaled sprites/tiles with smooth filtering, free zoom (wheel), and the
   Enhanced in-game UI, a modern procedural skin (docs/enhanced-graphics.md "In-game UI"; scales with
   the window: 1.5x at 1280x800, 2x at 1920x1080, or the UI scale setting):
@@ -319,7 +329,9 @@ screen points (like a system cursor; not scaled by the window or the zoom). `--c
   - no selection panel: health bars above selected units and buildings (a selected building: brackets
     around its whole footprint, the bar centred above it, the PRIMARY "1"); deploy / self-destruct /
     thump / stealth with D or a second click, primary with a second click on a factory, upgrades on
-    the Special tab, control groups on the keys (Ctrl+1..0 / 1..0).
+    the Special tab, control groups on the keys (Ctrl+1..0 / 1..0); an own unit's group number as a
+    small badge left of its health bar (Interface → Group numbers: Off / Selected / Always, default
+    Always; also in 3D; not part of a preset; Original keeps the original digit on selected units).
   - modern procedural chrome at native resolution (no original UI bitmaps) in Dune 2000's palette: a
     dark brushed-bronze / leather column with a sand-amber edge (a faint house-colour glow), volumetric buttons with vector icons (hover / pressed / active / disabled), a
     segmented tab control, modern credits / power / timer readouts, a power meter, icon bezels with the
@@ -376,6 +388,12 @@ screen points (like a system cursor; not scaled by the window or the zoom). `--c
   blocked rock that the original paints pale marked by boulders. Spice lies in organic patches in both. 3D has the same choice ("3D
   terrain": Original tiles / Designed / Faithful). `--terrain2d original|upscaled|designed|faithful`,
   `--terrain3d tiles|designed|faithful`.
+- **Vehicle animation** (Enhanced and 3D; not original; render-only; docs/enhanced-graphics.md "Vehicle animation"):
+  Options → Graphics → Custom → Effects: "Vehicle animation" Original / Modern (the presets: Modern) - hulls squat
+  when setting off, dip their nose when stopping, roll in turns, bounce once over a ground change and
+  recoil on firing (nothing else moves a standing vehicle) (dust at the start with Modern effects); `--vehicle-animation original|modern`. With Modern
+  effects, muzzle flashes, tracers and projectiles start at the real barrel tip (models' / pack's `fx_muzzle`
+  anchors, or measured on the original turret sprites; "Barrel tips").
 - **Lighting** (Enhanced and 3D; not original; docs/enhanced-graphics.md "Lighting"): Options → Graphics → Custom →
   Lighting and the in-game options: **Time of day** Day / Dawn (low pink-orange sun) / Dusk (red-gold, long shadows) /
   Night (cool blue moonlight, still readable) / Cycle (a 16-minute day over a long battle, from the game clock) and
@@ -387,7 +405,7 @@ screen points (like a system cursor; not scaled by the window or the zoom). `--c
   glow from inside instead: emissive lamps, wind trap energy cores (pulsing), cyan strips, the refinery's windows
   (3D: glTF emission; 2D: the pack's `.glow.png` layers), off without power / when destroyed, no more lamps floating
   beside them (docs/enhanced-graphics.md "Emission"). 2D: the terrain bake follows the light (one
-  re-bake on a change), a grade over the map; 3D: the sun moves, spot / point lights. `--time-of-day`, `--lighting`.
+  re-bake on a change), a grade over the map; 3D: the sun moves, spot / point lights - every lamp in view lit (clustered light grid, budget 768; docs/3d-mode.md "Dynamic lights"). `--time-of-day`, `--lighting`.
 - **Quality** (Enhanced and 3D; not original; docs/enhanced-graphics.md "Quality"): Options → Graphics → Custom →
   Quality: **Quality** Low / Medium / High (a shortcut: HDR off/on/on, MSAA 1x/2x/4x, anisotropy off/4x/16x; the
   Enhanced / 3D presets set High), **HDR rendering** (with Modern lighting: half-float battlefield, bloom of the
@@ -398,6 +416,11 @@ screen points (like a system cursor; not scaled by the window or the zoom). `--c
   Unlimited / 30 / 60 / 120. `--quality low|medium|high`, `--hdr on|off`, `--hdr-output on|off`, `--msaa 1|2|4`,
   `--aniso 1|4|16`, `--vsync on|off|adaptive`, `--fps-limit 0|30|60|120` (one-frame runs: struct defaults - no HDR,
   MSAA 4x, anisotropy 16x - unless given).
+- **Display adjustments** (Enhanced and 3D; not original; docs/enhanced-graphics.md "SDR output and the display
+  adjustments"): Options → Graphics → Display (every tab) and the in-game options: **Brightness**, **Contrast**,
+  **Saturation** -50..+50, **Gamma** 0.80 - 1.40, **Reset picture** and a grey-step / colour test pattern; the
+  last colour step of the frame, live; defaults = unchanged. Original: never applied (byte-identical).
+  `--display B,C,G,S` (e.g. `--display 0,-25,110,0`). The SDR tone map's highlight shoulder is softer (knee 0.6).
 - **Classic view** (Enhanced and 3D; not original, like the C&C Remastered swap key): hold **Tab** and the
   battlefield shows the original 1998 graphics - original tiles, pixel-exact sprites, Classic effects, the
   original shroud edge and selection overlay - instantly, mid-game and while paused; a small "Original 1998

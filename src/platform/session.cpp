@@ -13,6 +13,7 @@
 #include "platform/sound_bank.hpp"
 #include "platform/ui.hpp"
 #include "render/art_pack.hpp"
+#include "render/frame_probe.hpp"
 #include "render/bloom.hpp"
 #include "render/hdr.hpp"
 #include "render/build_icons.hpp"
@@ -28,6 +29,7 @@
 #include "render/sprites.hpp"
 #include "render/text.hpp"
 #include "render/tileset.hpp"
+#include "render3d/gpu.hpp"
 #include "render3d/models.hpp"
 #include "render3d/renderer3d.hpp"
 #include "render3d/terrain_bake.hpp"
@@ -139,10 +141,37 @@ Session::Session(SDL_Renderer* r, std::unique_ptr<GameData> data, Settings& sett
     sprites_ = std::make_unique<render::SpriteCache>(r_, g.sprites, g.colours);
     if (enhanced) sprites_->setHq(true);
     mapRenderer_ = std::make_unique<render::MapRenderer>(r_, *atlas_, *sprites_, g.templates);
+    mapRenderer_->enableArtPrefetch();  // art-pack frames prepared on worker threads (render/sprites.hpp)
+    {
+        // Sprite texture memory: unlimited on the desktop; the iPad / phone keep an LRU budget and
+        // prefetch less (one neighbour each side, only what is on screen). D2K_SPRITE_BUDGET_MB
+        // (and D2K_SPRITE_RADIUS) override - measurements on the desktop.
+        std::size_t mb = 0;
+        int radius = render::SpriteCache::kNeighbours;
+        if constexpr (kTouchPlatform) {
+            mb = isPhoneDevice() ? 256 : 384;
+            radius = 1;
+            lightPrefetch_ = true;
+        }
+        if (const char* e = std::getenv("D2K_SPRITE_BUDGET_MB"); e && *e) {
+            mb = std::size_t(std::max(0, std::atoi(e)));
+            radius = 1;
+            lightPrefetch_ = mb > 0;
+        }
+        if (const char* e = std::getenv("D2K_SPRITE_RADIUS"); e && *e) radius = std::atoi(e);
+        sprites_->setMemoryBudget(mb << 20, radius);
+    }
+    vehicleMotion_ = std::make_unique<render::VehicleMotion>(g.templates);
     mapRenderer_->playerSide = playerSide_;
     if (cfg.reveal) mapRenderer_->showShroud = false;
     mapRenderer_->classicSelection = !enhanced;
     mapRenderer_->healthBars = static_cast<int>(settings_.healthBars);
+    {  // the cursor puff: EX_PUFF = Templates.bin groupIds[57] (AddCursorPuffAnimationToQueue 0x456d50)
+        const int gid = g.templates.bin.groupIds[57];
+        if (gid >= 0 && gid < int(g.templates.animationArtFirstFrame.size()) && gid < int(g.templates.animationArtFrames.size()))
+            orderFeedback_.setPuffArt(g.templates.animationArtFirstFrame[std::size_t(gid)],
+                                      g.templates.animationArtFrames[std::size_t(gid)]);
+    }
     appliedArtPack_ = enhanced ? "upscaled" : "";
     appliedTerrainKey_ = enhanced ? "hq|" : "classic";
     syncVisuals();
@@ -233,8 +262,13 @@ Session::Session(SDL_Renderer* r, std::unique_ptr<GameData> data, Settings& sett
 Session::~Session() {
     // The day / night cycle continues in the next game from here (Settings::cyclePhase); previews and
     // one-frame runs never write settings (App::persist_), so only played games move it.
+    // The zoom carries over to the next game too (Enhanced / 3D; the Original view has no zoom).
+    if (!cfg_.presetPreview && !classicUi() && ppp_ > 0) settings_.lastZoom = cam_.zoom / ppp_;
     if (!cfg_.presetPreview && settings_.timeOfDay == Settings::TimeOfDay::Cycle && lastCycleSeconds_ > 0)
         settings_.cyclePhase = std::fmod(lastCycleSeconds_, render::cycleLength());
+    // D2K_LOG_HASH: the world's state hash at the end (render-only features must not change it).
+    if (std::getenv("D2K_LOG_HASH") && world_)
+        SDL_Log("world hash at tick %u: %016llx", world_->gameTicks(), (unsigned long long)game::worldStateHash(*world_));
     if (classicTarget_) SDL_DestroyTexture(classicTarget_);
     if (peekTarget_) SDL_DestroyTexture(peekTarget_);
 }
@@ -262,10 +296,13 @@ void Session::toGameEvent(SDL_Event& e) const {
 
 void Session::createWorld() {
     const GameData& g = *data_;
+    game::Rules rules = rulesOf(g);
+    // "Unit limit" (not original): chosen for new games; a loaded game keeps its own (applySave).
+    rules.unlimitedObjects = settings_.unlimitedUnits;
     if (g.start.skirmish)
-        world_ = std::make_unique<game::World>(g.map, g.mission, g.tileAtr, g.tileData, rulesOf(g), skirmishSetupOf(g));
+        world_ = std::make_unique<game::World>(g.map, g.mission, g.tileAtr, g.tileData, rules, skirmishSetupOf(g));
     else
-        world_ = std::make_unique<game::World>(g.map, g.mission, g.tileAtr, g.tileData, rulesOf(g), playerSide_,
+        world_ = std::make_unique<game::World>(g.map, g.mission, g.tileAtr, g.tileData, rules, playerSide_,
                                                g.playAs() ? g.missionSide : -1);
     game::World& world = *world_;
     if (!g.start.skirmish) world.difficulty = std::clamp(g.start.sk.difficulty, 0, 2);  // gDifficultyLevel
@@ -283,7 +320,20 @@ void Session::createWorld() {
     if (("," + cfg_.sidebarPage + ",").find(",demo-base,") != std::string::npos) demoBase(world, playerSide_);
     // D2K_PREVIEW_SCENE (check): the Graphics previews' scene (a base, tanks, infantry) on this map too.
     if (cfg_.presetPreview || std::getenv("D2K_PREVIEW_SCENE")) presetPreviewScene(world, playerSide_);
-    for (int t = 0; t < cfg_.ticks; ++t) world.tick();
+    if (const char* fd = std::getenv("D2K_FACING_DEMO"))
+        facingDemoScene(world, playerSide_, fd, cfg_.at ? cfg_.at->first - 10 : 4, cfg_.at ? cfg_.at->second - 3 : 4);
+    if (("," + cfg_.sidebarPage + ",").find(",demo-groups,") != std::string::npos) {
+        // Screenshots of the group badges: own units into groups 1..9, 0 by type (a few per group).
+        auto& me = world.sides()[playerSide_];
+        int n = 0;
+        for (int i = me.firstUnit; i != -1; i = me.nextObject(i)) me.units[i].groupId = std::uint8_t(1 + (n++ / 3) % 10);
+    }
+    for (int t = 0; t < cfg_.ticks; ++t) {
+        // --vfx-demo --ticks N: the demo's scene runs in the pre-ticks too (screenshots at a fixed tick).
+        if (cfg_.vfxDemo)
+            vfxDemoTick(world, cfg_.at ? cfg_.at->first * 32 : world.width() * 16, cfg_.at ? cfg_.at->second * 32 : world.height() * 16);
+        world.tick();
+    }
     // Check of the build-up look (render/buildup_fx.hpp): D2K_BUILDUP=<0..1>[s] puts every building
     // at that point of its build-up (s: of its sale). Debug, before the first frame.
     if (const char* bu = std::getenv("D2K_BUILDUP")) {
@@ -320,6 +370,7 @@ void Session::createWorld() {
     }
     snd_.reset();  // FUN_0046f980 at mission start
     motion_.reset();
+    vmClock_ = -1;
     minimap_->rebuild(world, playerSide_);
     // Open the view on the player's first building or unit (unless --at is given).
     if (!cfg_.at) {
@@ -340,6 +391,8 @@ void Session::createWorld() {
     leftDown_ = dragging_ = minimapDrag_ = false;
     cursorMode_ = 0;
     snapCamera_ = true;
+    orderFeedback_.clear();
+    flickerClock_ = 0;
 }
 
 void Session::restart() {
@@ -362,7 +415,10 @@ void Session::showPausePage(const std::string& name) {
         pendingPage_ = name;
         return;
     }
-    if (name == "pause-options") showPauseOptions();
+    if (name == "pause-options" || name == "pause-options-end") {  // -end: scrolled to the bottom (the display rows)
+        showPauseOptions();
+        if (name == "pause-options-end") pauseOptionsScroll_ = 1e6f;
+    }
     else if (name == "pause-save") showPauseSlots(true);
     else if (name == "pause-load") showPauseSlots(false);
     else if (name.rfind("pause-cheats", 0) == 0) {  // pause-cheats[-money|-tech|-build|-deliver|-spawn|-toggles]
@@ -452,13 +508,14 @@ bool Session::saveToSlot(int slot, std::string& error, const std::string& name) 
 }
 
 void Session::applySave(const game::SaveMeta& meta, std::span<const std::uint8_t> worldSection) {
-    game::loadWorldState(*world_, worldSection);
+    game::loadWorldState(*world_, worldSection, meta.version);
     playerSide_ = world_->mySide();
     mapRenderer_->playerSide = playerSide_;
     cam_.x = meta.cameraX;
     cam_.y = meta.cameraY;
     if (meta.cameraZoom > 0.1f && settings_.enhanced()) cam_.zoom = meta.cameraZoom * ppp_;
     motion_.reset();
+    vmClock_ = -1;
     snapCamera_ = true;
     minimap_->rebuild(*world_, playerSide_);
     tickAccumulator_ = 0;
@@ -467,6 +524,7 @@ void Session::applySave(const game::SaveMeta& meta, std::span<const std::uint8_t
     cursorMode_ = 0;
     endSeenAt_ = 0;
     leftDown_ = dragging_ = minimapDrag_ = false;
+    orderFeedback_.clear();
     last_ = SDL_GetTicksNS();
     snd_.reset();                       // FUN_0046f980 (LoadGame 0x4418b0)
     mentatSpeech("GAMELOADED", true);   // Game__MainLoopFrame 0x448bfa after a load
@@ -503,6 +561,7 @@ SDL_Rect Session::battlefieldRect() const {
 void Session::runTicks(int n) {
     for (int t = 0; t < n; ++t) world_->tick();
     motion_.reset();
+    vmClock_ = -1;
     minimap_->rebuild(*world_, playerSide_);
 }
 
@@ -524,7 +583,11 @@ void Session::syncGraphics() {
     cursorMode_ = 0;
     placingType_ = -1;
     leftDown_ = dragging_ = minimapDrag_ = false;
-    if (enhanced) cam_.zoom = cfg_.zoom * ppp_;
+    // The zoom of the last played game (Settings::lastZoom), unless --zoom asked for another; previews and
+    // one-frame runs never load saved settings, so lastZoom is 0 there.
+    const float startZoom = !cfg_.presetPreview && cfg_.zoom == 1.0f && settings_.lastZoom > 0.1f
+                                ? std::clamp(settings_.lastZoom, 0.25f, 4.0f) : cfg_.zoom;
+    if (enhanced) cam_.zoom = startZoom * ppp_;
     // The two modes have separate pause menus (modern Ui pages / the original page stack). The
     // pause frame that consumed pauseOpened_ was the other mode's, so the original page stack
     // would stay empty: nothing drawn, no Resume, the game stuck paused (the reported hang after
@@ -551,6 +614,9 @@ void Session::syncGraphics() {
 
 render::Hdr* Session::hdrIfOn() {
     if (!settings_.hdr || appliedGraphics_ == Settings::Graphics::Original) return nullptr;
+    // Direct3D 12 (SDL 3.4.20): the half-float lighting composite of Enhanced breaks like the 3D scene does
+    // (a black battlefield with modern lighting) - 8-bit lighting there (render3d::gpuHdrOk).
+    if (!render3d::gpuHdrOk()) return nullptr;
     if (!hdr_) hdr_ = std::make_unique<render::Hdr>(r_);
     return hdr_->available() ? hdr_.get() : nullptr;
 }
@@ -686,6 +752,19 @@ void Session::screenToWorld(float sx, float sy, float& wx, float& wy, bool units
     }
     wx = cam_.x + sx / cam_.zoom;
     wy = cam_.y + sy / cam_.zoom;
+}
+
+// A selection box keeps its start point on the battlefield while the view scrolls (owner 2026-11-14:
+// the box moved with the map): the anchor is a ground point, mapped back to the screen each frame.
+void Session::refreshBoxAnchor() {
+    if (!leftDown_) return;
+    float sx = 0, sy = 0;
+    if (view3d() && view3d()->ready()) {
+        if (view3d()->worldToScreen(leftWX_, leftWY_, 0, sx, sy)) leftX_ = sx, leftY_ = sy;
+        return;
+    }
+    leftX_ = (leftWX_ - cam_.x) * cam_.zoom;
+    leftY_ = (leftWY_ - cam_.y) * cam_.zoom;
 }
 
 void Session::panView(float dx, float dy) {
@@ -888,6 +967,7 @@ void Session::drawClassicPeek(const game::World& world, const game::Scenario& s,
     SDL_SetRenderClipRect(r_, nullptr);
     SDL_SetRenderDrawColor(r_, 0, 0, 0, 255);
     SDL_RenderClear(r_);
+    peekMap_->orderFeedback = &orderFeedback_;
     peekMap_->draw(world, s, render::Camera{fx, fy, 1.0f}, tw, th);
     SDL_SetRenderTarget(r_, prev);
     SDL_SetRenderViewport(r_, vpSet ? &vp : nullptr);
@@ -1094,6 +1174,18 @@ bool Session::originalBoxSelect(float x0, float y0, float x1, float y1, bool add
     return true;
 }
 
+// D2K_PICK_LOG=1 (debug, with Renderer3D::pick's log): the battlefield order a click gave.
+static void logOrder(const char* how, game::SmartOrder r, int wx, int wy) {
+    static const bool on = [] {
+        const char* e = std::getenv("D2K_PICK_LOG");
+        return e && *e && *e != '0';
+    }();
+    if (!on) return;
+    static const char* const kNames[] = {"None",       "Move",     "AttackUnit",       "AttackBuilding",
+                                         "AttackTile", "Friendly", "TurretAttackUnit", "TurretAttackBuilding"};
+    SDL_Log("order (%s): %s at cell (%d,%d)", how, kNames[int(r)], wx >> 5, wy >> 5);
+}
+
 // Left click on the battlefield in the original scheme (HandleBattlefieldClick 0x4433a0, mode 0,
 // left button released; re/notes/timing.md §Input). Ctrl = force attack, Shift = toggle an own
 // unit in the selection.
@@ -1114,6 +1206,7 @@ void Session::originalLeftClick(float sx, float sy) {
     // units are selected). Unit orders play the unit response; turret orders are silent.
     auto order = [&] {
         const game::SmartOrder r = world.smartOrder(side, wx, wy, ctrl, alt);
+        logOrder("left click", r, wx, wy);
         if (r == game::SmartOrder::Move || r == game::SmartOrder::AttackUnit || r == game::SmartOrder::AttackBuilding ||
             r == game::SmartOrder::AttackTile)
             unitResponse(true);
@@ -1122,9 +1215,9 @@ void Session::originalLeftClick(float sx, float sy) {
     // Shrouded cell: move there (GenerateUnitMoveOrder) if anything is selected.
     if (mapRenderer_->showShroud && world.shrouded(tx, ty)) {
         if (anySel) {
-            for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
-                if (me.units[i].selected) world.orderMove(side, i, tx, ty);
+            for (int i : world.orderGroup(side)) world.orderMove(side, i, tx, ty);  // max 64 (Order limit)
             unitResponse(true);
+            orderFeedback(Feedback::Move, fx, fy);  // + AddCursorPuffAnimationToQueue
         }
         return;
     }
@@ -1148,6 +1241,8 @@ void Session::originalLeftClick(float sx, float sy) {
         // attack it (Alt + enemy infantry + a crusher: drive over it); with none, a selected own
         // turret in reach fires at it, else select it for viewing only (0x4433a0).
         const game::SmartOrder r = order();
+        if (r == game::SmartOrder::AttackUnit || r == game::SmartOrder::TurretAttackUnit)
+            orderFeedback(Feedback::AttackUnit, fx, fy, us, ui);  // SetUnitToFlicker
         const bool hidden = (u->flags & game::unit_flags::kCloaked) && world.diplomacy(side, us) != 0;
         if (r == game::SmartOrder::Friendly || (r == game::SmartOrder::None && !anySel && !hidden)) {
             deselectAll();
@@ -1169,17 +1264,18 @@ void Session::originalLeftClick(float sx, float sy) {
                 return any;
             };
             if (bt.specialBehavior == game::building_behaviour::kRefinery && allHarvesters()) {
-                for (int i = me.firstUnit; i != -1; i = me.nextObject(i))  // GenerateDockWithRefineryOrder
-                    if (me.units[i].selected) world.orderDockAtRefinery(side, i, bi);
+                for (int i : world.orderGroup(side))  // GenerateDockWithRefineryOrder 0x459540 (max 64)
+                    world.orderDockAtRefinery(side, i, bi);
                 me.buildings[bi].flicker = 7;
                 unitResponse(true);
                 return;
             }
             if (bt.specialBehavior == game::building_behaviour::kRepairPad && anySel) {
-                bool sent = false;  // GenerateRepairSelectedUnitsOrder: vehicles only
-                for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
-                    if (me.units[i].selected && !data_->templates.bin.units[me.units[i].type].isInfantry)
-                        sent = world.orderRepairUnit(side, i, bi) || sent;
+                bool sent = false;  // GenerateRepairSelectedUnitsOrder 0x4595e0: vehicles only (max 64)
+                for (int i : world.orderGroup(side, [&](const game::Unit& u) {
+                         return !data_->templates.bin.units[u.type].isInfantry;
+                     }))
+                    sent = world.orderRepairUnit(side, i, bi) || sent;
                 if (sent) {
                     me.buildings[bi].flicker = 7;
                     unitResponse(true);
@@ -1202,6 +1298,8 @@ void Session::originalLeftClick(float sx, float sy) {
         // fires at it when in range (checked before the units), else units attack it; when nothing
         // is ordered and no units (or a turret) are selected, select it (template flag 0x200).
         const game::SmartOrder r = order();
+        if (r == game::SmartOrder::AttackBuilding || r == game::SmartOrder::TurretAttackBuilding)
+            orderFeedback(Feedback::AttackBuilding, fx, fy, bs, bi);  // SetBuildingToFlicker
         const bool selectIt = r == game::SmartOrder::Friendly ||
                               (r == game::SmartOrder::None && (!anySel || world.selectedBarrelBuilding(side)));
         if (selectIt && (bt.flags & game::building_flags::kSelectable) &&
@@ -1211,15 +1309,86 @@ void Session::originalLeftClick(float sx, float sy) {
         }
         return;
     }
-    order();  // open ground: move (Ctrl: attack the ground)
+    // Open ground: move (Ctrl: attack the ground), both with a cursor puff at the click point.
+    const game::SmartOrder r = order();
+    if (r == game::SmartOrder::Move) orderFeedback(Feedback::Move, fx, fy);
+    else if (r == game::SmartOrder::AttackTile) orderFeedback(Feedback::AttackGround, fx, fy);
+}
+
+// Order feedback (render only, render/order_feedback.hpp). Graphics: Original reproduces the
+// original: a cursor puff for a move / attack-ground order on the battlefield (0x4433a0 ->
+// AddCursorPuffAnimationToQueue 0x456d50; not for radar orders), the attacked target's blink is
+// its flicker counter (set by the World orders). Enhanced / 3D: modern ground rings.
+void Session::orderFeedback(Feedback kind, float wx, float wy, int targetSide, int targetIndex) {
+    const bool original = mapRenderer_->classicSelection;
+    switch (kind) {
+    case Feedback::Move:
+    case Feedback::AttackGround:
+        if (original) orderFeedback_.addPuff(int(wx), int(wy));
+        else orderFeedback_.addMove(wx, wy, kind == Feedback::AttackGround);
+        break;
+    case Feedback::RadarMove:
+        if (!original) orderFeedback_.addMove(wx, wy, false);
+        break;
+    case Feedback::AttackUnit:
+    case Feedback::AttackBuilding:
+        // Only the target's blink (its flicker counter, as in the original; Enhanced draws it as a brief
+        // brightening) - no red ring around it (owner 2026-11-14: "I don't like this red circle").
+        break;
+    }
+}
+
+// An order through the radar / minimap at world point (wx, wy). Plain: GenerateUnitMoveOrder to
+// the cell for every selected unit (0x4433a0 radar branch: outpost with power, units selected; the
+// orderGroup keeps the original 64-unit Order limit) + the order response. Smart (Modern controls'
+// right click): the same as a right click on that cell of the battlefield - attack what is there
+// (Ctrl: force attack, Alt: force move), else move; a shrouded cell is always a plain move.
+bool Session::minimapOrder(float wx, float wy, bool smart) {
+    game::World& world = *world_;
+    const int side = playerSide_;
+    if (!anyUnitSelected()) return false;
+    const int tx = int(wx) >> 5, ty = int(wy) >> 5;
+    if (!world.inBounds(tx, ty)) return false;
+    const float cx = tx * 32.0f + 16, cy = ty * 32.0f + 16;
+    if (smart && !(mapRenderer_->showShroud && world.shrouded(tx, ty))) {
+        const SDL_Keymod mod = SDL_GetModState();
+        game::SmartOrder r =
+            world.smartOrder(side, int(cx), int(cy), (mod & SDL_KMOD_CTRL) != 0, (mod & SDL_KMOD_ALT) != 0);
+        if (r == game::SmartOrder::Friendly) {
+            for (int i : world.orderGroup(side)) world.orderMove(side, i, tx, ty);
+            r = game::SmartOrder::Move;
+        }
+        int ts = -1, ti = -1;
+        switch (r) {
+        case game::SmartOrder::Move: orderFeedback(Feedback::RadarMove, cx, cy); break;
+        case game::SmartOrder::AttackTile: if (!mapRenderer_->classicSelection) orderFeedback_.addMove(cx, cy, true); break;
+        case game::SmartOrder::AttackUnit:
+            if (world.unitAt(int(cx), int(cy), ts, ti)) orderFeedback(Feedback::AttackUnit, cx, cy, ts, ti);
+            break;
+        case game::SmartOrder::AttackBuilding:
+            if (world.buildingAt(tx, ty, ts, ti)) orderFeedback(Feedback::AttackBuilding, cx, cy, ts, ti);
+            break;
+        default: return false;
+        }
+        unitResponse(true);
+        return true;
+    }
+    for (int i : world.orderGroup(side)) world.orderMove(side, i, tx, ty);  // GenerateUnitMoveOrder (max 64)
+    unitResponse(true);
+    orderFeedback(Feedback::RadarMove, cx, cy);
+    return true;
+}
+
+bool Session::minimapPoint(float sx, float sy, float& wx, float& wy) const {
+    if (!world_->radarActive(playerSide_)) return false;  // no radar: the logo takes no clicks
+    const SDL_FPoint p{sx, sy};
+    if (!SDL_PointInRectFloat(&p, &minimapArea_)) return false;  // (phone: the radar may be hidden)
+    return minimap_->screenToWorld(sx, sy, wx, wy);
 }
 
 bool Session::centreFromMinimap(float sx, float sy) {
     float wx = 0, wy = 0;
-    if (!world_->radarActive(playerSide_)) return false;  // no radar: the logo takes no clicks
-    const SDL_FPoint p{sx, sy};
-    if (!SDL_PointInRectFloat(&p, &minimapArea_)) return false;  // (phone: the radar may be hidden)
-    if (!minimap_->screenToWorld(sx, sy, wx, wy)) return false;
+    if (!minimapPoint(sx, sy, wx, wy)) return false;
     centreViewOn(wx, wy);
     return true;
 }
@@ -1377,6 +1546,22 @@ bool Session::handleClassicEvent(SDL_Event& e) {
         if (!classic_->inBattlefield(x, y)) {
             if (ended) return true;
             if (e.button.button == SDL_BUTTON_RIGHT) placingType_ = -1;
+            // Modern controls on the original radar: left = camera (also with units selected), right =
+            // order there (minimapOrder smart). Original controls: the original's radar (left with units
+            // selected = move there, else centre the view; right = deselect), in ClassicSidebar.
+            int rwx = 0, rwy = 0;
+            if (!originalControls() && classic_->radarToWorld(x, y, world, playerSide_, rwx, rwy)) {
+                if (e.button.button == SDL_BUTTON_RIGHT) {
+                    minimapOrder(rwx + 16.0f, rwy + 16.0f, true);
+                    return true;
+                }
+                if (e.button.button == SDL_BUTTON_LEFT) {
+                    cam_.x = rwx - viewW_ / (2 * cam_.zoom);
+                    cam_.y = rwy - viewH_ / (2 * cam_.zoom);
+                    minimapDrag_ = true;
+                    return true;
+                }
+            }
             const auto act = classic_->mouseDown(x, y, e.button.button, world, playerSide_, anyUnitSelected());
             classicAction(act);
             for (const auto& name : classic_->takeSounds())  // QueueAudioToPlay(id, 0, 0, 0)
@@ -1469,13 +1654,7 @@ void Session::classicAction(const render::ClassicAction& a) {
         cam_.y = a.y - viewH_ / (2 * cam_.zoom);
         minimapDrag_ = true;
         break;
-    case A::RadarMove: {
-        auto& me = world.sides()[side];
-        for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
-            if (me.units[i].selected) world.orderMove(side, i, a.x, a.y);
-        unitResponse(true);
-        break;
-    }
+    case A::RadarMove: minimapOrder(a.x * 32.0f + 16, a.y * 32.0f + 16, false); break;  // GenerateUnitMoveOrder (max 64)
     case A::Deselect: deselectAll(); break;
     case A::StarportPick: world.orderStarportPick(side, a.type); break;
     case A::StarportUnpick: world.orderStarportUnpick(side, a.type); break;
@@ -1565,9 +1744,8 @@ void Session::handleEvent(const SDL_Event& ev) {
         if (e.key.key == SDLK_F) mapRenderer_->showShroud = !mapRenderer_->showShroud;
         {
             auto& me = world.sides()[side];
-            if (e.key.key == SDLK_S)
-                for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
-                    if (me.units[i].selected) world.orderStop(side, i);
+            if (e.key.key == SDLK_S)  // GenerateStopOrder 0x459c40 (max 64)
+                for (int i : world.orderGroup(side)) world.orderStop(side, i);
             if (e.key.key == SDLK_D)
                 for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
                     if (me.units[i].selected && world.canDeploy(side, i)) world.orderDeploy(side, i);
@@ -1605,8 +1783,21 @@ void Session::handleEvent(const SDL_Event& ev) {
             case C::None: break;
             }
             if (ca.kind != C::None) break;
-            if (button == SDL_BUTTON_LEFT && centreFromMinimap(x, y)) {
-                minimapDrag_ = true;
+            // The minimap (Enhanced / 3D; radar active). Original controls = the original radar: left
+            // with units selected moves them there, else centres the view (drag keeps centring); right
+            // deselects. Modern controls: left = camera (drag), right = order there (minimapOrder).
+            if (float mwx = 0, mwy = 0; minimapPoint(x, y, mwx, mwy)) {
+                if (button == SDL_BUTTON_LEFT) {
+                    if (originalControls() && anyUnitSelected()) {
+                        minimapOrder(mwx, mwy, false);
+                    } else {
+                        centreViewOn(mwx, mwy);
+                        minimapDrag_ = true;
+                    }
+                } else if (button == SDL_BUTTON_RIGHT) {
+                    if (originalControls()) deselectAll();
+                    else minimapOrder(mwx, mwy, true);
+                }
                 break;
             }
             if (sidebarLive(x, y)) {
@@ -1670,10 +1861,24 @@ void Session::handleEvent(const SDL_Event& ev) {
             }
             break;
         }
-        if (e.button.button == SDL_BUTTON_RIGHT) { dragging_ = true; rightMoved_ = false; }
+        if (e.button.button == SDL_BUTTON_RIGHT) {
+            dragging_ = true;
+            rightMoved_ = false;
+            rightPressX_ = e.button.x;
+            rightPressY_ = e.button.y;
+            // Original controls: a right click on the battlefield ALWAYS deselects (owner 2026-11-14; the
+            // original deselects on the click, HandleBattlefieldClick 0x4433a0) - on the press, so a wobble
+            // or a right-drag pan never swallows it. The pan still works while the button is held.
+            if (originalControls() && e.button.x < viewW_ && !ended) deselectAll();
+        }
         if (e.button.button == SDL_BUTTON_LEFT) {
             if (!classicUi() && centreFromMinimap(e.button.x, e.button.y)) minimapDrag_ = true;
-            else if (e.button.x < viewW_) { leftDown_ = true; leftX_ = e.button.x; leftY_ = e.button.y; }
+            else if (e.button.x < viewW_) {
+                leftDown_ = true;
+                leftX_ = e.button.x;
+                leftY_ = e.button.y;
+                screenToWorld(leftX_, leftY_, leftWX_, leftWY_, false);  // the box's anchor on the ground
+            }
         }
         break;
     case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -1686,10 +1891,7 @@ void Session::handleEvent(const SDL_Event& ev) {
             dragging_ = false;
             if (!rightMoved_ && e.button.x < viewW_ && !ended) {
                 if (originalControls()) {
-                    // Original: right click on the battlefield deselects everything
-                    // (HandleBattlefieldClick 0x4433a0 -> DeselectAllForAllSides). It acts on
-                    // release here so that a right drag can still pan the view.
-                    deselectAll();
+                    // Original: already deselected on the press (above).
                 } else {
                     // Modern: smart order for the selected units (or a selected own turret):
                     // attack the enemy unit/building under the cursor, else move there. Ctrl =
@@ -1704,14 +1906,21 @@ void Session::handleEvent(const SDL_Event& ev) {
                     } else {
                         game::SmartOrder r = world.smartOrder(side, int(wx), int(wy), (mod & SDL_KMOD_CTRL) != 0,
                                                               (mod & SDL_KMOD_ALT) != 0);
+                        logOrder("right click", r, int(wx), int(wy));
                         if (r == game::SmartOrder::Friendly && anyUnitSelected()) {
                             const int tx = int(wx) >> 5, ty = int(wy) >> 5;
-                            const auto& mine = world.sides()[side];
-                            for (int i = mine.firstUnit; i != -1; i = mine.nextObject(i))
-                                if (mine.units[i].selected && mine.units[i].state != game::UnitState::Dead)
-                                    world.orderMove(side, i, tx, ty);
+                            for (int i : world.orderGroup(side)) world.orderMove(side, i, tx, ty);
                             r = game::SmartOrder::Move;
                         }
+                        int ts = -1, ti = -1;
+                        if (r == game::SmartOrder::Move) orderFeedback(Feedback::Move, wx, wy);
+                        else if (r == game::SmartOrder::AttackTile) orderFeedback(Feedback::AttackGround, wx, wy);
+                        else if ((r == game::SmartOrder::AttackUnit || r == game::SmartOrder::TurretAttackUnit) &&
+                                 world.unitAt(int(wx), int(wy), ts, ti))
+                            orderFeedback(Feedback::AttackUnit, wx, wy, ts, ti);
+                        else if ((r == game::SmartOrder::AttackBuilding || r == game::SmartOrder::TurretAttackBuilding) &&
+                                 world.buildingAt(int(wx) >> 5, int(wy) >> 5, ts, ti))
+                            orderFeedback(Feedback::AttackBuilding, wx, wy, ts, ti);
                         if (r == game::SmartOrder::Move || r == game::SmartOrder::AttackUnit ||
                             r == game::SmartOrder::AttackBuilding || r == game::SmartOrder::AttackTile)
                             unitResponse(true);
@@ -1722,6 +1931,7 @@ void Session::handleEvent(const SDL_Event& ev) {
         if (e.button.button == SDL_BUTTON_LEFT) {
             minimapDrag_ = false;
             if (leftDown_) {
+                refreshBoxAnchor();
                 const bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
                 if (originalControls()) {
                     // A box needs >= 4 px in both directions (0x4433a0), else it is a click.
@@ -1746,7 +1956,11 @@ void Session::handleEvent(const SDL_Event& ev) {
         mouseY_ = e.motion.y;
         if (minimapDrag_ && !classicUi()) centreFromMinimap(e.motion.x, e.motion.y);
         if (dragging_) {
-            if (std::abs(e.motion.xrel) + std::abs(e.motion.yrel) > 0) rightMoved_ = true;
+            // A right click that wobbles a few px is still a click (deselect / order), not a pan: only a
+            // move of more than ~6 points from the press turns it into a drag (owner 2026-11-14: right click
+            // often failed to deselect during fast play). Event coordinates are output pixels.
+            const float tol = 6.0f * std::max(1.0f, pixelsPerPoint(r_));
+            if (std::abs(e.motion.x - rightPressX_) > tol || std::abs(e.motion.y - rightPressY_) > tol) rightMoved_ = true;
             panView(-e.motion.xrel / cam_.zoom, -e.motion.yrel / cam_.zoom);
         }
         if (middleDrag_ && view3d()) {  // 3D: middle drag turns (x) and tilts (y) the camera
@@ -1906,8 +2120,7 @@ void Session::touchCommand(TouchCommand c) {
     auto& me = world.sides()[side];
     switch (c) {
     case TouchCommand::Stop:
-        for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
-            if (me.units[i].selected) world.orderStop(side, i);
+        for (int i : world.orderGroup(side)) world.orderStop(side, i);
         break;
     case TouchCommand::Deploy:
         for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
@@ -1929,6 +2142,15 @@ void Session::touchCommand(TouchCommand c) {
         else if (!ended) setPaused(true);
         break;
     }
+}
+
+// Settings::groupNumbers for the renderers (0 off, 1 selected, 2 always); Graphics: Original never
+// (the original draws its own digit on selected units). D2K_GROUP_NUMBERS=off|selected|always
+// overrides it (screenshots: one-frame runs use the struct default).
+int Session::groupNumbersMode() const {
+    if (appliedGraphics_ == Settings::Graphics::Original) return 0;
+    if (const char* e = std::getenv("D2K_GROUP_NUMBERS")) return static_cast<int>(Settings::groupNumbersFrom(e));
+    return static_cast<int>(settings_.groupNumbers);
 }
 
 bool Session::touchGroupUsed(int grp) const {
@@ -2162,12 +2384,12 @@ void Session::renderPhoneUi(game::World& world) {
 }
 
 // D2K_CAMERA_MOVE (recordings, debug): a scripted camera move over the first seconds of the game,
-// e.g. "secs=8,yaw=-30:30,tilt=40:55,zoom=2:2.6,at=10:9:14:12" - each key optional, from:to eased
+// e.g. "secs=8,yaw=-30:30,tilt=40:55,zoom=2:2.6,at=10:9:14:12" (wait=S: start after S seconds) - each key optional, from:to eased
 // (smoothstep); at = view centre in cells (x0:y0:x1:y1); zoom is ignored by Graphics: Original.
 void Session::applyCameraMove(double dt) {
     static const struct Move {
         bool on = false;
-        double secs = 10;
+        double secs = 10, wait = 0;
         bool yaw = false, tilt = false, zoom = false, at = false;
         float yaw0 = 0, yaw1 = 0, tilt0 = 0, tilt1 = 0, zoom0 = 1, zoom1 = 1, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     } mv = [] {
@@ -2187,6 +2409,7 @@ void Session::applyCameraMove(double dt) {
             const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
             float a = 0, b = 0, c = 0, d = 0;
             if (k == "secs") m.secs = std::max(0.01, std::atof(v.c_str()));
+            else if (k == "wait") m.wait = std::max(0.0, std::atof(v.c_str()));
             else if (k == "yaw" && std::sscanf(v.c_str(), "%f:%f", &a, &b) == 2) { m.yaw = true; m.yaw0 = a; m.yaw1 = b; }
             else if (k == "tilt" && std::sscanf(v.c_str(), "%f:%f", &a, &b) == 2) { m.tilt = true; m.tilt0 = a; m.tilt1 = b; }
             else if (k == "zoom" && std::sscanf(v.c_str(), "%f:%f", &a, &b) == 2) { m.zoom = true; m.zoom0 = a; m.zoom1 = b; }
@@ -2199,7 +2422,8 @@ void Session::applyCameraMove(double dt) {
     }();
     if (!mv.on) return;
     cameraMoveT_ += dt;
-    const float t = float(std::clamp(cameraMoveT_ / mv.secs, 0.0, 1.0)), u = t * t * (3 - 2 * t);
+    if (cameraMoveT_ < mv.wait) return;  // wait=S: the camera stays as it starts for S seconds
+    const float t = float(std::clamp((cameraMoveT_ - mv.wait) / mv.secs, 0.0, 1.0)), u = t * t * (3 - 2 * t);
     auto lerp = [u](float a, float b) { return a + (b - a) * u; };
     if (mv.yaw) camYaw_ = render3d::radians(lerp(mv.yaw0, mv.yaw1));
     if (mv.tilt) camTilt_ = render3d::radians(std::clamp(lerp(mv.tilt0, mv.tilt1), 0.0f, 66.0f));
@@ -2210,14 +2434,74 @@ void Session::applyCameraMove(double dt) {
     cam_.y = ny - viewH_ / (2 * cam_.zoom);
 }
 
+// D2K_DEMO_CLICKS (recordings, debug): scripted mouse clicks through handleEvent, e.g.
+// "0.5:L:400:300;1.2:R:900:120:ctrl" = seconds since the game started : L / R : output-pixel
+// position : optional ctrl / alt / shift. Each is a press and a release at the same point.
+void Session::applyDemoClicks(double dt) {
+    struct Click { double t; int button; float x, y; SDL_Keymod mod; };
+    static std::vector<Click> clicks = [] {
+        std::vector<Click> v;
+        const char* e = std::getenv("D2K_DEMO_CLICKS");
+        if (!e) return v;
+        std::stringstream ss(e);
+        std::string item;
+        while (std::getline(ss, item, ';')) {
+            double t = 0;
+            char b = 'L';
+            float x = 0, y = 0;
+            char mods[32] = {};
+            const int n = std::sscanf(item.c_str(), "%lf:%c:%f:%f:%31s", &t, &b, &x, &y, mods);
+            if (n < 4) continue;
+            SDL_Keymod m = SDL_KMOD_NONE;
+            const std::string ms = n == 5 ? mods : "";
+            if (ms.find("ctrl") != std::string::npos) m |= SDL_KMOD_LCTRL;
+            if (ms.find("alt") != std::string::npos) m |= SDL_KMOD_LALT;
+            if (ms.find("shift") != std::string::npos) m |= SDL_KMOD_LSHIFT;
+            v.push_back({t, b == 'R' ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT, x, y, m});
+        }
+        SDL_Log("D2K_DEMO_CLICKS: %d clicks", int(v.size()));
+        return v;
+    }();
+    if (clicks.empty()) return;
+    const double before = demoClickT_;
+    demoClickT_ += dt;
+    for (const Click& c : clicks) {
+        if (!(c.t >= before && c.t < demoClickT_)) continue;
+        const SDL_Keymod old = SDL_GetModState();
+        SDL_SetModState(c.mod);
+        SDL_Event ev{};
+        ev.type = SDL_EVENT_MOUSE_MOTION;
+        ev.motion.x = c.x;
+        ev.motion.y = c.y;
+        handleEvent(ev);
+        ev = {};
+        ev.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+        ev.button.button = Uint8(c.button);
+        ev.button.down = true;
+        ev.button.x = c.x;
+        ev.button.y = c.y;
+        handleEvent(ev);
+        ev.type = SDL_EVENT_MOUSE_BUTTON_UP;
+        ev.button.down = false;
+        handleEvent(ev);
+        SDL_SetModState(old);
+    }
+}
+
 void Session::update() {
+    updateStartNs_ = SDL_GetTicksNS();
     syncGraphics();
     layout();
-    if (world_) world_->rallyPointsEnabled = settings_.rallyPoints;  // "Factory rally points" (not original)
+    if (world_) {
+        world_->rallyPointsEnabled = settings_.rallyPoints;  // "Factory rally points" (not original)
+        // "Order limit" (not original): applies to the next order at once.
+        world_->setOrderUnitLimit(settings_.unlimitedOrders ? 0 : game::kOrderUnitsOriginal);
+    }
     const Uint64 now = SDL_GetTicksNS();
     // Long stalls (window drag, breakpoints) are not caught up.
     const double dt = fixedStep_ > 0 ? fixedStep_ : std::min(0.25, double(now - last_) / 1e9);
     last_ = now;
+    if (render::FrameProbe::get().on) render::FrameProbe::get().add("dt", Uint64(dt * 1e9) + 1);
     if (out_->ok()) snd_.update(*out_, sfxVolume());  // FUN_0046faa0: next queued speech
     if (paused_) return;
     game::World& world = *world_;
@@ -2237,6 +2521,7 @@ void Session::update() {
     const bool el = edges && se.left, er = edges && se.right, eu = edges && se.up, ed = edges && se.down;
     panView(((kr || er) ? speed : 0.0f) - ((kl || el) ? speed : 0.0f), ((kd || ed) ? speed : 0.0f) - ((ku || eu) ? speed : 0.0f));
     applyCameraMove(dt);  // D2K_CAMERA_MOVE (recordings)
+    applyDemoClicks(dt);  // D2K_DEMO_CLICKS (recordings)
     if (r3d_) {  // 3D: Q / E turn, Page Up / Down tilt
         const float fdt = float(dt);
         if (keys[SDL_SCANCODE_Q]) camYaw_ -= 1.6f * fdt;
@@ -2280,12 +2565,22 @@ void Session::update() {
         motion_.beforeTick(world);
         if (cfg_.vfxDemo)
             vfxDemoTick(world, cfg_.at ? cfg_.at->first * 32 : world.width() * 16, cfg_.at ? cfg_.at->second * 32 : world.height() * 16);
-        world.tick();
-        if (world.gameTicks() % 10 == 0) minimap_->rebuild(world, playerSide_);
+        {
+            render::FrameProbe::Scope ps("tick");
+            ++render::FrameProbe::get().ticks;
+            world.tick();
+        }
+        if (world.gameTicks() % 10 == 0) {
+            render::FrameProbe::Scope ps("minimap");
+            minimap_->rebuild(world, playerSide_);
+        }
         for (const auto& m : world.messages()) {
             // A mission .ini [Text] entry replaces the string (show-message-event.c).
             const auto custom = g.missionText.find(m.textId);
-            const std::string txt = custom != g.missionText.end() ? custom->second
+            const std::string* limit = m.textId == game::kTextReachedUnitLimit ? g.text.findNoCase("ReachedUnitLimit") : nullptr;
+            const std::string txt = m.textId == game::kTextReachedUnitLimit
+                                        ? (limit ? *limit : std::string("You may not build any more units or buildings at this time."))
+                                    : custom != g.missionText.end() ? custom->second
                                     : m.textId >= 0 && m.textId < int(g.text.entries.size())
                                         ? g.text.entries[m.textId].second
                                         : "(message " + std::to_string(m.textId) + ")";
@@ -2409,6 +2704,18 @@ void Session::render(Ui& ui) {
     layout();
     game::World& world = *world_;
     const GameData& g = *data_;
+    {
+        // Art frames prepared in the background: queue the groups of the objects in play (a few times
+        // a second), upload what is ready within a small budget (render/sprites.hpp).
+        render::FrameProbe::Scope ps("artPump");
+        if (artPrefetchFrame_++ % 8 == 0) {
+            render::FrameProbe::Scope ps2("artQueue");
+            // (touch profiles: only what the 2D view shows - the 3D view's camera has no such rectangle)
+            const float view[4] = {cam_.x, cam_.y, cam_.x + viewW_ / cam_.zoom, cam_.y + viewH_ / cam_.zoom};
+            mapRenderer_->prefetchArt(world, lightPrefetch_ && !view3d() ? view : nullptr);
+        }
+        sprites_->pump(1.0);
+    }
     const int viewW = drawW_, viewH = viewH_;  // the drawn battlefield (under a translucent panel too)
     const bool classic = classicUi();
     const bool peek = classicPeek();
@@ -2455,6 +2762,22 @@ void Session::render(Ui& ui) {
     // right after the draw so the simulation keeps its exact positions).
     const bool smooth = settings_.smoothMotion;
     if (smooth) motion_.apply(world, float(tickAccumulator_));
+    // Vehicle animation: Modern (Enhanced / 3D): the hulls' render-only pose, from the drawn positions.
+    const render::VehicleMotion* vm = nullptr;
+    if (vehicleMotion_ && appliedGraphics_ != Settings::Graphics::Original &&
+        settings_.vehicleAnimation == Settings::VehicleAnimation::Modern) {
+        const double clock = double(world.gameTicks()) + tickAccumulator_;
+        float vdt = vmClock_ < 0 ? 0.0f : float(std::clamp((clock - vmClock_) / 20.0, 0.0, 0.1));
+        if (vmClock_ < 0 || clock < vmClock_ - 1) {  // a new game, a load: start over
+            vehicleMotion_->reset();
+            vdt = 0;
+        }
+        vmClock_ = clock;
+        vehicleMotion_->update(world, vdt);
+        vm = vehicleMotion_.get();
+    } else {
+        vmClock_ = -1;
+    }
     const Uint64 nowNs = SDL_GetTicksNS();
     const float frameDt = fixedStep_ > 0 ? float(fixedStep_)
                           : lastRenderNs_ ? std::min(0.1f, float(double(nowNs - lastRenderNs_) / 1e9)) : 0.0f;
@@ -2464,18 +2787,46 @@ void Session::render(Ui& ui) {
         o3.showShroud = mapRenderer_->showShroud;
         o3.playerSide = playerSide_;
         o3.healthBars = static_cast<int>(settings_.healthBars);
+        o3.groupNumbers = groupNumbersMode();
+        o3.groupFont = skin_ ? skin_->font(true) : nullptr;
         o3.designedTerrain = settings_.terrain3dDesigned();
         o3.faithfulTerrain = settings_.terrain3d == Settings::Terrain3D::Faithful;
         o3.shadowMap = settings_.shadows3d;
         o3.packAnchors = packAnchors_.empty() ? nullptr : &packAnchors_;  // building sprites from the pack
         o3.snapCamera = snapCamera_;
         snapCamera_ = false;
+        {  // 3D resolution (Settings::resolution3d; Auto: platform/resolution3d.hpp)
+            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(SDL_GetRenderWindow(r_)));
+            double targetMs = 1000.0 / double(mode && mode->refresh_rate > 0 ? mode->refresh_rate : 60.0f);
+            if (settings_.fpsLimit > 0) targetMs = std::max(targetMs, 1000.0 / settings_.fpsLimit);
+            const bool measure = cfg_.liveTiming && fixedStep_ <= 0 && !paused_ && !snapCamera_;
+            o3.renderScale = res3d_.update(settings_.resolution3d, viewW, viewH, settings_.msaa, double(frameDt) * 1000.0,
+                                           double(frameCpuNs_) / 1e6, targetMs, measure);
+            o3.renderScaleMax = settings_.resolution3d > 0 ? o3.renderScale : Resolution3D::cap(viewW, viewH, settings_.msaa);
+        }
         view3d()->constrainPose(camYaw_, camTilt_);
+        view3d()->setVehicleMotion(vm);
         const render3d::CameraPose pose{cam_.x + viewW / (2 * cam_.zoom), cam_.y + viewH / (2 * cam_.zoom), cam_.zoom, camYaw_,
                                         camTilt_};
         {  // time of day / lighting: the ground rectangle the 3D view sees (about twice the 2D one)
-            const float view[4] = {pose.cx - viewW / cam_.zoom, pose.cy - viewH / cam_.zoom, pose.cx + viewW / cam_.zoom,
-                                   pose.cy + viewH / cam_.zoom};
+            float view[4] = {pose.cx - viewW / cam_.zoom, pose.cy - viewH / cam_.zoom, pose.cx + viewW / cam_.zoom,
+                             pose.cy + viewH / cam_.zoom};
+            // ... grown to the camera's whole ground footprint (last frame's camera): a wide (21:9) or tilted view
+            // sees further to the sides / the far edge than that rectangle, and lamps there went dark.
+            if (const render3d::Renderer3D* v = view3d(); v && v->ready()) {
+                const render3d::Camera3D& c = v->camera();
+                const float w = float(c.viewW()), h = float(c.viewH());
+                const float mapW = world.width() * 32.0f, mapH = world.height() * 32.0f;
+                const float pts[8][2] = {{0, 0}, {0.5f, 0}, {1, 0}, {0, 0.5f}, {1, 0.5f}, {0, 1}, {0.5f, 1}, {1, 1}};
+                for (const auto& p : pts) {
+                    float gx = 0, gy = 0;
+                    c.groundPoint(p[0] * w, p[1] * h, gx, gy);
+                    view[0] = std::min(view[0], std::max(gx, -64.0f));
+                    view[1] = std::min(view[1], std::max(gy, -64.0f));
+                    view[2] = std::max(view[2], std::min(gx, mapW + 64));
+                    view[3] = std::max(view[3], std::min(gy, mapH + 64));
+                }
+            }
             if (prepareLighting(world, true, view)) {
                 o3.light = &light_;
                 o3.lamps = sceneLights_ && light_.lamps > 0 ? sceneLights_.get() : nullptr;
@@ -2487,8 +2838,11 @@ void Session::render(Ui& ui) {
             // Emitters cull to a ground rectangle: the 3D view sees about twice the 2D one.
             const render::Camera wide{pose.cx - viewW / cam_.zoom, pose.cy - viewH / cam_.zoom, cam_.zoom * 0.5f};
             mapRenderer_->setEffectClock(double(world.gameTicks()) + tickAccumulator_);
+            fx->setDetail(effectDetail());
             fx->setCardTilt(camTilt_);  // effects on building art stand on the cards (render3d)
             fx->setAnchors(view3d());   // ... or leave the models' anchors (refinery flues)
+            fx->setVehicleAnimation(vm != nullptr);
+            render::FrameProbe::Scope ps("fxUpdate3d");
             mapRenderer_->updateEffects(world, wide, viewW, viewH);
             fx->setCardTilt(-1);
             fx->setAnchors(nullptr);
@@ -2496,8 +2850,16 @@ void Session::render(Ui& ui) {
             o3.shakeX = fx->shakeX();
             o3.shakeY = fx->shakeY();
         }
-        view3d()->render(world, pose, viewW, viewH, frameDt, o3);
-        view3d()->drawOverlays(world, o3);
+        {
+            render::FrameProbe::Scope ps("3dRender");
+            view3d()->render(world, pose, viewW, viewH, frameDt, o3);
+        }
+        {
+            render::FrameProbe::Scope ps("3dOverlays");
+            view3d()->drawOverlays(world, o3);
+        }
+        frameCpuNs_ = updateStartNs_ ? SDL_GetTicksNS() - updateStartNs_ : 0;
+        if (render::FrameProbe::get().on) render::FrameProbe::get().add("3dScale%", Uint64(o3.renderScale * 100.0f * 1e6f));
         if (render::Effects* fx = mapRenderer_->effects()) fx->drawPost(viewW, viewH);
     } else if (peek) {
         // Classic view: the original-graphics battlefield. The Modern effects keep running unseen
@@ -2512,7 +2874,11 @@ void Session::render(Ui& ui) {
         // Time of day / lighting (Enhanced only): the grade over the map, the lamps, bloom, and the
         // light the terrain is baked under.
         const float view[4] = {cam.x, cam.y, cam.x + viewW / cam.zoom, cam.y + viewH / cam.zoom};
-        const bool lit = prepareLighting(world, false, view);
+        bool lit = false;
+        {
+            render::FrameProbe::Scope ps("lighting");
+            lit = prepareLighting(world, false, view);
+        }
         mapRenderer_->lighting = lit ? &light_ : nullptr;
         mapRenderer_->sceneLights = lit && light_.lamps > 0 ? sceneLights_.get() : nullptr;
         mapRenderer_->bloom = lit ? bloom_.get() : nullptr;
@@ -2550,14 +2916,42 @@ void Session::render(Ui& ui) {
         }
         // Enhanced "Terrain: Designed": the baked chunks instead of the tiles (built on the first
         // frame, then only the chunks whose spice / concrete changed).
-        mapRenderer_->terrainLayer = baker_ && baker_->update(world, atlas_.get()) ? baker_.get() : nullptr;
+        {
+            render::FrameProbe::Scope ps("bakeUpd");
+            mapRenderer_->terrainLayer = baker_ && baker_->update(world, atlas_.get()) ? baker_.get() : nullptr;
+        }
         mapRenderer_->packAnchors = packAnchors2D();  // weld flashes / sparks in the redesigned works
-        if (render::Effects* fx = mapRenderer_->effects()) fx->setAnchors(mapRenderer_->packAnchors);
-        mapRenderer_->draw(world, g.scenario, cam, viewW, viewH);
+        if (render::Effects* fx = mapRenderer_->effects()) {
+            fx->setAnchors(mapRenderer_->packAnchors);
+            fx->setDetail(effectDetail());
+            fx->setVehicleAnimation(vm != nullptr);
+        }
+        mapRenderer_->vehicleMotion = vm;
+        mapRenderer_->orderFeedback = &orderFeedback_;
+        mapRenderer_->groupNumbers = mapRenderer_->classicSelection ? 0 : groupNumbersMode();
+        mapRenderer_->groupFont = skin_ ? skin_->font(true) : nullptr;
+        {
+            render::FrameProbe::Scope ps("mapDraw");
+            mapRenderer_->draw(world, g.scenario, cam, viewW, viewH);
+        }
+        mapRenderer_->vehicleMotion = nullptr;
         if (render::Effects* fx = mapRenderer_->effects()) fx->setAnchors(nullptr);
         mapRenderer_->packAnchors = nullptr;
     }
     if (smooth) motion_.restore(world);
+    if (!mapRenderer_->classicSelection && !peek) {  // Enhanced / 3D order markers (Original: puffs in MapRenderer)
+        if (view3d())
+            orderFeedback_.drawModern(r_, world, [&](float x, float y, float& sx, float& sy) {
+                return view3d()->worldToScreen(x, y, 0, sx, sy);
+            });
+        else
+            orderFeedback_.drawModern(r_, world, [&](float x, float y, float& sx, float& sy) {
+                sx = (x - cam.x) * cam.zoom;
+                sy = (y - cam.y) * cam.zoom;
+                return true;
+            });
+    }
+    if (!paused_) orderFeedback_.update(frameDt);
     drawPlacement(world);
     if (settings_.rallyPoints && view3d()) {  // 3D: the same flag, projected onto the terrain
         drawRallyPoint(
@@ -2583,7 +2977,14 @@ void Session::render(Ui& ui) {
         cheatMenu_->drawPlacement(r_, ui, world, cam_.x + mouseX_ / cam_.zoom, cam_.y + mouseY_ / cam_.zoom, camX, camY,
                                   cam_.zoom, classic ? sprites_.get() : nullptr);
     }
-    if (!paused_) world.decayFlicker();  // the original counts attack-order flicker down per drawn frame
+    // The original counts the attack-order flicker down once per drawn frame at 60 fps (BlitVehicles
+    // 0x428e30): 7 frames, grey on 7, 6, 3, 2 = two short blinks in ~0.12 s. Here at 60 steps per
+    // second whatever the display rate (a 120 Hz display used to halve it).
+    if (!paused_) {
+        flickerClock_ = std::min(flickerClock_ + double(frameDt), 8.0 / 60.0);
+        for (; flickerClock_ >= 1.0 / 60.0; flickerClock_ -= 1.0 / 60.0) world.decayFlicker();
+    }
+    refreshBoxAnchor();
     if (leftDown_ && (std::abs(mouseX_ - leftX_) > 3 || std::abs(mouseY_ - leftY_) > 3)) {
         const SDL_FRect box{std::min(leftX_, mouseX_), std::min(leftY_, mouseY_), std::abs(mouseX_ - leftX_),
                             std::abs(mouseY_ - leftY_)};
@@ -2748,6 +3149,10 @@ Session::CursorChoice Session::cursorAt(float x, float y) {
         if (!q.overBattlefield) q.overRadar = classic_->radarToWorld(x, y, world, playerSide_, wx, wy);
     } else {
         q.overBattlefield = x >= 0 && y >= 0 && x < viewW_ && y < viewH_ && !overUi(x, y);
+        // The minimap stands for the original radar: the small radar-move ring while units are
+        // selected and a click / right click there sends them (0x4433a0 off the battlefield: id 6).
+        float mwx = 0, mwy = 0;
+        if (!q.overBattlefield) q.overRadar = minimapPoint(x, y, mwx, mwy);
     }
     if (q.overBattlefield) {
         float wx = 0, wy = 0;

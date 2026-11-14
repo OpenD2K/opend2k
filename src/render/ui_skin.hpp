@@ -125,6 +125,8 @@ public:
     static constexpr Colour kGood{120, 230, 110, 255};
     static constexpr Colour kBad{240, 96, 70, 255};
     static constexpr Colour kWarn{250, 205, 80, 255};
+    // The embedded Play font (bold, else regular; nullptr without one): battlefield badges too.
+    TtfFont* font(bool bold) const;
 
 private:
     struct Tex {
@@ -137,7 +139,6 @@ private:
     // Procedural pieces baked at the exact size: see baked() in the .cpp for the kinds.
     const Tex& baked(int kind, int w, int h, int state, int extra = 0);
     void drawBaked(const Tex& t, const SDL_FRect& r);
-    TtfFont* font(bool bold) const;
 
     SDL_Renderer* r_;
     TextRenderer& text_;

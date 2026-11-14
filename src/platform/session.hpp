@@ -8,12 +8,15 @@
 #include "game/savegame.hpp"
 #include "game/sound_system.hpp"
 #include "platform/game_data.hpp"
+#include "platform/resolution3d.hpp"
 #include "platform/saves.hpp"
 #include "platform/settings.hpp"
 #include "render/cursor.hpp"
 #include "render/lighting.hpp"
 #include "render/map_renderer.hpp"
 #include "render/motion.hpp"
+#include "render/order_feedback.hpp"
+#include "render/vehicle_motion.hpp"
 #include "render/weld_fx.hpp"
 
 #include <SDL3/SDL.h>
@@ -85,6 +88,9 @@ struct SessionConfig {
     // in createWorld (presetPreviewScene) and the frame is drawn for this output size (offscreen
     // target, 1 pixel per point) instead of the window's.
     bool presetPreview = false;
+    // A real (windowed) game: "3D resolution: Auto" may follow the frame times; one-frame runs and
+    // previews keep its cap (reproducible pictures).
+    bool liveTiming = false;
     int outputW = 0, outputH = 0;
 };
 
@@ -185,6 +191,7 @@ public:
     void touchCommand(TouchCommand c);
     void touchGroup(int grp, bool assign) { controlGroup(grp, assign); }
     bool touchGroupUsed(int grp) const;   // any own unit in control group grp
+    int groupNumbersMode() const;        // Settings::groupNumbers as drawn (0 off in Graphics: Original)
 
     // Phone layout (Settings::touchLayout; render/phone_hud.hpp, docs/ios.md "Phone layout"):
     // decided per frame in layout() (Enhanced / 3D only).
@@ -257,6 +264,7 @@ private:
     void screenToWorld(float sx, float sy, float& wx, float& wy, bool units = true) const;
     // Scrolls the view by (dx, dy) world pixels along the screen axes (3D: turned by the yaw).
     void panView(float dx, float dy);
+    void refreshBoxAnchor();
     // 3D: unit (pixel position) is inside the view-pixel box.
     bool unitInScreenBox(const game::Unit& u, float x0, float y0, float x1, float y1) const;
     bool classicUi() const { return appliedGraphics_ == Settings::Graphics::Original && classic_ != nullptr; }
@@ -283,6 +291,7 @@ private:
     bool anyUnitSelected() const;
     std::pair<int, int> placementTile(float sx, float sy) const;
     bool centreFromMinimap(float sx, float sy);
+    bool minimapPoint(float sx, float sy, float& wx, float& wy) const;  // radar active + inside the minimap
     // Graphics: 3D: the ground footprint of the visible battlefield (0..viewW_ x 0..viewH_ seen by
     // the eased 3D camera, on the plane through the look-at point), world pixels, clipped to the
     // map - the minimap's view frame. False when not in 3D (the 2D rectangle applies).
@@ -320,6 +329,10 @@ private:
     std::string appliedArtPack_;
     // The rendered pack's fx_weld anchors (2D Enhanced: weld flashes in the redesigned works).
     render::PackAnchors packAnchors_;
+    // Particle density of the Modern effects' continuous emitters by the Quality preset (Low: phones).
+    float effectDetail() const {
+        return settings_.msaa <= 1 && !settings_.hdr ? 0.45f : settings_.msaa == 2 ? 0.7f : 1.0f;
+    }
     const render::EffectAnchors* packAnchors2D() const {
         return appliedGraphics_ == Settings::Graphics::Enhanced && !packAnchors_.empty() ? &packAnchors_ : nullptr;
     }
@@ -391,6 +404,20 @@ private:
     SDL_Texture* peekTarget_ = nullptr;
     bool peekHeld_ = false, peekToggled_ = false, peekWasOn_ = false;
     Uint64 lastRenderNs_ = 0;
+    // 3D resolution (Settings::resolution3d; platform/resolution3d.hpp): the Auto scale, and this
+    // frame's CPU work for it (update() start .. the 3D view drawn).
+    Resolution3D res3d_;
+    Uint64 updateStartNs_ = 0, frameCpuNs_ = 0;
+    // Order feedback (render only): the original's cursor puffs (Graphics: Original) / modern
+    // markers (Enhanced, 3D); flickerClock_ counts the attack-order flicker down at the original's
+    // 60 drawn frames per second whatever the display rate.
+    render::OrderFeedback orderFeedback_;
+    double flickerClock_ = 0;
+    enum class Feedback { Move, AttackGround, AttackUnit, AttackBuilding, RadarMove };
+    void orderFeedback(Feedback kind, float wx, float wy, int targetSide = -1, int targetIndex = -1);
+    // Minimap / radar order (Original controls: left click with units selected, like the original
+    // radar; Modern controls: right click; Ctrl: force attack). Returns true when an order went out.
+    bool minimapOrder(float wx, float wy, bool smart);
     int playerSide_ = 0;
     int placingType_ = -1;  // building type being placed (cursor footprint), -1 = none
     struct LogLine { std::string text; std::uint32_t until; };
@@ -398,9 +425,17 @@ private:
     double tickAccumulator_ = 0;  // model ticks owed (fraction = interpolation alpha)
     Uint64 last_ = 0;             // SDL_GetTicksNS of the previous update
     double fixedStep_ = 0;        // --record: fixed frame step (s), 0 = real time
+    bool lightPrefetch_ = false;  // touch profiles: art prefetch only for the view (SpriteCache budget)
     double cameraMoveT_ = 0;      // D2K_CAMERA_MOVE: seconds into the move
+    std::uint64_t artPrefetchFrame_ = 0;  // render(): every few frames the world's art groups are queued
     void applyCameraMove(double dt);
+    void applyDemoClicks(double dt);  // D2K_DEMO_CLICKS (recordings, debug)
+    double demoClickT_ = 0;
     render::MotionInterpolator motion_;
+    // "Vehicle animation: Modern" (render-only hull motion, render/vehicle_motion.hpp); its clock in
+    // game ticks (+ the fraction of the next one) as the effects' (-1 = restart).
+    std::unique_ptr<render::VehicleMotion> vehicleMotion_;
+    double vmClock_ = -1;
     // Layout of the current frame.
     int outW_ = 0, outH_ = 0, viewW_ = 0, viewH_ = 0;
     float ppp_ = 1;  // output pixels per window point (layout(); >1 at Render resolution: Full on Retina)
@@ -418,7 +453,9 @@ private:
     SDL_FRect minimapArea_{};
     // Mouse interaction state: left = select (click or box), right = order (click) or pan (drag).
     bool dragging_ = false, rightMoved_ = false, leftDown_ = false, minimapDrag_ = false;
+    float rightPressX_ = 0, rightPressY_ = 0;  // where the right button went down (click vs drag tolerance)
     float leftX_ = 0, leftY_ = 0, mouseX_ = -10000, mouseY_ = -10000;  // map coordinates (below mapTop_)
+    float leftWX_ = 0, leftWY_ = 0;  // the selection box start on the ground (world px; refreshBoxAnchor)
     bool paused_ = false;
     bool pauseOpened_ = false;  // reset the menu focus on the next pause frame
     bool pauseOptions_ = false; // pause menu shows the in-game options page

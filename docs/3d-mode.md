@@ -61,7 +61,9 @@ terrain styles and a 6000-frame battle. `D2K_D3D12_ANISO=1` turns it back on (to
 the Windows default, keeps anisotropy.
 **HDR is off on Direct3D 12 too** (`gpuHdrOk()`): the half-float 3D scene failed to create a pipeline
 (`E_INVALIDARG`: a black battlefield) and the extended-range output swapchain crashed (command list close
-failed). D3D12 runs an 8-bit scene and SDR output; `D2K_D3D12_HDR=1` retests it. When D3D12 is the requested
+failed). D3D12 runs an 8-bit scene and SDR output; `D2K_D3D12_HDR=1` retests it. The same holds for Enhanced (2D):
+with modern lighting its half-float lighting composite gave a black battlefield in a visible window (a hidden
+one-frame window rendered fine), so `Session::hdrIfOn` returns nothing on D3D12 (8-bit lighting). When D3D12 is the requested
 backend (Graphics API setting / `SDL_GPU_DRIVER`) the HDR-output start-up (a window one pixel short, resized at
 the first frames) is skipped too - it crashed there. Known gap (accepted for 0.0.1): Auto falling back to
 D3D12 on a PC without a Vulkan driver still takes that start-up when HDR output is on (the backend is only
@@ -473,29 +475,54 @@ use the model's anchor points instead of their 2D offsets (docs/3d-models.md "An
 ### Dynamic lights
 
 The effects' light list (`Effects::lights()`: explosions and their flashes, muzzle flashes,
-projectiles, fires, burning wrecks; docs/enhanced-graphics.md "Light list") becomes real point
-lights: `Renderer3D::buildPointLights` keeps the lights on screen and not under the shroud, the
-strongest (intensity x reach) first, at most `kMaxPointLights` = 48 (`render3d/lights.hpp`), each
-lifted 8 px + 6 % of its reach above its point (so the ground right under it is lit from above),
-radius = 0.55 x reach, colour x intensity x 1.35 (matches the 2D glow on flat ground). The block
-(`PointLightsU`: count + 48 x position/radius + 48 x colour, 1552 bytes) is fragment uniform
-buffer 1 of `terrain_fs`, `terrain2_fs`, `rock_fs`, `model_fs` and `sprite_fs` (MSL `[[buffer(1)]]`,
-code in `render3d/lights_msl.hpp`; HLSL `b1 space3` at the top of `shaders.hlsl`): pushed once after
-the main pass begins (and by the designed terrain / models from the same block; the Enhanced 2D
-terrain bake pushes an empty one). Each light adds `colour * (1 - d²/r²)² * wrapped N·L` to the
-sun term (terrain wrap 0.3, models / rocks 0.25, billboards 0.8 with an up normal, so units,
-buildings and smoke are lit too) before fog and shroud. Cost: one loop over the active lights per
-fragment (typically 5 - 25).
+projectiles, fires, burning wrecks; docs/enhanced-graphics.md "Light list") and the lamps of the time of
+day (`render::SceneLights`: headlight cones as spot lights, work lamps, beacons' pools, building lamps,
+`fx_light*` anchors of models) become real lights. Effect lights sit 8 px + 6 % of their reach above their
+point (so the ground right under it is lit from above), radius = 0.55 x reach, colour x intensity x 1.35
+(matches the 2D glow on flat ground); a headlight cone is a spot light from the lamp tilted to reach the
+ground half way along its beam (radius 1.1 x its length, the beam fading over the outer 45 % of its cone),
+a pool a point light above its point. Each light adds `colour * (1 - d²/r²)² * wrapped N·L` to the sun term
+(terrain wrap 0.3, models / rocks 0.25, billboards 0.8 with an up normal, so units, buildings and smoke are
+lit too) before fog and shroud.
 
-**Time of day / Modern lighting** (docs/enhanced-graphics.md "Lighting"): the block (now 64 + 48 x 48 bytes)
-has a head - sun colour, sky colour, billboard tint, specular factor, saturation - that every lit shader applies
-(`sunAmb`, `satur`), and per light a spot direction + cone (`spot[]`; w < -1 = point light). The renderer
-turns its sun per frame from the style's base sun (`baseSun_`), so the shadow map follows the time of day.
-The lamps (`render::SceneLights`: headlight cones as spot lights, tail lights, work lamps, building lamps,
-`fx_light*` anchors of models) get the slots the effects leave, at most 16 at ~1 Mpx and 8 at 4 Mpx
-(every lit fragment loops over the block: 40+ lights cost ~0.7 ms at 1280 x 800 and dropped a wide night view
-below 120 Hz), nearest to the view centre first; their flares are additive billboards. Bloom over the
-composite (`render::Bloom`).
+**Clustered forward lighting** (2026-11-14; the owner, 5K ultrawide: "not all units use lights when there are
+a lot in one frame, and when I move the view the lights switch off on the sides of the screen"). The lights
+used to be a uniform block of 48 that every lit fragment looped over, so the lamps were capped at 20 at ~1 Mpx
+and 10 at 4 Mpx and picked nearest the view centre - the rest of a big army, and every lamp towards the sides
+of a wide view, went dark and popped on / off while panning. Now (`render3d/lights.hpp`):
+- `Renderer3D::buildPointLights` takes every light whose reach touches the view and is not under the shroud.
+  Within the budget (`kMaxGridLights` = 768 desktop, 192 phones / tablets; `D2K_MAX_LIGHTS` overrides for
+  tests) all of them are drawn. Past it the ones covering most of the view win - score = priority x intensity
+  x sqrt(screen coverage of the light's sphere, clipped to the view) x reach, effects x 4 - so the choice
+  spans the whole view, not the distance from its centre; lamps the budget takes or drops **fade in / out
+  over 0.3 s** (`Lamp::id` = object kind / side / index + the lamp's number; a lamp first seen starts at its
+  target, so nothing fades where nothing popped). Headlight beams of units driving together are merged into
+  one beam per cluster only far past the budget (more than twice it).
+- `LightGrid::build` bins them into a grid of square cells on the ground (world x / z, 32 px = one map cell,
+  larger on huge views: at most 128 x 128 cells) over the lights' footprints - a point light's sphere, a
+  beam's cone (a circle around its middle that holds the cone, about half the sphere) - in score order, at
+  most `kMaxLightsPerCell` = 40 per cell (20 on phones; the first, most important ones stay).
+- One storage buffer (uint4: the lights, 3 x uint4 each; one uint per cell = first index << 8 | count; the
+  index lists) is uploaded every frame in its own copy pass (`render3d/light_buffer.hpp`, cycled) and bound
+  as **fragment storage buffer 0** of `terrain_fs`, `terrain2_fs`, `terrain3_fs`, `rock_fs`, `model_fs` and
+  `sprite_fs` (MSL `[[buffer(<uniform count>)]]` = 2, terrain3 3; HLSL `t<sampler count>, space2` = t3 / t4 /
+  t7 / t8, one `StructuredBuffer<uint4>` per count with the lookup instantiated per buffer by a macro; SPIR-V
+  set 2, binding = sampler count). The 2D terrain bake and model passes without a grid bind a 64-byte
+  stand-in (`count` 0: nothing is read).
+- The uniform block (`PointLightsU`, fragment uniform buffer 1, 96 bytes) keeps the frame's light (sun
+  colour, sky colour, billboard tint, specular factor, saturation; `sunAmb`, `satur`) and the grid's
+  placement; a fragment finds its cell from its world position and loops over that cell's lights only.
+  `D2K_LIGHT_LOG=1` logs candidates / drawn / grid size / the fullest cell every 60 frames.
+
+Cost (M4 Pro, LG 5120 x 1924, 3D resolution 100 %, a H5V1 army of ~330 tanks at night: 237 lights in view):
+16.5 ms without lights, 17.9 ms with all 237 (+1.4 ms); the old block with its 10 lamps was 19.0 ms. Numbers for
+the owner's saves: "Performance (lights)" below.
+
+**Time of day / Modern lighting** (docs/enhanced-graphics.md "Lighting"): the renderer turns its sun per frame
+from the style's base sun (`baseSun_`), so the shadow map follows the time of day. The lamps' flares are
+additive billboards. Bloom over the composite (`render::Bloom`). The lamps' list (`SceneLights::update`) is
+built for the camera's whole ground footprint (the 3D view rectangle grown to the footprint's corners and
+edge middles, last frame's camera), so the lamps of a wide or tilted view's sides are there too.
 
 ### Hook for real models
 
@@ -536,13 +563,81 @@ and the full tilt range.
 
 Every screen → world conversion of the session goes through `Session::screenToWorld`: 2D = the old
 `cam_.x + x / zoom`; 3D = `Renderer3D::pick` (ray from the eye through the pixel, marched over the
-heightfield + bisection; a unit drawn within its radius of the cursor wins and returns its exact
-position). Selection boxes test the units' projected positions against the screen rectangle. So
+heightfield + bisection). **Picking**: the object drawn under the cursor wins, nearest first along the
+ray; the ground point only when nothing is hit (or a ridge is nearer). Building models: ray against
+their triangles (rest pose, through this frame's body / turret placement; `ModelHook::rayBuilding`,
+per-model boxes of 32-triangle runs keep it cheap) - a hit returns the centre of the building's
+footprint cell nearest the hit (cells without a unit on them first), so a click on any visible part
+of the model - a tower or chimney rising over the ground behind it, an overhang - targets the
+building exactly as a click on its cells in 2D (attack, dock, repair, select, sell, cursor). Units:
+their model's box (`ModelHook::rayUnit`), else a screen radius around their ground point; returns the
+unit's exact position. Before this a tall model's upper part picked the ground behind it: Ctrl-click
+gave an attack-ground order on an empty cell (the red ring; the units do fire there, as the original's
+AttackTile 0x496ff0 - `testForceAttackGround`), a plain click a move. `D2K_PICK_LOG=1` logs every pick
+and the order a battlefield click gave. Selection boxes test the units' projected positions against the screen rectangle. So
 selection, orders, Ctrl-attack, repair/sell/target modes, building placement, cheat spawning,
 rally clicks and the cursor choice all work as in 2D.
 
 Command line (reproducible shots): `--graphics 3d --camera-tilt DEG --camera-yaw DEG` (clamped as
 above) with the usual `--map/--at/--zoom/--ticks/--reveal/--screenshot/--frames`.
+
+## Performance (lights)
+
+Clustered lights (2026-11-14, "Dynamic lights" above), M4 Pro, VSync off, windowed, the owner's 3D settings,
+p50 frame time (fps); before = the 48-light block with 10 lamp slots at 5K / ~11 on the built-in display:
+
+| scene (3D resolution) | lights in view after | before | after |
+|---|---|---|---|
+| LG 5120x1924, SAVE4 night (100 %) | ~58 | 13.37 ms (75) | 13.39 ms (75) |
+| LG 5120x1924, SAVE4 dusk (100 %) | | 13.39 ms (75) | 13.44 ms (74) |
+| LG 5120x1924, SAVE5 night (100 %) | | 10.40 ms (96) | 10.09 ms (99) |
+| LG 5120x1924, SAVE5 dusk (100 %) | | 10.45 ms (96) | 10.07 ms (99) |
+| built-in 3456x2100, SAVE4 night (Auto) | | 9.02 ms (111) | 9.23 ms (108) |
+| built-in 3456x2100, SAVE5 night (Auto) | | 6.07 ms (165) | 5.94 ms (168) |
+| LG 5120x1924, H5V1 + ~330 tanks night (100 %) | 237 | 19.05 ms (52) | 17.86 ms (56); no lights 16.45 |
+
+Every lamp in view is lit now at the same or lower cost (the grid visits ~0-13 lights per pixel where the old
+block looped over all of them). The rest of the army scene's frame is its 330 tank models. Scripts, logs and
+pictures: ~/Desktop/d2k-compare/many-lights/README.md.
+
+## Performance (2026-11-14: 5K ultrawide, the owner's saves)
+
+Owner: "in 3D on this Mac it works slowly" (M4 Pro; LG UltraWide 100 Hz, 5120x1924 px at Render resolution
+Full; built-in 120 Hz XDR; the 3D preset, Quality High). Measured with `D2K_FRAME_LOG` (+ `D2K_DISPLAY`,
+`D2K_QUIT_AFTER`), VSync off, windowed, Xcode's Metal System Trace (`xctrace record --template 'Metal System
+Trace' --attach PID`) for the GPU split; numbers and the scripts' description: ~/Desktop/d2k-compare/3d-perf/
+README.md. The GPU was the whole cost (CPU 1-2 ms a frame). What it was and what changed:
+
+- **Rocks drawn without culling** (the faithful terrain's ~1000 loose stones, ~1.4k triangles each, twice a
+  frame: shadow map + scene, ~6 ms of vertex work). `DesignedTerrain::cullRocks`: per frame the instances in
+  the camera's frustum and in the sun's (the shadow map's) are copied into two small instance buffers
+  (`viewRocks()` / `shadowRocks()`); the full set only until the first upload. -8 ms on the 5K view.
+- **terrain3_fs** (the faithful terrain's fragment shader, by far the biggest per-pixel cost): skips work whose
+  result is known to be zero - the spice field (9 taps + 15 noises + the mound spots) where no spice lies
+  within reach, the slope / rim guide taps (6 bicubic reads = 30 taps) where no relief lies within reach (both
+  as flags per cell in the spice texture's B / A channels, `DesignedTerrain::buildSpiceTex`, dilated by the
+  taps' reach), and (MSL) whole SIMD groups under full shroud / off the map (`simd_all`). Picture identical
+  (screenshot diffs: only moving units differ). -7 ms on the 5K view.
+- **Model textures had no mipmaps** (1-2k textures on units a few dozen pixels big: cache misses, shimmer).
+  Now a full mip chain + trilinear sampling; opaque models also draw through a pipeline without blending
+  (`meshOpaquePipe_`: blended fragments are never hidden-surface-removed on Apple GPUs). A busy base with a
+  few dozen tanks: 21.0 -> 13.9 ms at 100 %.
+- Indexed model meshes (equal corners shared at upload: 3.9 M -> 1.2 M vertices for the redesign pack).
+- **3D resolution** (Options -> Graphics -> Quality, `resolution3d` auto|100|75|50, `--resolution3d`; not part
+  of Quality): the 3D pass at a share of the view's pixels per axis, scaled up into the view (the UI and the
+  overlays stay sharp). The targets are allocated at the largest share and a smaller one renders into their
+  top-left part (viewport), so the share can change every frame without a hitch. **Auto**
+  (`platform/resolution3d.hpp`): 100 % up to 6 MP (MSAA 4x; 7.5 at 2x, 9 without), so a 5120x1924 view starts
+  at 75 %; then while the frames are GPU-bound and slower than the display rate it steps down 5 % at a time
+  (to 60 %), and after steady frames probes a step back up (waiting longer after each failed probe).
+  One-frame runs keep the cap (reproducible). Render resolution (the whole window: Full / Half) is untouched.
+- Quality High stays the 3D preset's default: MSAA 2x saves ~15 % at the same resolution, but Auto's lower
+  share costs less in sharpness than the jaggies of 2x on the models.
+
+Motion (owner: "tank movements not smooth"): the unit models now turn by the eased facing of the Modern
+effects (`Effects::unitVisual`, as the 2D sprites, headlights and muzzles do; `ModelHook::setEffects`) instead
+of the 32 simulation steps; positions were already interpolated between ticks (render/motion.*). Vehicle
+animation: no idling tremble and no random bumps (see docs/enhanced-graphics.md "Vehicle animation").
 
 ## Performance (M4 Pro, 120 Hz, 1728x1080 window)
 

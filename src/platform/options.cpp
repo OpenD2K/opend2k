@@ -67,8 +67,10 @@ Options parseArgs(int argc, char** argv) {
             else if (a == "--quality") o.quality = next();
             else if (a == "--hdr") o.hdr = next();
             else if (a == "--hdr-output") o.hdrOutput = next();
+            else if (a == "--display") o.display = next();
             else if (a == "--msaa") o.msaa = std::stoi(next());
             else if (a == "--aniso") o.aniso = std::stoi(next());
+            else if (a == "--resolution3d") o.resolution3d = next();
             else if (a == "--vsync") o.vsync = next();
             else if (a == "--fps-limit") o.fpsLimit = std::stoi(next());
             else if (a == "--graphics") {
@@ -79,6 +81,8 @@ Options parseArgs(int argc, char** argv) {
                 }
             }
             else if (a == "--art-pack") o.artPack = next();
+            else if (a == "--vehicle-animation") o.vehicleAnimation = next();
+            else if (a == "--controls") o.controls = next();
             else if (a == "--effects") {
                 o.effects = next();
                 if (o.effects != "classic" && o.effects != "modern") {

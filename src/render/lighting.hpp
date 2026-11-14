@@ -58,6 +58,11 @@ struct SpriteShadowWarp {
     // The length factor for art-pack frames rendered from 3D models (tools/render_sprites: their sun
     // stands 58 degrees high, so their shadows are shorter; the same elevation factor of that sun).
     float kPack = 1;
+    // Units drawn from 3D-rendered pack frames: their .shadow.png holds only the part of the 58-degree
+    // sun's shadow that sticks out from under the model (a thin rim), which cannot be turned / stretched
+    // into a long shadow. They cast their silhouette instead (MapRenderer::drawSilhouetteShadow); this
+    // is its share against the pack's own shadow (0 at Day .. 1 a little away from it: the Cycle blends).
+    float silhouette = 0;
 };
 SpriteShadowWarp spriteShadowWarp(const SceneLight& l);
 

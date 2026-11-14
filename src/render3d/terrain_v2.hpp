@@ -25,6 +25,7 @@
 // is the original's 32 x 16 slabs. The Designed style is untouched by it (its own shader, its
 // own code paths).
 
+#include "render3d/light_buffer.hpp"
 #include "render3d/lights.hpp"
 #include "render3d/math3d.hpp"
 #include "render3d/terrain_guide.hpp"
@@ -119,8 +120,10 @@ public:
         SDL_GPUTexture* shadowMap = nullptr;
         SDL_GPUSampler* shadowSampler = nullptr;
         float shadow[4] = {};
-        // Dynamic point lights (render3d/lights.hpp); nullptr = none (the 2D bake).
+        // Dynamic lights (render3d/lights.hpp); nullptr = none (the 2D bake). lightGrid: fragment storage buffer 0
+        // (nullptr = a stand-in).
         const PointLightsU* lights = nullptr;
+        SDL_GPUBuffer* lightGrid = nullptr;
         // Faithful only. The faithful 2D bake lights its relief (cliffs, broken rock) with `sun`
         // (the original tiles' own light, from the WSW) but the level ground's fine detail (sand
         // ripples, plain rock) with detailSun, the Designed bake's sun, so sand and buildable
@@ -148,6 +151,13 @@ public:
     // The rocks as casters in the sun shadow map's depth pass (format: the shadow map's).
     int drawShadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const Mat4& lightVP, SDL_GPUTextureFormat fmt,
                    const RockSet* rocks = nullptr);
+    // Per frame, before prepare() (docs/3d-mode.md "Performance"): the rock instances inside the
+    // view (viewProj) and inside the sun's view (lightVP; nullptr = no shadow pass) - each set is
+    // uploaded by prepare() and drawn instead of all of them (a 128 x 128 map has ~1000 stones of
+    // ~1.4k triangles: drawing them all twice a frame was ~6 ms of vertex work on an M4 Pro).
+    void cullRocks(const Mat4& viewProj, const Mat4* lightVP);
+    const RockSet* viewRocks() const { return culled_ ? &viewSet_ : nullptr; }
+    const RockSet* shadowRocks() const { return culledShadow_ ? &shadowSet_ : nullptr; }
     int rockCount() const { return int(inst_.size()); }
     const std::vector<RockInst>& rocks() const { return inst_; }  // sorted by type (layer)
     // Largest horizontal reach of a rock from its position (world px), for culling.
@@ -184,8 +194,10 @@ private:
     // The spice texture, RG8 per cell: R = presence (the amount up to thin spice, 2 levels),
     // G = richness (the amount above thin, blurred over two cells: thick spice lies in soft
     // patches, not in cell blocks). Rebuilt from spice_ when it changes.
-    std::vector<std::uint8_t> spiceTexCpu_;
+    std::vector<std::uint8_t> spiceTexCpu_;  // RGBA8 per cell: presence, richness, spice near, relief near
     void buildSpiceTex();
+    std::vector<std::uint8_t> reliefNear_;  // faithful: per cell, relief within 2 cells (built with the guide)
+    static std::vector<std::uint8_t> dilateCells(const std::vector<std::uint8_t>& in, int w, int h, int r);
     std::vector<std::uint32_t> concreteSig_;  // per cell: concrete bit (rebuild the splat when it changes)
     std::vector<RockInst> inst_;              // sorted by layer
     std::uint32_t instFirst_[kRockTypes] = {}, instCount_[kRockTypes] = {};
@@ -226,7 +238,16 @@ private:
     int guideW_ = 0, guideH_ = 0;
     SDL_GPUBuffer* rockVB_ = nullptr;
     SDL_GPUBuffer* instVB_ = nullptr;
+    LightGridBuffer lightFallback_;  // fragment storage buffer 0 without a light grid (the 2D bake)
     std::uint32_t instCap_ = 0;
+    // cullRocks: the visible subsets (CPU lists sorted by type, their buffers, the sets drawn).
+    std::vector<RockInst> viewInst_, shadowInst_;
+    SDL_GPUBuffer* viewVB_ = nullptr;
+    SDL_GPUBuffer* shadowVB_ = nullptr;
+    std::uint32_t viewCap_ = 0, shadowCap_ = 0;
+    RockSet viewSet_, shadowSet_;
+    bool culled_ = false, culledShadow_ = false, cullUpload_ = false;
+    void uploadCulled(SDL_GPUCommandBuffer* cmd);
 };
 
 }  // namespace d2k::render3d

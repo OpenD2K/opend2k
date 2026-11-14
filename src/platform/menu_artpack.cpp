@@ -73,6 +73,12 @@ std::string releasePage(const ArtPackDownloader::Status& s) {
 
 }  // namespace
 
+bool Menu::artPackCheckingShown() const {
+    const auto s = ArtPackDownloader::instance().status();
+    return s.state == State::Checking ||
+           ((s.state == State::Checked || s.state == State::CheckFailed) && checkingShown(false, s.startedMs));
+}
+
 std::string Menu::artPackRowLabel() const {
     const auto s = ArtPackDownloader::instance().status();
     const InstalledArtPack inst = installedCached(s.haveManifest ? s.manifest.name : kArtPackName);
@@ -208,9 +214,16 @@ MenuResult Menu::pageArtPack() {
     title(tr("Art pack"), 110, 30);
     ui_.panel(st_.r(100, 56, 440, 318));
     auto& dl = ArtPackDownloader::instance();
-    const auto s = dl.status();
+    const auto real = dl.status();
+    // "Checking..." held for a moment after a quick answer (Menu::checkingShown): none of it shown yet.
+    ArtPackDownloader::Status s = real;
+    if (s.state != State::Checking && artPackCheckingShown()) {
+        s = ArtPackDownloader::Status{};
+        s.state = State::Checking;
+    }
     const InstalledArtPack inst = installedCached(s.haveManifest ? s.manifest.name : kArtPackName);
     const bool update = updateAvailable(s, inst);
+    const std::string checkedAt = checkedAtText(real.checkedAt);
     const float x = 116, w = 408;
     const float ts = ui_.textScale, small = ui_.textScale * 0.85f;
     const float lineH = ui_.textHeight(ts) / st_.s + 4;
@@ -287,9 +300,17 @@ MenuResult Menu::pageArtPack() {
         if (ui_.button(st_.r(x, y, 130, bh), tr("Cancel"))) dl.cancel();
         y += bh + 8;
     } else if (s.state == State::Checking) {
-        textAt(tr("Checking for the latest version..."), y, theme::kDim, small);
-        y += lineH + bh + 12;
+        checkingSpinner(x, y, 14);
+        textAt(tr("Checking for the latest version..."), y, theme::kDim, small, x + 20);
+        y += lineH + 4;
+        ui_.button(st_.r(x, y, 110, bh), tr("Check now"), ButtonStyle::Normal, false);  // greyed: the layout stays
+        y += bh + 8;
     } else {
+        auto checkedLine = [&] {  // under the check's result
+            if (checkedAt.empty() || (s.state != State::Checked && s.state != State::CheckFailed)) return;
+            textAt(checkedAt, y, theme::kDim, small * 0.95f);
+            y += ui_.textHeight(small * 0.95f) / st_.s + 4;
+        };
         if (s.state == State::Done) {
             const bool models = ArtPackDownloader::installed(settings_.artPack).hasModels;
             y += ui_.wrapped(tr(models ? "Installed. The redesigned art and the 3D models are selected (Options > Graphics)."
@@ -299,13 +320,17 @@ MenuResult Menu::pageArtPack() {
                  6;
         } else if (s.state == State::Failed || s.state == State::CheckFailed) {
             const std::string what = tr(s.state == State::Failed ? "Download failed" : "Could not check for the latest version");
-            y += ui_.wrapped(what + ": " + uiUtf8(s.error), st_.r(x, y, w, 36), theme::kBad, small) / st_.s + 6;
+            y += ui_.wrapped(what + ": " + uiUtf8(s.error), st_.r(x, y, w, 36), theme::kBad, small) / st_.s + 2;
+            checkedLine();
         } else if (s.state == State::Cancelled) {
             textAt(tr("Download cancelled - Download continues where it stopped."), y, theme::kDim, small);
             y += lineH + 2;
         } else if (inst.installed && !inst.version.empty() && s.haveManifest && !update) {
             textAt(tr("Up to date."), y, Colour{150, 220, 120, 255}, small);
-            y += lineH + 2;
+            y += lineH;
+            checkedLine();
+        } else {
+            checkedLine();
         }
         float bx = x;
         const bool failed = s.state == State::Failed;
@@ -317,7 +342,8 @@ MenuResult Menu::pageArtPack() {
             if (ui_.button(st_.r(bx, y, 170, bh), label, ButtonStyle::Primary, !busy)) dl.download();
             bx += 176;
         }
-        if (ui_.button(st_.r(bx, y, 110, bh), tr(s.state == State::CheckFailed ? "Retry" : "Check now"), ButtonStyle::Normal, !busy))
+        if (ui_.button(st_.r(bx, y, 110, bh), tr(s.state == State::CheckFailed ? "Retry" : "Check now"), ButtonStyle::Normal,
+                       !busy && s.state != State::Checking))
             dl.check();
         bx += 116;
         if (failed || s.state == State::CheckFailed)

@@ -49,6 +49,8 @@ public:
         double bytesPerSec = 0;
         std::string error;
         bool manualOnly = false;  // no HTTPS backend here: only the manual link works
+        std::uint64_t startedMs = 0;  // SDL_GetTicks() when the last manifest check started (0 = none this run)
+        std::int64_t checkedAt = 0;   // time(nullptr) when the last manifest check ended (answer or error; 0 = never)
     };
 
     // One per process (the Options page, the art pack page and the 3D prompt share it).

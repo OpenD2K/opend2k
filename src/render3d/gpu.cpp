@@ -50,7 +50,26 @@ SDL_Renderer* createGpuRenderer(SDL_Window* window, bool ourFormats, bool featur
 
 bool createWindowAndRenderer(const char* title, int w, int h, SDL_WindowFlags flags, SDL_Window** window,
                              SDL_Renderer** renderer) {
-    *window = SDL_CreateWindow(title, w, h, flags);
+    *window = nullptr;
+    // D2K_DISPLAY=N (measurements): the window on display N (0 = the first SDL lists) instead of the main one.
+    if (const char* d = std::getenv("D2K_DISPLAY"); d && *d) {
+        int n = 0;
+        SDL_DisplayID* ids = SDL_GetDisplays(&n);
+        const int i = std::atoi(d);
+        if (ids && i >= 0 && i < n) {
+            const SDL_PropertiesID p = SDL_CreateProperties();
+            SDL_SetStringProperty(p, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(ids[i]));
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(ids[i]));
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
+            SDL_SetNumberProperty(p, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, Sint64(flags));
+            *window = SDL_CreateWindowWithProperties(p);
+            SDL_DestroyProperties(p);
+        }
+        SDL_free(ids);
+    }
+    if (!*window) *window = SDL_CreateWindow(title, w, h, flags);
     if (!*window) return false;
     *renderer = nullptr;
     const char* pref = std::getenv("D2K_RENDERER");

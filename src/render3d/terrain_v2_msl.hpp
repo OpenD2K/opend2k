@@ -198,7 +198,7 @@ float3 concreteSlab(float2 p, float3 base, thread float3& nrm, float4 look0, flo
     return mix(col, look0.rgb * (0.92 + 0.1 * dirt), sand);
 }
 
-fragment float4 terrain2_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]],
+fragment float4 terrain2_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]], const device uint4* plg [[buffer(2)]],
                             texture2d_array<float> alb [[texture(0)]], texture2d_array<float> nor [[texture(1)]],
                             texture2d<float> splatA [[texture(2)]], texture2d<float> splatB [[texture(3)]],
                             texture2d<float> spiceMap [[texture(4)]], texture2d<float> shroud [[texture(5)]],
@@ -302,7 +302,7 @@ fragment float4 terrain2_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], 
     const float sm = u.shadow.x > 0.5 ? shadowPCF(shadowMap, shadowSamp, (u.lightVP * float4(in.wpos, 1.0)).xyz, u.shadow) : in.sun;
     const float vis = mix(u.light.w, 1.0, sm);
     const float3 shade = sunAmb(pl, u.light.x, u.light.y * ndl * vis) * u.light.z;
-    float3 rgb = satur(pl, albedo) * shade + albedo * pointLights(pl, in.wpos, n, 0.3);
+    float3 rgb = satur(pl, albedo) * shade + albedo * pointLights(pl, plg, in.wpos, n, 0.3);
     float s = 0.0;
     // fog2.w: 0 no shroud, 1 shroud, 2 baked for the Enhanced 2D view (no shroud, no edge fade).
     if (u.fog2.w > 0.5 && u.fog2.w < 1.5) s = shroud.sample(shroudSamp, p / mapSize).a;
@@ -381,7 +381,7 @@ float shadowPCF(depth2d<float> sm, sampler ss, float3 lp, float4 sh) {
     return s / 9.0;
 }
 
-fragment float4 rock_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]],
+fragment float4 rock_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]], const device uint4* plg [[buffer(2)]],
                         texture2d_array<float> tex [[texture(0)]], texture2d<float> shroud [[texture(1)]],
                         depth2d<float> shadowMap [[texture(2)]],
                         sampler texSamp [[sampler(0)]], sampler shroudSamp [[sampler(1)]],
@@ -399,7 +399,7 @@ fragment float4 rock_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], cons
     const float vis = mix(u.light.w, 1.0, sm);
     // Sky light brighter on top faces, contact darkening near the ground.
     const float amb = u.light.x * (0.78 + 0.22 * n.y) * mix(0.62, 1.0, smoothstep(0.0, 0.55, in.ao));
-    float3 rgb = satur(pl, albedo) * sunAmb(pl, amb, u.light.y * ndl * vis) * u.light.z + albedo * pointLights(pl, in.wpos, n, 0.25);
+    float3 rgb = satur(pl, albedo) * sunAmb(pl, amb, u.light.y * ndl * vis) * u.light.z + albedo * pointLights(pl, plg, in.wpos, n, 0.25);
     const float2 p = in.wpos.xz, mapSize = u.fog2.yz;
     float s = 0.0;
     // fog2.w: 0 no shroud, 1 shroud, 2 baked for the Enhanced 2D view (no shroud, no edge fade).

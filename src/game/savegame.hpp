@@ -31,12 +31,15 @@ namespace d2k::game {
 class World;
 
 inline constexpr char kSaveMagic[8] = {'D', '2', 'K', 'S', 'A', 'V', 'E', '\0'};
-inline constexpr std::uint32_t kSaveVersion = 7;  // 2: cheat state (World::cheats_); 3: Side::autoQueue;
+inline constexpr std::uint32_t kSaveVersion = 8;  // 2: cheat state (World::cheats_); 3: Side::autoQueue;
                                                   // 4: community extended events (World::ext_, tags);
                                                   // 5: cheat reinforcements, rally points, Order payload
                                                   // 6: play as any side (World::scriptSide_, SaveMeta::playAsSide)
                                                   // 7: campaign-map saves (SaveMeta::kind, missionNumber);
                                                   //    version 6 files still load (same world section)
+                                                  // 8: "Unit limit" (World::unlimitedObjects_) and the
+                                                  //    pool slots past 1000, appended to the world
+                                                  //    section (versions 6/7 load as 1000-slot pools)
 inline constexpr std::uint32_t kOldestSaveVersion = 6;
 
 struct SaveError : std::runtime_error {
@@ -129,13 +132,18 @@ struct SaveMeta {
         std::uint32_t until = 0;
     };
     std::vector<Message> messages;
+    // Not stored: the format version of the file it was read from (readSaveFile / readSaveMeta),
+    // passed on to loadWorldState.
+    std::uint32_t version = kSaveVersion;
 };
 
 // The world section alone (also the input of the state hash).
 std::vector<std::uint8_t> saveWorldState(const World& w);
 // Overwrites every mutable field of `w` (constructed for the same map/mission/setup).
 // Throws SaveError on malformed data or a map size mismatch.
-void loadWorldState(World& w, std::span<const std::uint8_t> data);
+// `version`: the file's format version (SaveMeta::version) - older world sections lack the
+// later additions.
+void loadWorldState(World& w, std::span<const std::uint8_t> data, std::uint32_t version = kSaveVersion);
 // FNV-1a 64 of saveWorldState(w): equal hashes = equal simulation state.
 std::uint64_t worldStateHash(const World& w);
 std::uint64_t fnv1a64(std::span<const std::uint8_t> data);

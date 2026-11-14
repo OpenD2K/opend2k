@@ -35,12 +35,40 @@ SoundBank::SoundBank(const std::string& dataDir) : dataDir_(dataDir) {
     baseSamples_ = samples_;
 }
 
-void SoundBank::setOverlay(const std::string& modsData) {
-    if (modsData == overlay_) return;
+SoundBank::~SoundBank() { stopPrefetch(); }
+
+void SoundBank::stopPrefetch() {
+    if (!worker_.joinable()) return;
+    stop_ = true;
+    worker_.join();
+    stop_ = false;
+}
+
+void SoundBank::startPrefetch() {
+    stopPrefetch();
+    std::vector<std::string> files;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& e : samples_.entries) files.push_back(e.second);
+    }
+    worker_ = std::thread([this, files = std::move(files)] {
+        const Uint64 t0 = SDL_GetTicksNS();
+        for (const std::string& f : files) {
+            if (stop_) return;
+            resolve(f);
+        }
+        SDL_Log("Sounds: %zu samples decoded in the background in %.0f ms", files.size(), double(SDL_GetTicksNS() - t0) / 1e6);
+    });
+}
+
+bool SoundBank::setOverlay(const std::string& modsData) {
+    if (modsData == overlay_) return false;
+    stopPrefetch();
+    std::lock_guard lock(mutex_);
     overlay_ = modsData;
     samples_ = baseSamples_;
     overlayArchive_.reset();
-    if (modsData.empty()) return;
+    if (modsData.empty()) return true;
     using formats::findFileNoCase;
     try {
         if (const auto ui = findFileNoCase(modsData, "UI_DATA"); !ui.empty())
@@ -50,9 +78,15 @@ void SoundBank::setOverlay(const std::string& modsData) {
     } catch (const std::exception& e) {
         SDL_Log("Mission sounds %s: %s", modsData.c_str(), e.what());
     }
+    return true;
 }
 
 const formats::AudClip* SoundBank::resolve(const std::string& file) {
+    std::lock_guard lock(mutex_);
+    return resolveLocked(file);
+}
+
+const formats::AudClip* SoundBank::resolveLocked(const std::string& file) {
     const std::string key = overlay_.empty() ? file : overlay_ + "|" + file;
     auto it = cache_.find(key);
     if (it != cache_.end()) return it->second ? &*it->second : nullptr;
@@ -122,6 +156,7 @@ const formats::AudClip* SoundBank::byName(const std::string& sampleName) {
 }
 
 std::string SoundBank::sourceOf(const std::string& sampleName) {
+    std::lock_guard lock(mutex_);
     const std::string* file = samples_.find(sampleName);
     if (!file) return {};
     resolve(*file);

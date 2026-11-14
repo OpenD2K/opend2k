@@ -5,7 +5,9 @@
 #include "game/world.hpp"
 #include "render/art_pack.hpp"
 #include "render/buildup_fx.hpp"
+#include "render/effects.hpp"
 #include "render/scene_lights.hpp"
+#include "render/vehicle_motion.hpp"
 #include "render3d/gpu.hpp"
 #include "render3d/model_anim.hpp"
 #include "render3d/model_gltf.hpp"
@@ -21,6 +23,7 @@
 #include <atomic>
 #include <map>
 #include <thread>
+#include <unordered_set>
 
 namespace d2k::render3d {
 
@@ -82,7 +85,7 @@ std::string underscored(std::string s) {
     return s;
 }
 
-// models.ini: [NAME] scale= yaw= y= fit=contain|centre|off x= z= anchor.fx_NAME= x y z [size]
+// models.ini: [NAME] scale= yaw= y= fit=contain|centre|off x= z= glow=blink anchor.fx_NAME= x y z [size [turret]]
 // (docs/3d-models.md "models.ini").
 std::map<std::string, GltfAdjust> readAdjust(const fs::path& file) {
     std::map<std::string, GltfAdjust> out;
@@ -108,6 +111,7 @@ std::map<std::string, GltfAdjust> readAdjust(const fs::path& file) {
         else if (k == "x") a.x = v;
         else if (k == "z") a.z = v;
         else if (k == "shrink") a.shrink = v != 0;
+        else if (k == "glow") a.glowBlink = val == "blink" ? 1 : val == "pulse" ? 2 : 0;
         else if (k == "fit") {
             a.fit = val == "off" || val == "none" ? GltfAdjust::Fit::Off
                     : val == "centre" || val == "center" ? GltfAdjust::Fit::Centre
@@ -116,9 +120,11 @@ std::map<std::string, GltfAdjust> readAdjust(const fs::path& file) {
             GltfAdjust::Anchor an;
             an.name = k.substr(7);
             for (char& c : an.name) c = char(std::tolower(static_cast<unsigned char>(c)));
-            const int n = std::sscanf(val.c_str(), "%f %f %f %f", &an.pos[0], &an.pos[1], &an.pos[2], &an.size);
+            char flag[16] = {};
+            const int n = std::sscanf(val.c_str(), "%f %f %f %f %15s", &an.pos[0], &an.pos[1], &an.pos[2], &an.size, flag);
+            an.onTurret = n >= 5 && std::string_view(flag) == "turret";
             if (n >= 3) a.anchors.push_back(an);
-            else SDL_Log("3D models: models.ini [%s] %s: wants x y z [size]", section.c_str(), k.c_str());
+            else SDL_Log("3D models: models.ini [%s] %s: wants x y z [size [turret]]", section.c_str(), k.c_str());
         }
     }
     return out;
@@ -293,6 +299,26 @@ Mat4 yawM(float a) {
     m.m[10] = c;
     return m;
 }
+// Pitch about the model's x axis (east at facing 0): + lifts the nose (-z, north at facing 0).
+Mat4 pitchM(float a) {
+    const float c = std::cos(a), s = std::sin(a);
+    Mat4 m;
+    m.m[5] = c;   // y' = c y - s z
+    m.m[6] = s;   // z' = s y + c z
+    m.m[9] = -s;
+    m.m[10] = c;
+    return m;
+}
+// Roll about the model's z axis (the hull's long axis): + lowers the right side (+x).
+Mat4 rollM(float a) {
+    const float c = std::cos(a), s = std::sin(-a);
+    Mat4 m;
+    m.m[0] = c;   // x' = c x - s y
+    m.m[1] = s;   // y' = s x + c y
+    m.m[4] = -s;
+    m.m[5] = c;
+    return m;
+}
 Mat4 scaleY(float k) {
     Mat4 m;
     m.m[5] = k;
@@ -325,6 +351,7 @@ Mat4 tiltTo(const Vec3& n) {
     return m;
 }
 float facingAngle(int facing) { return float(facing & 31) * (kTwoPi / 32); }
+float facingAngle(float facing) { return facing * (kTwoPi / 32); }
 
 }  // namespace
 
@@ -345,6 +372,7 @@ ModelRenderer::~ModelRenderer() {
         if (projShadowPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, projShadowPipe_);
         if (depthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, depthPipe_);
         if (walkPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, walkPipe_);
+        if (meshOpaquePipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, meshOpaquePipe_);
         if (nearest_) SDL_ReleaseGPUSampler(dev_, nearest_);
         if (linear_) SDL_ReleaseGPUSampler(dev_, linear_);
         if (white_) SDL_ReleaseGPUTexture(dev_, white_);
@@ -358,8 +386,11 @@ void ModelRenderer::releaseGpu() {
     gpu_.clear();
     if (vb_) SDL_ReleaseGPUBuffer(dev_, vb_);
     vb_ = nullptr;
+    if (ib_) SDL_ReleaseGPUBuffer(dev_, ib_);
+    ib_ = nullptr;
     if (palette_) SDL_ReleaseGPUBuffer(dev_, palette_);
     if (paletteTb_) SDL_ReleaseGPUTransferBuffer(dev_, paletteTb_);
+    lightFallback_.release();
     palette_ = nullptr;
     paletteTb_ = nullptr;
     paletteCap_ = 0;
@@ -377,6 +408,11 @@ bool ModelRenderer::hasUnitModel(int type) const {
 }
 bool ModelRenderer::hasBuildingModel(int type) const {
     return active() && type >= 0 && type < int(buildingModel_.size()) && buildingModel_[std::size_t(type)] >= 0;
+}
+int ModelRenderer::buildingGlowBlink(int type) const {
+    if (!hasBuildingModel(type)) return 0;
+    const std::size_t m = std::size_t(buildingModel_[std::size_t(type)]);
+    return m < glowBlink_.size() ? glowBlink_[m] : 0;
 }
 
 // The built-in model pack "new": assets/models (our own procedural models, tools/models/), found
@@ -445,7 +481,9 @@ bool ModelRenderer::load(Source s, const std::string& ps1Image, const std::strin
     models_.clear();
     modelTop_.clear();
     decks_.clear();
+    roofs_.clear();
     anim_.clear();
+    glowBlink_.clear();
     poseCache_.clear();
     frameSlots_.clear();
     std::fill(unitModel_.begin(), unitModel_.end(), -1);
@@ -578,6 +616,8 @@ bool ModelRenderer::load(Source s, const std::string& ps1Image, const std::strin
             models_.push_back(std::move(m));
             const int mi = int(models_.size()) - 1;
             anim_.resize(models_.size());
+            glowBlink_.resize(models_.size(), 0);
+            glowBlink_[std::size_t(mi)] = a != adjust.end() ? a->second.glowBlink : 0;
             // Animated infantry: the frame map next to the glb (docs/art-pipeline.md "Animated models").
             const fs::path fm = root / kind / (key + ".anim.json");
             if (fs::exists(fm, ec) && !models_.back().skeleton.empty()) {
@@ -649,6 +689,7 @@ bool ModelRenderer::load(Source s, const std::string& ps1Image, const std::strin
         }
     }
     decks_.clear();
+    roofs_.clear();
     for (const int m : buildingModel_)
         if (m >= 0 && (std::size_t(m) >= decks_.size() || decks_[std::size_t(m)].w == 0)) buildDeck(m);
     modelTop_.clear();
@@ -941,13 +982,14 @@ bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
     if (projShadowPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, projShadowPipe_);
     if (depthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, depthPipe_);
     if (walkPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, walkPipe_);
-    meshPipe_ = shadowPipe_ = projShadowPipe_ = depthPipe_ = walkPipe_ = nullptr;
+    if (meshOpaquePipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, meshOpaquePipe_);
+    meshPipe_ = shadowPipe_ = projShadowPipe_ = depthPipe_ = walkPipe_ = meshOpaquePipe_ = nullptr;
     depthPipeFmt_ = SDL_GPU_TEXTUREFORMAT_INVALID;
     colorFmt_ = f.colorFormat;
     depthFmt_ = f.depthFormat;
     samples_ = f.samples;
     SDL_GPUShader* vs = createShader(dev_, ShaderId::ModelVs, 0, 1, 1);
-    SDL_GPUShader* fsM = createShader(dev_, ShaderId::ModelFs, 3, 2);
+    SDL_GPUShader* fsM = createShader(dev_, ShaderId::ModelFs, 3, 2, 1);
     SDL_GPUShader* fsS = createShader(dev_, ShaderId::ShadowFs, 3, 1);
     SDL_GPUShader* vsS = createShader(dev_, ShaderId::ModelShadowVs, 0, 1, 1);
     if (vs && fsM && fsS && vsS) {
@@ -997,6 +1039,15 @@ bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
             pi.depth_stencil_state.compare_mask = pi.depth_stencil_state.write_mask = 0xFF;
         }
         meshPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+        {
+            SDL_GPUColorTargetDescription opaque = ctd;
+            opaque.blend_state = {};
+            opaque.blend_state.enable_color_write_mask = true;  // the scene's alpha stays as before (blend: dst alpha kept)
+            opaque.blend_state.color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B;
+            pi.target_info.color_target_descriptions = &opaque;
+            meshOpaquePipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+            pi.target_info.color_target_descriptions = &ctd;
+        }
         if (stencil) {
             SDL_GPUStencilOpState st{};
             st.fail_op = st.depth_fail_op = st.pass_op = SDL_GPU_STENCILOP_KEEP;
@@ -1035,6 +1086,8 @@ bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
         si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
         nearest_ = SDL_CreateGPUSampler(dev_, &si);
         si.min_filter = si.mag_filter = SDL_GPU_FILTER_LINEAR;
+        si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+        si.max_lod = 1000.0f;
         si.address_mode_u = si.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
         si.enable_anisotropy = gpuAnisotropy() && f.aniso > 1;  // Quality::aniso
         si.max_anisotropy = float(std::max(1, f.aniso));
@@ -1053,20 +1106,43 @@ void ModelRenderer::prepare(SDL_GPUDevice* dev, SDL_GPUCommandBuffer* cmd, const
     if (!uploaded_) {
         uploaded_ = true;
         std::vector<float> v;
+        std::vector<std::uint32_t> idx;
+        // Equal corners (all 20 floats bit for bit) share one vertex (per part).
+        auto vertexHash = [&](std::uint32_t i) {
+            std::uint64_t h = 1469598103934665603ull;
+            const auto* b = reinterpret_cast<const std::uint8_t*>(&v[std::size_t(i) * kVertexFloats]);
+            for (int k = 0; k < kVertexFloats * 4; ++k) h = (h ^ b[k]) * 1099511628211ull;
+            return std::size_t(h);
+        };
+        auto vertexEq = [&](std::uint32_t a, std::uint32_t b) {
+            return std::memcmp(&v[std::size_t(a) * kVertexFloats], &v[std::size_t(b) * kVertexFloats], kVertexFloats * 4) == 0;
+        };
+        std::unordered_set<std::uint32_t, decltype(vertexHash), decltype(vertexEq)> seen(0, vertexHash, vertexEq);
         auto put = [&](const formats::MeshPart& p) {
-            Range r{std::uint32_t(v.size() / kVertexFloats), std::uint32_t(p.tris.size())};
+            Range r{std::uint32_t(idx.size()), std::uint32_t(p.tris.size())};
+            seen.clear();
+            seen.reserve(p.tris.size());
             for (const auto& x : p.tris) {
                 float f16[kVertexFloats] = {x.pos[0], x.pos[1], x.pos[2], x.nrm[0], x.nrm[1], x.nrm[2], x.uv[0], x.uv[1],
                                             x.rgba[0], x.rgba[1], x.rgba[2], x.rgba[3], x.house, x.lit, x.textured, x.oneSided,
                                             x.gloss, x.metal, 0, 0};
                 std::memcpy(&f16[18], x.joint, 4);   // UBYTE4_NORM joints
                 std::memcpy(&f16[19], x.weight, 4);  // UBYTE4_NORM weights
+                const std::uint32_t at = std::uint32_t(v.size() / kVertexFloats);
                 v.insert(v.end(), f16, f16 + kVertexFloats);
+                const auto [it, added] = seen.insert(at);
+                if (!added) v.resize(v.size() - kVertexFloats);  // an equal corner is there already
+                idx.push_back(*it);
             }
             return r;
         };
         struct TexUp { SDL_GPUTexture* tex; const std::vector<std::uint32_t>* px; int w, h; };
         std::vector<TexUp> texUps;
+        // Model textures with a full mip chain (generated after the upload): a unit is a few dozen
+        // pixels across while its texture is 1-2k - without mips every pixel read far-apart texels
+        // (cache misses: the model pass cost most of a frame with a few dozen tanks in view, and
+        // the textures shimmered).
+        std::vector<SDL_GPUTexture*> mipped;
         auto makeTex = [&](int w, int h) {
             SDL_GPUTextureCreateInfo ci{};
             ci.type = SDL_GPU_TEXTURETYPE_2D;
@@ -1076,7 +1152,13 @@ void ModelRenderer::prepare(SDL_GPUDevice* dev, SDL_GPUCommandBuffer* cmd, const
             ci.height = Uint32(h);
             ci.layer_count_or_depth = 1;
             ci.num_levels = 1;
-            return SDL_CreateGPUTexture(dev_, &ci);
+            if (w > 1 || h > 1) {
+                for (int m = std::max(w, h); m > 1; m >>= 1) ++ci.num_levels;
+                ci.usage |= SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;  // SDL_GenerateMipmapsForGPUTexture blits into the levels
+            }
+            SDL_GPUTexture* t = SDL_CreateGPUTexture(dev_, &ci);
+            if (t && ci.num_levels > 1) mipped.push_back(t);
+            return t;
         };
         static const std::vector<std::uint32_t> kWhite{0xFFFFFFFFu};
         if (!white_) {
@@ -1104,24 +1186,35 @@ void ModelRenderer::prepare(SDL_GPUDevice* dev, SDL_GPUCommandBuffer* cmd, const
             }
             gpu_.push_back(g);
         }
-        const Uint32 vbytes = Uint32(v.size() * 4);
-        if (vbytes > 0) {
+        const Uint32 vbytes = Uint32(v.size() * 4), ibytes = Uint32(idx.size() * 4);
+        if (vbytes > 0 && ibytes > 0) {
             SDL_GPUBufferCreateInfo bi{};
             bi.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
             bi.size = vbytes;
             vb_ = SDL_CreateGPUBuffer(dev_, &bi);
+            bi.usage = SDL_GPU_BUFFERUSAGE_INDEX;
+            bi.size = ibytes;
+            ib_ = SDL_CreateGPUBuffer(dev_, &bi);
+            if (!ib_ && vb_) {
+                SDL_ReleaseGPUBuffer(dev_, vb_);
+                vb_ = nullptr;
+            }
+            SDL_Log("3D models: %zu triangles, %zu vertices after sharing equal corners (%.1f MB)", idx.size() / 3,
+                    v.size() / kVertexFloats, double(vbytes + ibytes) / 1048576.0);
         }
         // Staged in transfer buffers of at most kChunk bytes (a bigger texture gets its own): the
         // whole pack in one (~1.3 GB for opend2k-redesign) exceeds Direct3D 12's resource size
         // limit on cards with less VRAM. Texture offsets 512-aligned (D3D12 placement alignment).
         constexpr Uint32 kChunk = 64u << 20;
-        struct Up { const std::uint8_t* data; Uint32 size; Uint32 vbOff; const TexUp* tex; };
+        struct Up { const std::uint8_t* data; Uint32 size; Uint32 vbOff; const TexUp* tex; SDL_GPUBuffer* buf; };
         std::vector<Up> ups;
         if (vb_) {
             const auto* vp = reinterpret_cast<const std::uint8_t*>(v.data());
-            for (Uint32 o = 0; o < vbytes; o += kChunk) ups.push_back({vp + o, std::min(kChunk, vbytes - o), o, nullptr});
+            for (Uint32 o = 0; o < vbytes; o += kChunk) ups.push_back({vp + o, std::min(kChunk, vbytes - o), o, nullptr, vb_});
+            const auto* ip = reinterpret_cast<const std::uint8_t*>(idx.data());
+            for (Uint32 o = 0; o < ibytes; o += kChunk) ups.push_back({ip + o, std::min(kChunk, ibytes - o), o, nullptr, ib_});
             for (const auto& t : texUps)
-                ups.push_back({reinterpret_cast<const std::uint8_t*>(t.px->data()), Uint32(t.w * t.h * 4), 0, &t});
+                ups.push_back({reinterpret_cast<const std::uint8_t*>(t.px->data()), Uint32(t.w * t.h * 4), 0, &t, nullptr});
         }
         auto align = [](Uint32 x) { return (x + 511u) & ~511u; };
         SDL_GPUCopyPass* cp = ups.empty() ? nullptr : SDL_BeginGPUCopyPass(cmd);
@@ -1152,7 +1245,7 @@ void ModelRenderer::prepare(SDL_GPUDevice* dev, SDL_GPUCommandBuffer* cmd, const
                         SDL_UploadToGPUTexture(cp, &tsrc, &treg, false);
                     } else {
                         SDL_GPUTransferBufferLocation src{tb, off};
-                        SDL_GPUBufferRegion reg{vb_, ups[k].vbOff, ups[k].size};
+                        SDL_GPUBufferRegion reg{ups[k].buf, ups[k].vbOff, ups[k].size};
                         SDL_UploadToGPUBuffer(cp, &src, &reg, false);
                     }
                 }
@@ -1163,6 +1256,7 @@ void ModelRenderer::prepare(SDL_GPUDevice* dev, SDL_GPUCommandBuffer* cmd, const
             i = j;
         }
         if (cp) SDL_EndGPUCopyPass(cp);
+        for (SDL_GPUTexture* t : mipped) SDL_GenerateMipmapsForGPUTexture(cmd, t);
         if (!vb_) gpu_.clear();
     }
     if (!vb_) return;
@@ -1197,6 +1291,17 @@ void ModelRenderer::prepare(SDL_GPUDevice* dev, SDL_GPUCommandBuffer* cmd, const
     }
 }
 
+void ModelRenderer::drawnFacing(const game::Unit& u, int type, float& body, float& turret) const {
+    const bool barrel = type >= 0 && type < formats::kMaxUnitTypes && t_.bin.units[type].barrelArt >= 0;
+    body = float(u.facing & 31);
+    turret = float((barrel ? u.facingTurret : u.facing) & 31);
+    // (A carryall's cargo is drawn with the carrier's slot: only the unit's own type is eased.)
+    if (const render::Effects::UnitVisual* v = fx_ && type == u.type ? fx_->unitVisual(u.side, u.index) : nullptr) {
+        body = v->facing;
+        turret = barrel ? v->turret : v->facing;
+    }
+}
+
 bool ModelRenderer::unitPlacement(const Terrain& terr, const game::World& w, const game::Unit& u, int type, float height,
                                   bool flying, Mat4& body, Mat4& turret, Mat4& tilt, Vec3& at) const {
     if (type < 0 || type >= int(unitModel_.size())) return false;
@@ -1217,7 +1322,17 @@ bool ModelRenderer::unitPlacement(const Terrain& terr, const game::World& w, con
                                       terr.height(gx, gy - e) - terr.height(gx, gy + e)});
         tilt = tiltTo(n);
     }
-    body = translate(at.x, at.y, at.z) * tilt * yawM(facingAngle(u.facing));
+    float bodyF = 0, turretF = 0;
+    drawnFacing(u, type, bodyF, turretF);
+    body = translate(at.x, at.y, at.z) * tilt * yawM(facingAngle(bodyF));
+    // Vehicle animation: Modern (render/vehicle_motion.hpp): the hull's pitch / roll about its
+    // ground origin, its bounce and its recoil against the last shot; the turret recoils further.
+    float turretKick = 0;
+    if (const render::VehicleMotion::Pose* vp = vm_ && !flying ? vm_->pose(u.side, u.index) : nullptr) {
+        body = translate(at.x - vp->shotX * vp->recoil, at.y + vp->lift + vp->tremble, at.z - vp->shotY * vp->recoil) * tilt *
+               yawM(facingAngle(bodyF)) * rollM(vp->roll) * pitchM(vp->pitch);
+        turretKick = vp->turretRecoil;
+    }
     if (const UnitPose p = unitPose(u, type, mi); p.framed) {
         // A frame-map frame (infantry): its own turn, shift and size, as the 2D frame draws the
         // figure; upright (the original's soldiers do not lean with the ground).
@@ -1227,10 +1342,8 @@ bool ModelRenderer::unitPlacement(const Terrain& terr, const game::World& w, con
         body = translate(at.x + p.shiftE, at.y, at.z - p.shiftN) * yawM(radians(p.yaw)) * s;
     }
     const formats::Model3D& m = models_[std::size_t(mi)];
-    const auto& tmpl = t_.bin.units[type];
-    const int tf = tmpl.barrelArt >= 0 ? u.facingTurret : u.facing;
-    turret = body * translate(m.turretPivot[0], m.turretPivot[1], m.turretPivot[2]) * yawM(facingAngle(tf - u.facing)) *
-             translate(-m.turretPivot[0], -m.turretPivot[1], -m.turretPivot[2]);
+    turret = body * translate(m.turretPivot[0], m.turretPivot[1], m.turretPivot[2]) * yawM(facingAngle(turretF - bodyF)) *
+             translate(0, 0, turretKick) * translate(-m.turretPivot[0], -m.turretPivot[1], -m.turretPivot[2]);
     return true;
 }
 
@@ -1265,7 +1378,9 @@ void ModelRenderer::addUnit(const ModelFrame& f, const game::World& w, int sideI
             d.bodyPose = p.bodyPose;
         d.alpha *= p.alpha;
     }
-    d.shadowM = translate(gx, ground + 0.6f, gy) * tilt * yawM(facingAngle(u.facing));
+    float bodyF = 0, turretF = 0;
+    drawnFacing(u, type, bodyF, turretF);
+    d.shadowM = translate(gx, ground + 0.6f, gy) * tilt * yawM(facingAngle(bodyF));
     {  // projected shadow plane: the ground under the unit (sloped like the unit; flyers: level)
         Vec3 n{0, 1, 0};
         if (!flying) n = Vec3{tilt.m[4], tilt.m[5], tilt.m[6]};
@@ -1487,6 +1602,259 @@ void ModelRenderer::buildDeck(int mi) {
         }
 }
 
+const ModelRenderer::Roof& ModelRenderer::roof(int mi) const {
+    if (roofs_.size() <= std::size_t(mi)) roofs_.resize(std::size_t(mi) + 1);
+    Roof& rf = roofs_[std::size_t(mi)];
+    if (rf.built) return rf;
+    rf.built = true;
+    const formats::Model3D& m = models_[std::size_t(mi)];
+    float x0, z0, x1, z1;
+    if (!planBounds(m, x0, z0, x1, z1)) return rf;
+    rf.x0 = std::floor(x0);
+    rf.z0 = std::floor(z0);
+    rf.w = int(std::ceil((x1 - rf.x0) / Roof::kRes)) + 1;
+    rf.h = int(std::ceil((z1 - rf.z0) / Roof::kRes)) + 1;
+    if (rf.w <= 0 || rf.h <= 0 || rf.w * rf.h > (1 << 18)) {
+        rf.w = rf.h = 0;
+        return rf;
+    }
+    rf.y.assign(std::size_t(rf.w) * std::size_t(rf.h), -1.0f);
+    // As buildDeck: rasterise every (non-vertical) triangle top-down, keep the highest surface.
+    for (const auto* part : {&m.body, &m.house, &m.turret})
+        for (std::size_t t = 0; t + 2 < part->tris.size(); t += 3) {
+            const float* a = part->tris[t].pos;
+            const float* b = part->tris[t + 1].pos;
+            const float* c = part->tris[t + 2].pos;
+            const float ax = (a[0] - rf.x0) / Roof::kRes, az = (a[2] - rf.z0) / Roof::kRes;
+            const float bx = (b[0] - rf.x0) / Roof::kRes, bz = (b[2] - rf.z0) / Roof::kRes;
+            const float cx = (c[0] - rf.x0) / Roof::kRes, cz = (c[2] - rf.z0) / Roof::kRes;
+            const float den = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+            if (std::abs(den) < 1e-6f) continue;
+            const int i0 = std::max(0, int(std::floor(std::min({ax, bx, cx}))));
+            const int i1 = std::min(rf.w - 1, int(std::ceil(std::max({ax, bx, cx}))));
+            const int j0 = std::max(0, int(std::floor(std::min({az, bz, cz}))));
+            const int j1 = std::min(rf.h - 1, int(std::ceil(std::max({az, bz, cz}))));
+            for (int j = j0; j <= j1; ++j)
+                for (int i = i0; i <= i1; ++i) {
+                    const float px = float(i) + 0.5f, pz = float(j) + 0.5f;
+                    const float l0 = ((bz - cz) * (px - cx) + (cx - bx) * (pz - cz)) / den;
+                    const float l1 = ((cz - az) * (px - cx) + (ax - cx) * (pz - cz)) / den;
+                    const float l2 = 1 - l0 - l1;
+                    if (l0 < -1e-4f || l1 < -1e-4f || l2 < -1e-4f) continue;
+                    const float y = l0 * a[1] + l1 * b[1] + l2 * c[1];
+                    float& d = rf.y[std::size_t(j) * std::size_t(rf.w) + std::size_t(i)];
+                    d = std::max(d, y);
+                    rf.maxY = std::max(rf.maxY, y);
+                }
+        }
+    return rf;
+}
+
+// The model's top surface near (gx, gy): the nearest roof cell within 16 px that stands at least a
+// third of the model's height (fires burn on the building, not on its low apron or the ground).
+bool ModelRenderer::buildingSurface(const game::World& w, const Terrain& terr, int side, int building, float& gx,
+                                    float& gy, float& top) const {
+    if (!active() || side < 0 || side >= int(w.sides().size())) return false;
+    const auto& sd = w.sides()[std::size_t(side)];
+    if (building < 0 || building >= int(sd.buildings.size())) return false;
+    const game::Building& b = sd.buildings[std::size_t(building)];
+    Mat4 body, turret;
+    float groundY = 0;
+    if (!buildingPlacement(terr, b, body, turret, groundY)) return false;
+    const int mi = buildingModel_[std::size_t(b.type)];
+    const Roof& rf = roof(mi);
+    if (rf.w == 0 || rf.maxY <= 1) return false;
+    const float mx = gx - body.m[12], mz = gy - body.m[14];
+    const float want = std::max(4.0f, rf.maxY * 0.33f);
+    const int ci = int(std::floor((mx - rf.x0) / Roof::kRes)), cj = int(std::floor((mz - rf.z0) / Roof::kRes));
+    const int R = int(std::ceil(16.0f / Roof::kRes));
+    float best = 1e30f;
+    int bi = -1, bj = -1;
+    for (int j = cj - R; j <= cj + R; ++j)
+        for (int i = ci - R; i <= ci + R; ++i) {
+            if (i < 0 || j < 0 || i >= rf.w || j >= rf.h) continue;
+            if (rf.y[std::size_t(j) * std::size_t(rf.w) + std::size_t(i)] < want) continue;
+            const float d = float((i - ci) * (i - ci) + (j - cj) * (j - cj));
+            if (d < best) best = d, bi = i, bj = j;
+        }
+    if (bi < 0) return false;
+    gx = body.m[12] + rf.x0 + (float(bi) + 0.5f) * Roof::kRes;
+    gy = body.m[14] + rf.z0 + (float(bj) + 0.5f) * Roof::kRes;
+    top = body.m[13] + rf.y[std::size_t(bj) * std::size_t(rf.w) + std::size_t(bi)] * body.m[5];
+    return true;
+}
+
+// ---- Picking (docs/3d-mode.md "Picking") ----
+namespace {
+// The ray (o, d) in the model space of the affine matrix M (column-major): o' = M^-1 o, d' = A^-1 d
+// (A = M's 3x3 part), so the ray parameter t is the same in both spaces. False = singular.
+bool rayToModel(const Mat4& M, const Vec3& o, const Vec3& d, Vec3& mo, Vec3& md) {
+    const float a = M.at(0, 0), b = M.at(0, 1), c = M.at(0, 2);
+    const float e = M.at(1, 0), f = M.at(1, 1), g = M.at(1, 2);
+    const float h = M.at(2, 0), i = M.at(2, 1), j = M.at(2, 2);
+    const float det = a * (f * j - g * i) - b * (e * j - g * h) + c * (e * i - f * h);
+    if (std::abs(det) < 1e-9f) return false;
+    const float k = 1.0f / det;
+    const float inv[9] = {(f * j - g * i) * k, (c * i - b * j) * k, (b * g - c * f) * k,
+                          (g * h - e * j) * k, (a * j - c * h) * k, (c * e - a * g) * k,
+                          (e * i - f * h) * k, (b * h - a * i) * k, (a * f - b * e) * k};
+    auto mul = [&](const Vec3& v) {
+        return Vec3{inv[0] * v.x + inv[1] * v.y + inv[2] * v.z, inv[3] * v.x + inv[4] * v.y + inv[5] * v.z,
+                    inv[6] * v.x + inv[7] * v.y + inv[8] * v.z};
+    };
+    mo = mul(o - Vec3{M.m[12], M.m[13], M.m[14]});
+    md = mul(d);
+    return true;
+}
+
+// Slab test: the entry parameter of the ray into the box (0 when it starts inside), < 0 = missed.
+float rayBox(const Vec3& o, const Vec3& d, const Vec3& lo, const Vec3& hi) {
+    if (lo.x > hi.x) return -1;
+    float t0 = 0, t1 = 1e30f;
+    const float os[3] = {o.x, o.y, o.z}, ds[3] = {d.x, d.y, d.z};
+    const float los[3] = {lo.x, lo.y, lo.z}, his[3] = {hi.x, hi.y, hi.z};
+    for (int k = 0; k < 3; ++k) {
+        if (std::abs(ds[k]) < 1e-12f) {
+            if (os[k] < los[k] || os[k] > his[k]) return -1;
+            continue;
+        }
+        float ta = (los[k] - os[k]) / ds[k], tb = (his[k] - os[k]) / ds[k];
+        if (ta > tb) std::swap(ta, tb);
+        t0 = std::max(t0, ta);
+        t1 = std::min(t1, tb);
+        if (t0 > t1) return -1;
+    }
+    return t0;
+}
+
+// Nearest hit of the ray on triangles [first, first + count) of a triangle list (both faces;
+// Moller-Trumbore), < 0 = none.
+float rayTris(const Vec3& o, const Vec3& d, const formats::MeshPart& part, std::size_t first, std::size_t count) {
+    float best = -1;
+    const std::size_t end = std::min(part.tris.size() / 3, first + count);
+    for (std::size_t t = first * 3; t / 3 < end; t += 3) {
+        const float* pa = part.tris[t].pos;
+        const float* pb = part.tris[t + 1].pos;
+        const float* pc = part.tris[t + 2].pos;
+        const Vec3 a{pa[0], pa[1], pa[2]};
+        const Vec3 e1 = Vec3{pb[0], pb[1], pb[2]} - a, e2 = Vec3{pc[0], pc[1], pc[2]} - a;
+        const Vec3 p = cross(d, e2);
+        const float det = dot(e1, p);
+        if (std::abs(det) < 1e-9f) continue;
+        const float inv = 1.0f / det;
+        const Vec3 s = o - a;
+        const float u = dot(s, p) * inv;
+        if (u < 0 || u > 1) continue;
+        const Vec3 q = cross(s, e1);
+        const float v = dot(d, q) * inv;
+        if (v < 0 || u + v > 1) continue;
+        const float hit = dot(e2, q) * inv;
+        if (hit > 0 && (best < 0 || hit < best)) best = hit;
+    }
+    return best;
+}
+
+void growBox(const formats::MeshPart& part, Vec3& lo, Vec3& hi) {
+    for (const auto& v : part.tris) {
+        lo = Vec3{std::min(lo.x, v.pos[0]), std::min(lo.y, v.pos[1]), std::min(lo.z, v.pos[2])};
+        hi = Vec3{std::max(hi.x, v.pos[0]), std::max(hi.y, v.pos[1]), std::max(hi.z, v.pos[2])};
+    }
+}
+}  // namespace
+
+const ModelRenderer::PickBox& ModelRenderer::pickBox(int mi) const {
+    if (pickBoxes_.size() <= std::size_t(mi)) pickBoxes_.resize(std::size_t(mi) + 1);
+    PickBox& pb = pickBoxes_[std::size_t(mi)];
+    if (pb.built) return pb;
+    pb.built = true;
+    const formats::Model3D& m = models_[std::size_t(mi)];
+    growBox(m.body, pb.bodyLo, pb.bodyHi);
+    growBox(m.turret, pb.turretLo, pb.turretHi);
+    growBox(m.house, m.houseOnTurret && !m.turret.empty() ? pb.turretLo : pb.bodyLo,
+            m.houseOnTurret && !m.turret.empty() ? pb.turretHi : pb.bodyHi);
+    constexpr std::uint32_t kRun = 32;
+    const formats::MeshPart* parts[3] = {&m.body, &m.house, &m.turret};
+    for (std::uint8_t k = 0; k < 3; ++k) {
+        const std::uint32_t n = std::uint32_t(parts[k]->tris.size() / 3);
+        for (std::uint32_t f = 0; f < n; f += kRun) {
+            PickBox::Run r;
+            r.part = k;
+            r.first = f;
+            r.count = std::min(kRun, n - f);
+            r.lo = Vec3{1e30f, 1e30f, 1e30f};
+            r.hi = Vec3{-1e30f, -1e30f, -1e30f};
+            for (std::uint32_t v = f * 3; v < (f + r.count) * 3; ++v) {
+                const float* q = parts[k]->tris[v].pos;
+                r.lo = Vec3{std::min(r.lo.x, q[0]), std::min(r.lo.y, q[1]), std::min(r.lo.z, q[2])};
+                r.hi = Vec3{std::max(r.hi.x, q[0]), std::max(r.hi.y, q[1]), std::max(r.hi.z, q[2])};
+            }
+            pb.runs.push_back(r);
+        }
+    }
+    return pb;
+}
+
+// A building model: the exact triangles (rest pose) through this frame's body / turret placement.
+float ModelRenderer::rayBuilding(const game::World& w, const Terrain& terr, int side, int building, const Vec3& o,
+                                 const Vec3& d) const {
+    if (!active() || side < 0 || side >= int(w.sides().size())) return -1;
+    const auto& sd = w.sides()[std::size_t(side)];
+    if (building < 0 || building >= int(sd.buildings.size())) return -1;
+    const game::Building& b = sd.buildings[std::size_t(building)];
+    Mat4 body, turret;
+    float groundY = 0;
+    if (!buildingPlacement(terr, b, body, turret, groundY)) return -1;
+    const int mi = buildingModel_[std::size_t(b.type)];
+    const formats::Model3D& m = models_[std::size_t(mi)];
+    const PickBox& pb = pickBox(mi);
+    const bool houseTurret = m.houseOnTurret && !m.turret.empty();
+    float best = -1;
+    auto take = [&](float t) {
+        if (t > 0 && (best < 0 || t < best)) best = t;
+    };
+    const formats::MeshPart* parts[3] = {&m.body, &m.house, &m.turret};
+    // Pass 0: the parts drawn with the body matrix, pass 1: with the turret matrix.
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1 && m.turret.empty()) break;
+        Vec3 mo, md;
+        if (!rayToModel(pass == 0 ? body : turret, o, d, mo, md)) continue;
+        if (rayBox(mo, md, pass == 0 ? pb.bodyLo : pb.turretLo, pass == 0 ? pb.bodyHi : pb.turretHi) < 0) continue;
+        for (const auto& r : pb.runs) {
+            const bool onTurret = r.part == 2 || (r.part == 1 && houseTurret);
+            if (onTurret != (pass == 1)) continue;
+            const float tb = rayBox(mo, md, r.lo, r.hi);
+            if (tb < 0 || (best >= 0 && tb > best)) continue;
+            take(rayTris(mo, md, *parts[r.part], r.first, r.count));
+        }
+    }
+    return best;
+}
+
+// A unit model: its box (body + turret) through this frame's placement (animated poses move the
+// mesh, so the box is the forgiving, stable target for small moving objects).
+float ModelRenderer::rayUnit(const game::World& w, const Terrain& terr, int side, int unit, const Vec3& o,
+                             const Vec3& d) const {
+    if (!active() || side < 0 || side >= int(w.sides().size())) return -1;
+    const auto& sd = w.sides()[std::size_t(side)];
+    if (unit < 0 || unit >= int(sd.units.size())) return -1;
+    const game::Unit& u = sd.units[std::size_t(unit)];
+    if (!hasUnitModel(u.type)) return -1;
+    // As collect(): ground units at their height, flyers (0x140) at the low byte of it.
+    const bool flying = (u.flags & 0x200140) != 0;
+    if (flying && (!(u.flags & 0x140) || (u.flags & 0x200000))) return -1;
+    const float height = flying ? float(game::fixToPixel(u.posZ) & 0xff) : float(game::fixToPixel(u.posZ));
+    Mat4 body, turret, tilt;
+    Vec3 at;
+    if (!unitPlacement(terr, w, u, u.type, height, flying, body, turret, tilt, at)) return -1;
+    const PickBox& pb = pickBox(unitModel_[std::size_t(u.type)]);
+    float best = -1;
+    Vec3 mo, md;
+    if (rayToModel(body, o, d, mo, md)) best = rayBox(mo, md, pb.bodyLo, pb.bodyHi);
+    if (rayToModel(turret, o, d, mo, md))
+        if (const float t = rayBox(mo, md, pb.turretLo, pb.turretHi); t >= 0 && (best < 0 || t < best)) best = t;
+    return best;
+}
+
 // Anchor points in world space (docs/3d-models.md "Anchors"): the model's fx_* points through the
 // object's body / turret transform this frame.
 bool ModelRenderer::buildingAnchors(const game::World& w, const Terrain& terr, int side, int building,
@@ -1571,7 +1939,9 @@ void ModelRenderer::collect(const ModelFrame& f) {
             d.shadowM = translate(d.bodyM.m[12], groundY + 0.6f, d.bodyM.m[14]);
             d.plane[3] = groundY;
             d.turret = g.turret.count > 0;
-            if (g.emissive) d.emit = 1.6f * render::buildingGlow(w, t_, int(si), bi, f.lamps, f.time, true);  // thin strips: a bit more
+            if (g.emissive)  // thin strips: a bit more
+                d.emit = 1.6f * render::buildingGlow(w, t_, int(si), bi, f.lamps, f.time, true,
+                                                     std::size_t(mi) < glowBlink_.size() ? glowBlink_[std::size_t(mi)] : 0);
             // Build-up / selling: a plane rising from the foundation (the flat parts up to 1.5 px stand
             // from the start) to the top of the model.
             if (const float p = render::buildupProgress(t_, b, float(f.time * 20.0 - double(w.gameTicks()))); p >= 0) {
@@ -1680,7 +2050,7 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
     // With the sun shadow map the models cast real shadows (drawShadowDepth): no PS1 shadow
     // polygons / projected glTF shadows on top.
     const bool shadowMap = f.shadow[0] > 0.5f && f.shadowMap;
-    SDL_GPUBufferBinding vb{vb_, 0};
+    SDL_GPUBufferBinding vb{vb_, 0}, ib{ib_, 0};
     auto bind = [&](const GpuModel& g) {
         SDL_GPUTextureSamplerBinding sb[3] = {{g.tex ? g.tex : white_, g.point ? nearest_ : linear_},
                                               {f.shroud ? f.shroud : white_, f.linearClamp ? f.linearClamp : linear_},
@@ -1692,14 +2062,19 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
         std::memcpy(vu.model, m.m, sizeof vu.model);
         vu.skin[0] = float(palette);
         SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof vu);
-        SDL_DrawGPUPrimitives(pass, r.count, 1, r.first, 0);
+        SDL_DrawGPUIndexedPrimitives(pass, r.count, 1, r.first, 0, 0);
         ++calls;
     };
-    // Vertex storage buffer 0 of every model vertex shader: the joint palette.
-    auto bindPalette = [&] { SDL_BindGPUVertexStorageBuffers(pass, 0, &palette_, 1); };
+    // Vertex storage buffer 0 of every model vertex shader: the joint palette; fragment storage buffer 0 of
+    // model_fs: the light grid (render3d/lights.hpp).
+    auto bindPalette = [&] {
+        SDL_BindGPUVertexStorageBuffers(pass, 0, &palette_, 1);
+        bindLightGrid(pass, f.lightGrid, lightFallback_, dev_);
+    };
     // Shadows first (darken the terrain, no depth write), then the meshes.
     SDL_BindGPUGraphicsPipeline(pass, shadowPipe_);
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+    SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
     bindPalette();
     SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof fu);
     for (const Draw& d : draws_) {
@@ -1716,6 +2091,7 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
         if (!projBound) {
             SDL_BindGPUGraphicsPipeline(pass, projShadowPipe_);
             SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+            SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
             bindPalette();
             SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof fu);
             projBound = true;
@@ -1733,7 +2109,7 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
             std::memcpy(su.model, m.m, sizeof su.model);
             su.skin[0] = float(palette);
             SDL_PushGPUVertexUniformData(cmd, 0, &su, sizeof su);
-            SDL_DrawGPUPrimitives(pass, r.count, 1, r.first, 0);
+            SDL_DrawGPUIndexedPrimitives(pass, r.count, 1, r.first, 0, 0);
             ++calls;
         };
         const Mat4 sq = squashAbove(d.plane[3], d.buildK);
@@ -1742,6 +2118,7 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
     }
     SDL_BindGPUGraphicsPipeline(pass, meshPipe_);
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+    SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
     bindPalette();
     auto drawMesh = [&](const Draw& d, float walkMode) {
         const GpuModel& g = gpu_[std::size_t(d.model)];
@@ -1770,10 +2147,26 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
         if (walkPipe_ && r != ref) SDL_SetGPUStencilReference(pass, Uint8(r));
         ref = r;
     };
-    // Opaque first, translucent (stealth) last.
-    for (int pass2 = 0; pass2 < 2; ++pass2)
+    // Opaque first (without blending), then the blended ones: build-up holograms, translucent (stealth) last.
+    auto blended = [](const Draw& d) { return d.alpha < 1 || d.build[1] > 0; };
+    if (meshOpaquePipe_) {
+        SDL_BindGPUGraphicsPipeline(pass, meshOpaquePipe_);
+        SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+        SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        bindPalette();
+    }
+    bool blendBound = !meshOpaquePipe_;
+    for (int pass2 = 0; pass2 < 3; ++pass2)
         for (const Draw& d : draws_) {
-            if ((d.alpha < 1) != (pass2 == 1)) continue;
+            const int group = d.alpha < 1 ? 2 : blended(d) || !meshOpaquePipe_ ? 1 : 0;
+            if (group != pass2) continue;
+            if (group > 0 && !blendBound) {
+                SDL_BindGPUGraphicsPipeline(pass, meshPipe_);
+                SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+                SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+                bindPalette();
+                blendBound = true;
+            }
             const bool walkBuilding = d.walkRef > 0 && d.walk[2] > 0;
             walking |= walkBuilding;
             stencilRef(d.walkRef > 0 && !walkBuilding ? d.walkRef : 0);
@@ -1786,6 +2179,7 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
     if (walking && walkPipe_ && !walkDebug) {
         SDL_BindGPUGraphicsPipeline(pass, walkPipe_);
         SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+        SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
         bindPalette();
         for (const Draw& d : draws_) {
             if (d.walkRef <= 0 || d.walk[2] <= 0) continue;
@@ -1834,8 +2228,9 @@ int ModelRenderer::drawShadowDepth(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer
     }
     if (!depthPipe_) return 0;
     SDL_BindGPUGraphicsPipeline(pass, depthPipe_);
-    SDL_GPUBufferBinding vb{vb_, 0};
+    SDL_GPUBufferBinding vb{vb_, 0}, ib{ib_, 0};
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+    SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
     SDL_BindGPUVertexStorageBuffers(pass, 0, &palette_, 1);
     ModelVU vu;
     std::memcpy(vu.viewProj, f.lightViewProj.m, sizeof vu.viewProj);
@@ -1845,7 +2240,7 @@ int ModelRenderer::drawShadowDepth(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer
         std::memcpy(vu.model, m.m, sizeof vu.model);
         vu.skin[0] = float(palette);
         SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof vu);
-        SDL_DrawGPUPrimitives(pass, r.count, 1, r.first, 0);
+        SDL_DrawGPUIndexedPrimitives(pass, r.count, 1, r.first, 0, 0);
         ++calls;
     };
     for (const Draw& d : draws_) {

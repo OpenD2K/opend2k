@@ -33,9 +33,10 @@ UilPageStack::~UilPageStack() {
 
 std::string UilPageStack::pageFile(const std::string& menu) const { return res_.menuFile(menu); }
 
-// options.uil gets two rows of check boxes (not original; re/notes/campaign-flow.md §6.4):
-// "Extended queue" / "Cheats", "Modern effects" / "HD art" and "Rally points", with the tick / cross art of
-// setting.uil's check boxes, below the four value bars, which move closer together (16 px
+// options.uil gets four rows of check boxes (not original; re/notes/campaign-flow.md §6.4):
+// "Extended queue" / "Cheats", "Modern effects" / "HD art", "Rally points" and "Unlimited orders" / "Unlimited
+// units" (re/notes/limits.md), with the tick / cross art of
+// setting.uil's check boxes, below the four value bars, which move closer together (15 px
 // instead of 30) to make room.
 const formats::UilPage* UilPageStack::page(const std::string& menu) const {
     if (menu != "OPTIONS") return res_.page(pageFile(menu));
@@ -52,19 +53,22 @@ const formats::UilPage* UilPageStack::page(const std::string& menu) const {
         {"gsText", "gameSpeed"}, {"ssText", "scrollSpeed"}, {"cdvolText", "cdVol"}, {"sfxvolText", "fxVol"}};
     for (auto& w : ws) {
         for (int i = 0; i < 4; ++i)
-            if (w.name == kRowNames[i][0] || w.name == kRowNames[i][1]) w.y = 118 + i * 16;
+            if (w.name == kRowNames[i][0] || w.name == kRowNames[i][1]) w.y = 118 + i * 15;
         if (w.name == "music" || w.name == "done") w.y = 247;
     }
     // Second check row: the Enhanced-mode presentation (docs/enhanced-graphics.md): "Modern
     // effects" (Settings::effects) and "HD art" (artPack upscaled / an art pack vs original).
-    // Third row: "Rally points" (Settings::rallyPoints, game/rally.cpp).
-    const char* const extra[] = {"extQueue", "cheats", "modernFx", "hdArt", "rally"};
-    for (int i = 0; i < 5; ++i) {
+    // Third row: "Rally points" (Settings::rallyPoints, game/rally.cpp). Fourth row: the limits
+    // (re/notes/limits.md): "Unlimited orders" (Settings::unlimitedOrders) / "Unlimited units"
+    // (Settings::unlimitedUnits, new games).
+    const char* const extra[] = {"extQueue", "cheats", "modernFx", "hdArt", "rally", "orderLimit", "unitLimit"};
+    for (int i = 0; i < 7; ++i) {
+        const int k = i < 5 ? i : i + 1;  // (slot 5: the resolution button right of "Rally points")
         formats::UilWidget c;
         c.kind = "CHECKBOX";
         c.name = extra[i];
-        c.x = 200 + (i % 2) * 118;
-        c.y = 184 + (i / 2) * 16;
+        c.x = 200 + (k % 2) * 118;
+        c.y = 178 + (k / 2) * 16;
         c.w = c.h = 16;
         c.fields = {"JBoxOutLine", "JHighLightText", "Black", "tick", "cross", "SetValueBFTo gD2k TOGGLE"};
         ws.push_back(c);
@@ -72,7 +76,7 @@ const formats::UilPage* UilPageStack::page(const std::string& menu) const {
         t.name = std::string(extra[i]) + "Text";
         t.x = c.x + 20;
         t.y = c.y + 1;
-        t.w = i % 2 == 0 ? 96 : 60;
+        t.w = k % 2 == 0 ? 96 : 84;
         t.h = 16;
         ws.push_back(t);
     }
@@ -83,7 +87,7 @@ const formats::UilPage* UilPageStack::page(const std::string& menu) const {
     res.kind = "BUTTON";
     res.name = "resolution";
     res.x = 318;
-    res.y = 216;
+    res.y = 210;
     res.w = 84;
     res.h = 16;
     res.fields = {"NoText", "LightRed", "VDarkRed", "Red", "DarkRed", "JRubberText", "JRubberTextDn", "None", "None"};
@@ -107,6 +111,8 @@ void UilPageStack::optionsOverrides(UilOverrides& ov) const {
     ov.text["modernFxText"] = "Modern effects";
     ov.text["hdArtText"] = "HD art";
     ov.text["rallyText"] = "Rally points";
+    ov.text["orderLimitText"] = "Unlimited orders";
+    ov.text["unitLimitText"] = "Unlimited units";
     ov.text["resolution"] = "Res: " + Settings::resolutionLabel(settings_.resolution);
 }
 
@@ -315,6 +321,8 @@ void UilPageStack::enterOptions(UilState& s) {
     s.checks["modernFx"] = settings_.effects == Settings::Effects::Modern;
     s.checks["hdArt"] = settings_.artPack != "original";
     s.checks["rally"] = settings_.rallyPoints;
+    s.checks["orderLimit"] = settings_.unlimitedOrders;
+    s.checks["unitLimit"] = settings_.unlimitedUnits;
 }
 
 void UilPageStack::applyOptions(const UilEvents& ev, UilState& s) {
@@ -332,6 +340,8 @@ void UilPageStack::applyOptions(const UilEvents& ev, UilState& s) {
         settings_.effects = s.checks["modernFx"] ? Settings::Effects::Modern : Settings::Effects::Classic;
     if (ev.checked == "hdArt") settings_.artPack = s.checks["hdArt"] ? "upscaled" : "original";
     if (ev.checked == "rally") settings_.rallyPoints = s.checks["rally"];
+    if (ev.checked == "orderLimit") settings_.unlimitedOrders = s.checks["orderLimit"];
+    if (ev.checked == "unitLimit") settings_.unlimitedUnits = s.checks["unitLimit"];
 }
 
 std::vector<std::string> UilPageStack::wrapLines(const std::string& s, float w) const {

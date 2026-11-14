@@ -21,7 +21,7 @@ constexpr std::uint32_t kRallyTimeout = 0x400;  // ticks a unit may take to leav
 // Factories: the buildings units leave from (SetBuildingAsPrimary slots 1-7: light / heavy
 // factory, high-tech, the second high-tech kind, barracks, WOR, starport).
 bool World::canHaveRallyPoint(int side, int buildingIndex) const {
-    if (side < 0 || side >= kMaxSides || buildingIndex < 0 || buildingIndex >= kObjectsPerSide) return false;
+    if (side < 0 || side >= kMaxSides || buildingIndex < 0 || buildingIndex >= sides_[side].poolSize()) return false;
     const Side& s = sides_[side];
     if (s.links[buildingIndex].kind != SlotKind::Building) return false;
     const Building& b = s.buildings[buildingIndex];
@@ -68,7 +68,7 @@ void World::setRallyPoint(int side, int buildingIndex, int x, int y) {
 void World::rallyUnitLeft(int side, int unitIndex, const Building& factory) {
     if (unitIndex < 0) return;
     int x = 0, y = 0;
-    if (!rallyPoint(side, factory.index % kObjectsPerSide, x, y)) return;
+    if (!rallyPoint(side, factory.index % sides_[factory.side & 7].poolSize(), x, y)) return;
     rallyPending_.push_back({side, unitIndex, gameTicks_, x, y});
 }
 

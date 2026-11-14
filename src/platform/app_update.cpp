@@ -5,6 +5,7 @@
 #include <SDL3/SDL.h>
 
 #include <cstdlib>
+#include <ctime>
 
 #ifndef D2K_VERSION
 #define D2K_VERSION "0.0.0"
@@ -13,6 +14,20 @@
 namespace d2k::platform {
 
 const char* appVersion() { return D2K_VERSION; }
+
+std::int64_t previewCheckedAt() {
+    const std::time_t now = std::time(nullptr);
+    std::tm t{};
+#ifdef _WIN32
+    localtime_s(&t, &now);
+#else
+    localtime_r(&now, &t);
+#endif
+    t.tm_hour = 14;
+    t.tm_min = 32;
+    t.tm_sec = 0;
+    return std::int64_t(std::mktime(&t));
+}
 
 AppUpdateChecker& AppUpdateChecker::instance() {
     static AppUpdateChecker c;
@@ -49,6 +64,7 @@ void AppUpdateChecker::check() {
         std::lock_guard l(m_);
         st_.state = State::Checking;
         st_.error.clear();
+        st_.startedMs = SDL_GetTicks();
     }
     worker_ = std::thread([this] {
         work();
@@ -76,6 +92,7 @@ void AppUpdateChecker::work() {
         std::lock_guard l(m_);
         st_.state = State::Failed;
         st_.error = e;
+        st_.checkedAt = std::int64_t(std::time(nullptr));
         SDL_Log("Update check: %s", e.c_str());
     };
     std::string why;
@@ -92,9 +109,11 @@ void AppUpdateChecker::work() {
     formats::ReleaseInfo info;
     std::string err;
     if (!formats::parseReleaseInfo(body, u, info, err)) return fail("bad release info: " + err);
-    const Status s = evaluate(info);
+    Status s = evaluate(info);
     {
         std::lock_guard l(m_);
+        s.startedMs = st_.startedMs;
+        s.checkedAt = std::int64_t(std::time(nullptr));
         st_ = s;
     }
     SDL_Log("Update check: latest %s (this build %s)%s; download %s", info.version.c_str(), appVersion(),
@@ -115,6 +134,7 @@ void AppUpdateChecker::previewState(State st, const formats::ReleaseInfo& r, con
     st_ = r.tag.empty() ? Status{} : evaluate(r);
     st_.state = st;
     st_.error = error;
+    st_.checkedAt = st == State::Checked || st == State::Failed ? previewCheckedAt() : 0;
     autoChecked_ = true;
 }
 

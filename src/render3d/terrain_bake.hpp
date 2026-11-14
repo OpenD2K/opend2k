@@ -184,6 +184,10 @@ private:
     int wantLevel_ = -1;                 // kDetailPpc index the view wants, -1 none
     std::uint64_t wantSince_ = 0;        // frame the wanted level last changed
     bool syncDetail_ = false;            // bake every visible tile at once (first frame after a build)
+    SDL_GPUFence* bakeFence_ = nullptr;  // the last detail bake (no new one while the GPU is still on it)
+    std::uint64_t lastBakeFrame_ = 0;    // frame of the last detail bake
+    std::uint64_t rampTexels_ = 0;       // this frame's texel budget (ramps up after a pause)
+    static constexpr std::uint64_t kRampIdleFrames = 30;
     bool detailOff_ = false;             // D2K_BAKE_DETAIL=0
     bool bakeTest_ = false;              // D2K_BAKE_TEST: partial re-bakes of the tiles too
     int targetPx_ = 0;                   // size of msaa_ / scratch_ / depth_ (chunks and tiles fit)

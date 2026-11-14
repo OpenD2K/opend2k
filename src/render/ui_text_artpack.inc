@@ -36,6 +36,7 @@
 {"Installing...", "Installation...", "Installiere...", "Instalando...", "Установка..."},
 {"Checking for the latest version...", "Recherche de la dernière version...", "Suche nach der neuesten Version...",
  "Buscando la última versión...", "Поиск последней версии..."},
+{"Checked at %s", "Vérifié à %s", "Geprüft um %s", "Comprobado a las %s", "Проверено в %s"},
 {"Installed. The redesigned art and the 3D models are selected (Options > Graphics).",
  "Installé. Les graphismes redessinés et les modèles 3D sont sélectionnés (Options > Graphismes).",
  "Installiert. Die neue Grafik und die 3D-Modelle sind ausgewählt (Optionen > Grafik).",

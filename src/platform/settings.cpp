@@ -105,7 +105,7 @@ Settings Settings::load() {
         return s;
     }
     std::string line;
-    bool sawGraphics = false, legacyHq = false, sawShroud = false, sawLighting = false, sawQuality = false, sawCycleDefault = false;
+    bool sawGraphics = false, legacyHq = false, sawShroud = false, sawLighting = false, sawQuality = false, sawCycleDefault = false, sawLimits = false;
     auto toF = [](const std::string& v, float def) {
         try { return std::clamp(std::stof(v), 0.0f, 1.0f); } catch (...) { return def; }
     };
@@ -136,17 +136,25 @@ Settings Settings::load() {
         else if (k == "lighting") { s.lighting = lightingFrom(v); sawLighting = true; }
         else if (k == "cycleDefault") sawCycleDefault = true;
         else if (k == "cyclePhase") s.cyclePhase = std::atof(v.c_str());
+        else if (k == "lastZoom") s.lastZoom = float(std::atof(v.c_str()));
         else if (k == "hdr") s.hdr = v == "on" || v == "1";
         else if (k == "hdrOutput") s.hdrOutput = v == "on" || v == "1";
         else if (k == "msaa") { const int m = toI(v, 4); s.msaa = m >= 4 ? 4 : m >= 2 ? 2 : 1; sawQuality = true; }
+        else if (k == "resolution3d") s.resolution3d = resolution3dFrom(v);
         else if (k == "aniso") { const int a = toI(v, 1); s.aniso = a >= 16 ? 16 : a >= 4 ? 4 : 1; }
         else if (k == "vsync") s.vsync = vsyncFrom(v);
         else if (k == "gpuDriver") s.gpuDriver = v == "vulkan" || v == "direct3d12" ? v : std::string("auto");
         else if (k == "fpsLimit") { const int f = toI(v, 0); s.fpsLimit = f >= 120 ? 120 : f >= 60 ? 60 : f >= 30 ? 30 : 0; }
+        else if (k == "brightness") s.brightness = std::clamp(toI(v, 0), kMinDisplayAdjust, kMaxDisplayAdjust);
+        else if (k == "contrast") s.contrast = std::clamp(toI(v, 0), kMinDisplayAdjust, kMaxDisplayAdjust);
+        else if (k == "gamma") s.gamma = std::clamp(toI(v, 100), kMinGamma, kMaxGamma);
+        else if (k == "saturation") s.saturation = std::clamp(toI(v, 0), kMinDisplayAdjust, kMaxDisplayAdjust);
         else if (k == "effects") s.effects = v == "classic" ? Effects::Classic : Effects::Modern;
+        else if (k == "vehicleAnimation") s.vehicleAnimation = v == "original" ? VehicleAnimation::Original : VehicleAnimation::Modern;
         else if (k == "shroud") { s.shroud = v == "classic" ? Shroud::Classic : Shroud::Soft; sawShroud = true; }
         else if (k == "panelTransparency") s.panelTransparency = panelTransparencyFrom(v);
         else if (k == "healthBars") s.healthBars = v == "always" ? HealthBars::Always : v == "damaged" ? HealthBars::Damaged : HealthBars::Selected;
+        else if (k == "groupNumbers") s.groupNumbers = groupNumbersFrom(v);
         else if (k == "fullscreen") s.fullscreen = v == "1";
         else if (k == "musicVolume") s.musicVolume = toF(v, s.musicVolume);
         else if (k == "soundVolume") s.soundVolume = toF(v, s.soundVolume);
@@ -160,6 +168,8 @@ Settings Settings::load() {
         else if (k == "productionQueue") s.productionQueue = v == "original" ? ProductionQueue::Original : ProductionQueue::Extended;
         else if (k == "cheats") s.cheats = v != "0";
         else if (k == "rallyPoints") s.rallyPoints = v != "0";
+        else if (k == "orderLimit") { s.unlimitedOrders = v == "unlimited"; sawLimits = true; }
+        else if (k == "unitLimit") s.unlimitedUnits = v == "unlimited";
         else if (k == "cutscenes") s.cutscenes = v != "0";
         else if (k == "introOnStartup") s.introOnStartup = v != "0";
         else if (k == "introSeen") s.introSeen = v != "0";
@@ -204,6 +214,10 @@ Settings Settings::load() {
     if (!sawCycleDefault && s.timeOfDay == TimeOfDay::Day &&
         (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD))
         s.timeOfDay = TimeOfDay::Cycle;
+    // The Enhanced / 3D presets lift the order and unit limits (owner 2026-11-14); Original keeps the 1998 ones.
+    // A file from before the limit options that names one of those presets follows them.
+    if (!sawLimits && (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD))
+        s.unlimitedOrders = s.unlimitedUnits = true;
     // The Quality settings came 2026-11-13: a file from before that names the Enhanced / 3D preset
     // gets High (HDR rendering, 4x MSAA, 16x anisotropy) and the EDR output, like a new player.
     if (!sawQuality && (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD)) {
@@ -243,7 +257,8 @@ bool Settings::matchesPreset(GraphicsPreset p) const {
     if (p != GraphicsPreset::Enhanced && p != GraphicsPreset::ThreeD) return false;
     const bool common = presetArt(artPack) && effects == Effects::Modern && shroud == Shroud::Soft &&
                         healthBars == HealthBars::Selected && panelTransparency == PanelTransparency::Off &&
-                        classicView == ClassicView::Hold && timeOfDay == TimeOfDay::Cycle && lighting == Lighting::Modern;
+                        classicView == ClassicView::Hold && timeOfDay == TimeOfDay::Cycle && lighting == Lighting::Modern &&
+                        vehicleAnimation == VehicleAnimation::Modern;
     if (p == GraphicsPreset::Enhanced) return common && graphics == Graphics::Enhanced && terrain2d == Terrain2D::Faithful;
     return common && graphics == Graphics::ThreeD && terrain3d == Terrain3D::Faithful && shadows3d && models3d == Models3D::New;
 }
@@ -259,6 +274,7 @@ Settings::GraphicsPreset Settings::activePreset() const {
 void Settings::applyPreset(GraphicsPreset p) {
     if (p == GraphicsPreset::Original) {
         graphics = Graphics::Original;
+        unlimitedOrders = unlimitedUnits = false;  // the 1998 limits (64-unit orders, 1000 objects per side)
     } else if (p == GraphicsPreset::Enhanced || p == GraphicsPreset::ThreeD) {
         graphics = p == GraphicsPreset::ThreeD ? Graphics::ThreeD : Graphics::Enhanced;
         // A redesign pack the player chose stays; otherwise the installed redesign (the presets' look, as the
@@ -274,7 +290,9 @@ void Settings::applyPreset(GraphicsPreset p) {
         panelTransparency = PanelTransparency::Off;
         classicView = ClassicView::Hold;
         timeOfDay = TimeOfDay::Cycle;  // the day / night cycle (owner 2026-11-13)
+        unlimitedOrders = unlimitedUnits = true;  // no 64-unit order cap / 1000-object pool (owner 2026-11-14)
         lighting = Lighting::Modern;
+        vehicleAnimation = VehicleAnimation::Modern;
         applyQuality(Quality::High);
         if (p == GraphicsPreset::ThreeD) {
             terrain3d = Terrain3D::Faithful;
@@ -289,7 +307,7 @@ void Settings::applyPreset(GraphicsPreset p) {
 
 Settings::PresetValues Settings::presetValues() const {
     return {graphics, artPack, terrain2d, terrain3d, shadows3d, effects, shroud, healthBars, panelTransparency, classicView,
-            timeOfDay, lighting};
+            timeOfDay, lighting, vehicleAnimation};
 }
 
 void Settings::applyQuality(Quality q) {
@@ -355,17 +373,25 @@ bool Settings::save() const {
         << "timeOfDay=" << timeOfDayName(timeOfDay) << "\n"
         << "cycleDefault=1\n"
         << "cyclePhase=" << cyclePhase << "\n"
+        << "lastZoom=" << lastZoom << "\n"
         << "lighting=" << lightingName(lighting) << "\n"
         << "hdr=" << (hdr ? "on" : "off") << "\n"
         << "hdrOutput=" << (hdrOutput ? "on" : "off") << "\n"
         << "msaa=" << msaa << "\n"
         << "aniso=" << aniso << "\n"
+        << "resolution3d=" << (resolution3d > 0 ? std::to_string(resolution3d) : std::string("auto")) << "\n"
         << "vsync=" << vsyncName(vsync) << "\n"
         << "gpuDriver=" << gpuDriver << "\n"
         << "fpsLimit=" << fpsLimit << "\n"
+        << "brightness=" << brightness << "\n"
+        << "contrast=" << contrast << "\n"
+        << "gamma=" << gamma << "\n"
+        << "saturation=" << saturation << "\n"
         << "effects=" << effectsName(effects) << "\n"
+        << "vehicleAnimation=" << (vehicleAnimation == VehicleAnimation::Original ? "original" : "modern") << "\n"
         << "shroud=" << shroudName(shroud) << "\n"
         << "healthBars=" << healthBarsName(healthBars) << "\n"
+        << "groupNumbers=" << groupNumbersName(groupNumbers) << "\n"
         << "panelTransparency=" << panelTransparencyName(panelTransparency) << "\n"
         << "fullscreen=" << (fullscreen ? 1 : 0) << "\n"
         << "musicVolume=" << musicVolume << "\n"
@@ -380,6 +406,8 @@ bool Settings::save() const {
         << "productionQueue=" << (extendedQueue() ? "extended" : "original") << "\n"
         << "cheats=" << (cheats ? 1 : 0) << "\n"
         << "rallyPoints=" << (rallyPoints ? 1 : 0) << "\n"
+        << "orderLimit=" << (unlimitedOrders ? "unlimited" : "original") << "\n"
+        << "unitLimit=" << (unlimitedUnits ? "unlimited" : "original") << "\n"
         << "cutscenes=" << (cutscenes ? 1 : 0) << "\n"
         << "introOnStartup=" << (introOnStartup ? 1 : 0) << "\n"
         << "introSeen=" << (introSeen ? 1 : 0) << "\n"

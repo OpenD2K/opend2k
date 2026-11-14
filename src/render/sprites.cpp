@@ -1,6 +1,7 @@
 #include "render/sprites.hpp"
 
 #include "render/art_pack.hpp"
+#include "render/frame_probe.hpp"
 #include "render/upscale.hpp"
 
 #include <SDL3/SDL.h>
@@ -8,6 +9,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace d2k::render {
@@ -54,6 +60,24 @@ std::uint32_t maskValue(const ArtImage& m, int x, int y, int w, int h) {
 
 }  // namespace
 
+// Worker threads preparing queued frames (setPrefetchGroups).
+struct SpriteCache::Async {
+    struct Job {
+        long long key;
+        int frame, house;
+        bool grey;
+    };
+    std::mutex m;
+    std::condition_variable work, done;
+    std::deque<Job> queue;
+    std::unordered_set<long long> queued;  // in the queue
+    std::unordered_set<long long> running;
+    std::unordered_map<long long, std::pair<int, Prepared>> ready;  // key -> (frame, pixels)
+    std::vector<std::thread> threads;
+    std::uint64_t gen = 0;
+    bool stop = false;
+};
+
 const Sprite::Level& Sprite::level(float zoom) const {
     for (const auto& l : levels)
         if (l.scale <= 2.0f * zoom + 1e-3f) return l;
@@ -64,9 +88,30 @@ SpriteCache::SpriteCache(SDL_Renderer* renderer, const formats::R16File& file,
                          const formats::HouseColours& colours)
     : renderer_(renderer), file_(file), colours_(colours) {}
 
-SpriteCache::~SpriteCache() { clear(); }
+SpriteCache::~SpriteCache() {
+    if (std::getenv("D2K_SPRITE_LOG") && !cache_.empty()) {
+        std::size_t bytes = 0;
+        for (auto& [key, sp] : cache_)
+            for (auto& l : sp.levels)
+                for (SDL_Texture* t : {l.texture, l.shadow, l.glow})
+                    if (t) bytes += std::size_t(t->w) * std::size_t(t->h) * 4;
+        SDL_Log("sprite cache: %zu sprites, %.0f MB of textures (peak %.0f MB, budget %s, %llu evicted)", cache_.size(),
+                double(bytes) / (1 << 20), double(peakBytes_) / (1 << 20),
+                budget_ ? (std::to_string(budget_ >> 20) + " MB").c_str() : "none", (unsigned long long)evicted_);
+    }
+    stopAsync();
+    clear();
+}
 
 void SpriteCache::clear() {
+    if (async_) {  // queued / prepared frames are of the old art; wait for the running ones (they read the pack)
+        std::unique_lock<std::mutex> l(async_->m);
+        ++async_->gen;
+        async_->queue.clear();
+        async_->queued.clear();
+        async_->ready.clear();
+        async_->done.wait(l, [&] { return async_->running.empty(); });
+    }
     for (auto& [key, s] : cache_)
         for (auto& l : s.levels) {
             if (l.texture) SDL_DestroyTexture(l.texture);
@@ -74,6 +119,7 @@ void SpriteCache::clear() {
             if (l.glow) SDL_DestroyTexture(l.glow);
         }
     cache_.clear();
+    bytes_ = 0;
     for (auto& [key, s] : subCache_)
         for (auto& l : s.levels)
             if (l.texture) SDL_DestroyTexture(l.texture);
@@ -83,14 +129,14 @@ void SpriteCache::clear() {
 
 void SpriteCache::setHq(bool hq) {
     if (hq == hq_) return;
+    clear();  // rebuilt lazily at the new resolution (first: workers read hq_ / pack_)
     hq_ = hq;
-    clear();  // rebuilt lazily at the new resolution
 }
 
 void SpriteCache::setArtPack(const ArtPack* pack) {
     if (pack == pack_) return;
-    pack_ = pack;
     clear();
+    pack_ = pack;
 }
 
 void SpriteCache::upload(Sprite& s, std::vector<formats::Rgba>& px, std::vector<formats::Rgba>& shadow, int tw, int th,
@@ -129,7 +175,7 @@ void SpriteCache::upload(Sprite& s, std::vector<formats::Rgba>& px, std::vector<
 
 // Art-pack frame: base RGBA, house tint (mask from the pack, or derived from the original frame's
 // house pixels), shadow mask (from the pack, or derived from the original's index-1 pixels).
-bool SpriteCache::buildFromPack(Sprite& s, const formats::R16Frame& f, int frameIndex, int house, bool grey) {
+bool SpriteCache::prepareFromPack(Prepared& s, const formats::R16Frame& f, int frameIndex, int house, bool grey) const {
     ArtImage base, houseMask, shadowMask;
     if (!pack_->loadFrame(frameIndex, base, houseMask, shadowMask)) return false;
     const int w = base.w, h = base.h;
@@ -190,14 +236,14 @@ bool SpriteCache::buildFromPack(Sprite& s, const formats::R16Frame& f, int frame
             c = (c & 0xFF000000u) | v << 16 | v << 8 | v;
         }
     if (ownHotspot) {
-        formats::R16Frame& hd = packHeaders_[frameIndex];
+        formats::R16Frame& hd = s.header;
         hd.type = 1;
         hd.bpp = f.empty() ? 8 : f.bpp;
         hd.width = hd.frameWidth = std::max(1, int(std::lround(float(w) / scale)));
         hd.height = hd.frameHeight = std::max(1, int(std::lround(float(h) / scale)));
         hd.x = int(std::lround(float(hx) / scale));
         hd.y = int(std::lround(float(hy) / scale));
-        s.frame = &hd;
+        s.ownHeader = true;
     }
     s.width = f.empty() || ownHotspot ? int(float(w) / scale) : f.width;
     s.height = f.empty() || ownHotspot ? int(float(h) / scale) : f.height;
@@ -205,6 +251,22 @@ bool SpriteCache::buildFromPack(Sprite& s, const formats::R16Frame& f, int frame
     s.drawH = float(h) / scale;
     s.fromPack = true;
     s.rendered3d = ownHotspot;
+    {  // the opaque bounds (alpha > 1/2)
+        int top = h, bottom = -1, left = w, right = -1;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                if ((px[static_cast<std::size_t>(y) * w + x] >> 24) > 127) {
+                    top = std::min(top, y);
+                    bottom = y;
+                    left = std::min(left, x);
+                    right = std::max(right, x);
+                }
+        const bool any = bottom >= 0;
+        s.opaqueTop = any ? float(top) / scale : 0;
+        s.opaqueBottom = any ? float(bottom + 1) / scale : s.drawH;
+        s.opaqueLeft = any ? float(left) / scale : 0;
+        s.opaqueRight = any ? float(right + 1) / scale : s.drawW;
+    }
     // The emission layer (docs/enhanced-graphics.md "Emission"): premultiplied, drawn additively (ADD x alpha).
     std::vector<formats::Rgba> glow;
     ArtImage glowImg;
@@ -217,24 +279,45 @@ bool SpriteCache::buildFromPack(Sprite& s, const formats::R16Frame& f, int frame
             for (auto& c : glow) c = (c & 0xFFFFFFu) ? (c | 0xFF000000u) : 0u;  // rgb = emission, opaque where any
         }
     }
-    upload(s, px, shadow, w, h, scale, true, &glow);
-    return s.texture != nullptr;
+    mips(s, px, shadow, &glow, w, h, scale, true);
+    return true;
 }
 
-const Sprite* SpriteCache::get(int frameIndex, int house, bool grey) {
-    if (frameIndex < 0 || frameIndex >= frameCount()) return nullptr;
-    const long long key = (static_cast<long long>(frameIndex) * 16 + (house + 1)) * 2 + (grey ? 1 : 0);
-    if (auto it = cache_.find(key); it != cache_.end()) return it->second.texture ? &it->second : nullptr;
-
-    Sprite s;
-    const auto& f = file_.frames[frameIndex];
-    s.frame = &f;
-    if (pack_ && pack_->hasFrame(frameIndex) && buildFromPack(s, f, frameIndex, house, grey)) {
-        auto [it, _] = cache_.emplace(key, std::move(s));
-        return &it->second;
+// The level chain upload() makes, as pixels.
+void SpriteCache::mips(Prepared& p, std::vector<formats::Rgba>& px, std::vector<formats::Rgba>& shadow,
+                       std::vector<formats::Rgba>* glow, int tw, int th, float scale, bool linear) {
+    p.linear = linear;
+    int w = tw, h = th;
+    float sc = scale;
+    while (true) {
+        Prepared::Lvl l;
+        l.w = w;
+        l.h = h;
+        l.scale = sc;
+        l.px = px;
+        l.shadow = shadow;
+        if (glow) l.glow = *glow;
+        p.levels.push_back(std::move(l));
+        // Mips only for smoothed textures above 1 texel per world pixel.
+        if (!linear || sc <= 1.01f || w < 4 || h < 4) break;
+        int nw = 0, nh = 0;
+        px = downsample2(px, w, h, nw, nh);
+        if (!shadow.empty()) shadow = downsample2(shadow, w, h, nw, nh);
+        if (glow && !glow->empty()) *glow = downsample2(*glow, w, h, nw, nh);
+        w = nw;
+        h = nh;
+        sc *= 0.5f;
     }
-    s = Sprite{};
-    s.frame = &f;
+}
+
+SpriteCache::Prepared SpriteCache::prepare(int frameIndex, int house, bool grey) const {
+    Prepared s;
+    const auto& f = file_.frames[frameIndex];
+    if (pack_ && pack_->hasFrame(frameIndex) && prepareFromPack(s, f, frameIndex, house, grey)) {
+        s.ok = true;
+        return s;
+    }
+    s = Prepared{};
     if (!f.empty()) {
         s.width = f.width;
         s.height = f.height;
@@ -271,10 +354,230 @@ const Sprite* SpriteCache::get(int frameIndex, int house, bool grey) {
             px = scale4x(px, f.width, f.height);
             if (!shadow.empty()) shadow = scale4x(shadow, f.width, f.height);
         }
-        upload(s, px, shadow, f.width * k, f.height * k, float(k), hq_);
+        mips(s, px, shadow, nullptr, f.width * k, f.height * k, float(k), hq_);
+        s.ok = true;
     }
+    return s;
+}
+
+const Sprite* SpriteCache::finish(long long key, int frameIndex, Prepared& p) {
+    Sprite s;
+    s.frame = &file_.frames[frameIndex];
+    if (p.ok) {
+        s.width = p.width;
+        s.height = p.height;
+        s.drawW = p.drawW;
+        s.drawH = p.drawH;
+        s.fromPack = p.fromPack;
+        s.rendered3d = p.rendered3d;
+        s.opaqueTop = p.opaqueTop;
+        s.opaqueBottom = p.opaqueBottom;
+        s.opaqueLeft = p.opaqueLeft;
+        s.opaqueRight = p.opaqueRight;
+        if (p.ownHeader) {
+            formats::R16Frame& hd = packHeaders_[frameIndex];
+            hd = p.header;
+            s.frame = &hd;
+        }
+        const SDL_ScaleMode mode = p.linear ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST;
+        auto make = [&](const std::vector<formats::Rgba>& data, int w, int h, SDL_BlendMode blend) -> SDL_Texture* {
+            SDL_Texture* t = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);
+            if (!t) return nullptr;
+            SDL_UpdateTexture(t, nullptr, data.data(), w * 4);
+            SDL_SetTextureBlendMode(t, blend);
+            SDL_SetTextureScaleMode(t, mode);
+            return t;
+        };
+        for (const Prepared::Lvl& lv : p.levels) {
+            Sprite::Level l;
+            l.scale = lv.scale;
+            l.texture = make(lv.px, lv.w, lv.h, SDL_BLENDMODE_BLEND);
+            if (!lv.shadow.empty()) l.shadow = make(lv.shadow, lv.w, lv.h, SDL_BLENDMODE_MOD);
+            if (!lv.glow.empty()) l.glow = make(lv.glow, lv.w, lv.h, SDL_BLENDMODE_ADD);
+            s.levels.push_back(l);
+        }
+        if (!s.levels.empty()) {
+            s.texture = s.levels.front().texture;
+            s.shadow = s.levels.front().shadow;
+        }
+        for (const Sprite::Level& l : s.levels)
+            for (SDL_Texture* t : {l.texture, l.shadow, l.glow})
+                if (t) s.bytes += std::size_t(t->w) * std::size_t(t->h) * 4;
+        bytes_ += s.bytes;
+        peakBytes_ = std::max(peakBytes_, bytes_);
+    }
+    s.lastUsed = frame_;
     auto [it, _] = cache_.emplace(key, std::move(s));
     return it->second.texture ? &it->second : nullptr;
+}
+
+void SpriteCache::stopAsync() {
+    if (!async_) return;
+    {
+        std::lock_guard<std::mutex> l(async_->m);
+        async_->stop = true;
+    }
+    async_->work.notify_all();
+    for (auto& t : async_->threads) t.join();
+    async_.reset();
+}
+
+void SpriteCache::setPrefetchGroups(std::vector<int> groupStarts) {
+    std::sort(groupStarts.begin(), groupStarts.end());
+    groupStarts.erase(std::unique(groupStarts.begin(), groupStarts.end()), groupStarts.end());
+    groupStarts_ = std::move(groupStarts);
+    if (groupStarts_.empty() || async_) return;
+    async_ = std::make_unique<Async>();
+    const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
+    const unsigned n = std::clamp(hw / 3, 1u, 3u);
+    for (unsigned i = 0; i < n; ++i)
+        async_->threads.emplace_back([this] {
+            Async& a = *async_;
+            std::unique_lock<std::mutex> l(a.m);
+            while (true) {
+                a.work.wait(l, [&] { return a.stop || !a.queue.empty(); });
+                if (a.stop) return;
+                const Async::Job j = a.queue.front();
+                a.queue.pop_front();
+                a.queued.erase(j.key);
+                a.running.insert(j.key);
+                const std::uint64_t gen = a.gen;
+                l.unlock();
+                Prepared p = prepare(j.frame, j.house, j.grey);
+                l.lock();
+                a.running.erase(j.key);
+                if (gen == a.gen) a.ready.emplace(j.key, std::make_pair(j.frame, std::move(p)));
+                a.done.notify_all();
+            }
+        });
+}
+
+void SpriteCache::prefetch(int frameIndex, int house, int radius) {
+    if (!async_ || (!pack_ && !hq_) || frameIndex < 0 || frameIndex >= frameCount()) return;
+    auto it = std::upper_bound(groupStarts_.begin(), groupStarts_.end(), frameIndex);
+    if (it == groupStarts_.begin()) return;
+    // The neighbours inside the art group (the next / previous facings of a turning hull or
+    // turret, the next frames of an animation), nearest first; not the whole group: a group can
+    // be hundreds of frames (all facings x all animation frames), most never drawn.
+    const int first = *(it - 1);
+    const int end = std::min(it == groupStarts_.end() ? frameCount() : *it, frameCount());
+    std::lock_guard<std::mutex> l(async_->m);
+    bool any = false;
+    for (int d = radius; d >= 0; --d)
+        for (const int f : {frameIndex - d, frameIndex + d}) {
+            if (f < first || f >= end || (d == 0 && f != frameIndex)) continue;
+            const long long key = (static_cast<long long>(f) * 16 + (house + 1)) * 2;
+            if (cache_.count(key) || async_->running.count(key) || async_->ready.count(key)) continue;
+            if (file_.frames[std::size_t(f)].empty() && !(pack_ && pack_->hasFrame(f))) continue;
+            if (async_->queued.count(key))  // queued already: move it to the front
+                for (auto q = async_->queue.begin(); q != async_->queue.end(); ++q)
+                    if (q->key == key) {
+                        async_->queue.erase(q);
+                        break;
+                    }
+            async_->queue.push_front({key, f, house, false});
+            async_->queued.insert(key);
+            any = true;
+        }
+    // Keep the queue short: what was wanted long ago (the view moved on) is dropped.
+    while (async_->queue.size() > 512) {
+        async_->queued.erase(async_->queue.back().key);
+        async_->queue.pop_back();
+    }
+    if (any) async_->work.notify_all();
+}
+
+void SpriteCache::setMemoryBudget(std::size_t bytes, int prefetchRadius) {
+    budget_ = bytes;
+    radius_ = std::clamp(prefetchRadius, 0, kNeighbours);
+}
+
+void SpriteCache::evict() {
+    std::vector<std::pair<std::uint64_t, long long>> old;
+    for (const auto& [key, sp] : cache_)
+        if (sp.lastUsed + 2 < frame_ && sp.bytes) old.emplace_back(sp.lastUsed, key);
+    std::sort(old.begin(), old.end());
+    const std::size_t target = budget_ / 10 * 9;
+    for (const auto& [used, key] : old) {
+        if (bytes_ <= target) break;
+        auto it = cache_.find(key);
+        for (auto& l : it->second.levels)
+            for (SDL_Texture* t : {l.texture, l.shadow, l.glow})
+                if (t) SDL_DestroyTexture(t);
+        bytes_ -= it->second.bytes;
+        cache_.erase(it);
+        ++evicted_;
+    }
+}
+
+void SpriteCache::pump(double budgetMs) {
+    ++frame_;
+    if (budget_ && bytes_ > budget_) {
+        FrameProbe::Scope probe("spriteEvict");
+        evict();
+    }
+    if (!async_) return;
+    const Uint64 t0 = SDL_GetTicksNS(), budget = Uint64(budgetMs * 1e6);
+    while (SDL_GetTicksNS() - t0 < budget) {
+        long long key = 0;
+        std::pair<int, Prepared> item;
+        {
+            std::lock_guard<std::mutex> l(async_->m);
+            if (async_->ready.empty()) return;
+            auto it = async_->ready.begin();
+            key = it->first;
+            item = std::move(it->second);
+            async_->ready.erase(it);
+        }
+        const Uint64 f0 = SDL_GetTicksNS();
+        if (!cache_.count(key)) finish(key, item.first, item.second);
+        static const bool logLoads = std::getenv("D2K_SPRITE_LOG") != nullptr;
+        if (logLoads && SDL_GetTicksNS() - f0 > 2000000)
+            SDL_Log("sprite: upload of frame %d (%d levels, %dx%d) took %.2f ms", item.first, int(item.second.levels.size()),
+                    item.second.levels.empty() ? 0 : item.second.levels[0].w, item.second.levels.empty() ? 0 : item.second.levels[0].h,
+                    double(SDL_GetTicksNS() - f0) / 1e6);
+    }
+}
+
+const Sprite* SpriteCache::get(int frameIndex, int house, bool grey) {
+    if (frameIndex < 0 || frameIndex >= frameCount()) return nullptr;
+    const long long key = (static_cast<long long>(frameIndex) * 16 + (house + 1)) * 2 + (grey ? 1 : 0);
+    if (auto it = cache_.find(key); it != cache_.end()) {
+        it->second.lastUsed = frame_;
+        return it->second.texture ? &it->second : nullptr;
+    }
+    FrameProbe::Scope probe("spriteLoad");
+    if (async_) {
+        std::unique_lock<std::mutex> l(async_->m);
+        // Being prepared: wait for it (sooner than starting over); queued: take it out, build it now.
+        if (async_->running.count(key)) {
+            FrameProbe::Scope w("spriteWait");
+            async_->done.wait(l, [&] { return !async_->running.count(key); });
+        }
+        if (auto it = async_->ready.find(key); it != async_->ready.end()) {
+            Prepared p = std::move(it->second.second);
+            async_->ready.erase(it);
+            l.unlock();
+            const Sprite* s = finish(key, frameIndex, p);
+            prefetch(frameIndex, house, radius_);
+            return s;
+        }
+        if (async_->queued.erase(key))
+            for (auto q = async_->queue.begin(); q != async_->queue.end(); ++q)
+                if (q->key == key) {
+                    async_->queue.erase(q);
+                    break;
+                }
+    }
+    if (FrameProbe::get().on) {
+        FrameProbe::get().add("syncLoads", 1000000);  // a count (1 "ms" each)
+        static const bool logLoads = std::getenv("D2K_SPRITE_LOG") != nullptr;
+        if (logLoads) SDL_Log("sprite: sync build of frame %d house %d%s", frameIndex, house, grey ? " grey" : "");
+    }
+    Prepared p = prepare(frameIndex, house, grey);
+    const Sprite* s = finish(key, frameIndex, p);
+    if (!grey) prefetch(frameIndex, house, radius_);
+    return s;
 }
 
 const Sprite* SpriteCache::getIntensity(int frameIndex) {

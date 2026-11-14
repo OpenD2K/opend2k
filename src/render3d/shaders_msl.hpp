@@ -62,7 +62,7 @@ float shadowPCF(depth2d<float> sm, sampler ss, float3 lp, float4 sh) {
     return s / 9.0;
 }
 
-fragment float4 terrain_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]],
+fragment float4 terrain_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]], const device uint4* plg [[buffer(2)]],
                            texture2d_array<float> tiles [[texture(0)]],
                            texture2d<float> tileMap [[texture(1)]],
                            texture2d<float> shroud [[texture(2)]],
@@ -82,7 +82,7 @@ fragment float4 terrain_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], c
     const float sm = u.shadow.x > 0.5 ? shadowPCF(shadowMap, shadowSamp, (u.lightVP * float4(in.wpos, 1.0)).xyz, u.shadow) : in.sun;
     const float vis = mix(u.light.w, 1.0, sm);
     const float3 shade = sunAmb(pl, u.light.x, u.light.y * ndl * vis) * u.light.z;
-    float3 rgb = satur(pl, c.rgb) * shade + c.rgb * pointLights(pl, in.wpos, n, 0.3);
+    float3 rgb = satur(pl, c.rgb) * shade + c.rgb * pointLights(pl, plg, in.wpos, n, 0.3);
     // Darkness: the shroud mask, and a thin fade into the black beyond the map edge. The haze
     // is darkened too, so shrouded ground stays black at any distance.
     float s = 0.0;
@@ -161,7 +161,7 @@ float shadowPCF(depth2d<float> sm, sampler ss, float3 lp, float4 sh) {
     return s / 9.0;
 }
 
-fragment float4 sprite_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]],
+fragment float4 sprite_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]], const device uint4* plg [[buffer(2)]],
                           texture2d<float> tex [[texture(0)]], texture2d<float> shroud [[texture(1)]],
                           depth2d<float> shadowMap [[texture(2)]],
                           sampler texSamp [[sampler(0)]], sampler shroudSamp [[sampler(1)]],
@@ -182,7 +182,7 @@ fragment float4 sprite_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], co
         if (u.shadow.x > 0.5) c.rgb *= mix(u.shadow.z, 1.0, shadowPCF(shadowMap, shadowSamp, in.lpos, u.shadow));
         c.rgb = satur(pl, c.rgb) * pl.spriteTint.rgb;
         // Dynamic lights (explosions, muzzle flashes, fires, lamps) on units, buildings and smoke.
-        c.rgb += alb * pointLights(pl, in.wpos, float3(0.0, 1.0, 0.0), 0.8);
+        c.rgb += alb * pointLights(pl, plg, in.wpos, float3(0.0, 1.0, 0.0), 0.8);
         c.rgb = mix(c.rgb, u.fogColor.rgb, in.fog) * (1.0 - dark);
     } else if (u.mode.x < 1.5) {
         c.rgb *= (1.0 - dark) * (1.0 - in.fog);
@@ -206,8 +206,9 @@ struct TmIn {
     float2 uv [[user(locn1)]];
 };
 // a = (exposure, peak, knee, bloom strength), b = (bloom uv scale x, y, input linear, output linear),
-// c = (highlight desaturation, -, -, -)
-struct TmU { float4 a; float4 b; float4 c; };
+// c = (highlight desaturation, display adjustments on, -, -),
+// d = display adjustments (brightness -0.5..0.5, contrast -0.5..0.5, gamma 0.8..1.4, saturation -0.5..0.5)
+struct TmU { float4 a; float4 b; float4 c; float4 d; };
 static float3 toLin(float3 c) {
     c = max(c, float3(0.0));
     return select(pow((c + 0.055) / 1.055, float3(2.4)), c / 12.92, c <= float3(0.04045));
@@ -215,6 +216,23 @@ static float3 toLin(float3 c) {
 static float3 toSrgb(float3 c) {
     c = max(c, float3(0.0));
     return select(1.055 * pow(c, float3(1.0 / 2.4)) - 0.055, c * 12.92, c <= float3(0.0031308));
+}
+// Display adjustments (Options -> Display; render/hdr.hpp DisplayAdjust), on linear light: saturation
+// around the luminance, then gamma / contrast / brightness on the sRGB-coded value. 0 and 1 stay fixed
+// (nothing clips); EDR values above 1 keep their distance above SDR white.
+static float3 displayAdjust(float3 c, float4 d) {
+    const float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    c = max(float3(y) + (c - float3(y)) * (1.0 + d.w), float3(0.0));
+    const float3 over = max(c - float3(1.0), float3(0.0));
+    float3 e = toSrgb(min(c, float3(1.0)));
+    e = pow(e, float3(1.0 / d.z));
+    // contrast: a symmetric power curve around mid grey (p < 1 lifts the shadows and lowers the highlights)
+    const float p = d.y >= 0.0 ? 1.0 + 2.0 * d.y : 1.0 / (1.0 - 2.0 * d.y);
+    const float3 lo = 0.5 * pow(2.0 * e, float3(p)), hi = 1.0 - 0.5 * pow(2.0 * (1.0 - e), float3(p));
+    e = select(hi, lo, e < float3(0.5));
+    // brightness: lifts towards white (keeps white) or scales towards black (keeps black)
+    e = d.x >= 0.0 ? e + d.x * (1.0 - e) : e * (1.0 + d.x);
+    return toLin(e) + over;
 }
 fragment float4 tonemap_fs(TmIn in [[stage_in]], constant TmU& u [[buffer(0)]], texture2d<float> scene [[texture(0)]],
                            sampler sceneSamp [[sampler(0)]], texture2d<float> bloom [[texture(1)]],
@@ -227,7 +245,10 @@ fragment float4 tonemap_fs(TmIn in [[stage_in]], constant TmU& u [[buffer(0)]], 
     c *= u.a.x;
     // Hue-preserving filmic shoulder: identity up to the knee, then an exponential roll-off that
     // approaches the peak (1 = SDR white; the display's headroom with EDR output). Very hot
-    // pixels drift towards white (fire cores, flashes), as film does.
+    // pixels drift towards white (fire cores, flashes), as film does: towards the same shoulder
+    // per channel, so the brightest channel saturates first and the others catch up (fire:
+    // orange -> yellow -> white). Drifting towards the grey max instead passed red-orange
+    // through salmon pink (fires read pink / purple).
     const float m = max(c.r, max(c.g, c.b));
     const float knee = u.a.z, peak = u.a.y, room = peak - knee;
     if (m > knee) {
@@ -237,9 +258,11 @@ fragment float4 tonemap_fs(TmIn in [[stage_in]], constant TmU& u [[buffer(0)]], 
             const float mm = knee + room * (1.0 - exp(-(m - knee) / room));
             const float3 t = c * (mm / m);
             const float w = clamp((m - peak) / (3.0 * peak), 0.0, 1.0) * u.c.x;
-            c = mix(t, float3(mm), w);
+            const float3 pc = min(c, float3(knee)) + room * (1.0 - exp(-max(c - knee, float3(0.0)) / room));
+            c = mix(t, pc, w);
         }
     }
+    if (u.c.y > 0.5) c = displayAdjust(c, u.d);
     return float4(u.b.w > 0.5 ? c : toSrgb(c), 1.0);
 }
 )MSL";

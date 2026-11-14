@@ -42,7 +42,7 @@ RoundTripReport saveRoundTrip(const WorldFactory& make, int preTicks, int postTi
             rep.error = "world section in the file differs from saveWorldState";
             return rep;
         }
-        loadWorldState(*b, section);
+        loadWorldState(*b, section, back.version);
     } catch (const SaveError& e) {
         rep.error = std::string("load failed: ") + e.what();
         return rep;

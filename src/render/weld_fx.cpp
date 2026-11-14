@@ -60,6 +60,40 @@ bool weldFlash(const game::World& w, const game::Building& b, const formats::Tem
     return true;
 }
 
+bool workLamps(const game::World& w, const game::Building& b, const formats::Templates& t, int anchors, float* a) {
+    if (anchors <= 0 || !b.alive || b.state == 17 || b.type < 0 || b.type >= formats::kMaxBuildingTypes) return false;
+    const std::uint32_t f = b.flags;
+    if ((f & 0x6) || !(f & 0x30)) return false;  // build-up / selling; not working
+    if (b.health * 2 < static_cast<std::int32_t>(t.bin.buildings[b.type].hitPoints)) return false;
+    const int n = std::min(anchors, kMaxWorkLamps);
+    // The chase steps every 4 ticks; each building starts at its own lamp (index hash).
+    const std::uint32_t step = w.gameTicks() / 4u + mix(std::uint32_t(b.side) * 131u + std::uint32_t(b.index)) % 64u;
+    const int lit = int(step % std::uint32_t(n));
+    for (int k = 0; k < n; ++k) a[k] = k == lit ? 1.0f : k == (lit + n - 1) % n ? 0.35f : 0.0f;
+    if (n == 1) a[0] = (w.gameTicks() / 6u) & 1u ? 1.0f : 0.2f;  // a single lamp blinks
+    return true;
+}
+
+bool launchFlame(const game::World& w, const game::Building& b, const formats::Templates& t, float& a, float& size) {
+    if (!b.alive || b.state == 17 || b.type < 0 || b.type >= formats::kMaxBuildingTypes) return false;
+    const std::uint32_t f = b.flags;
+    if ((f & 0x6) || !(f & 0x30) || !(f & 0x40)) return false;
+    const auto& bt = t.bin.buildings[b.type];
+    if (b.health * 2 < static_cast<std::int32_t>(bt.hitPoints)) return false;
+    const int an = bt.buildingAnimation;
+    if (an >= formats::kMaxBuildingTypes) return false;
+    const int frames = int(t.bin.buildingAnimationFrames[an]);
+    const int k = b.animCounter / std::max(1, int(t.bin.buildings[an].animationSpeed));
+    if (frames <= 0 || k >= frames) return false;
+    const float p = (float(k) + 0.5f) / float(frames);
+    // Ignition in the first quarter, full burn, dying down in the last third.
+    const float env = p < 0.25f ? p / 0.25f : p > 0.67f ? std::max(0.0f, (1.0f - p) / 0.33f) : 1.0f;
+    const std::uint32_t h = mix(std::uint32_t(b.side) * 977u + std::uint32_t(b.index) * 31u + w.gameTicks() * 0x9e3779b9u);
+    a = env * (0.75f + 0.25f * float(h & 255u) / 255.0f);
+    size = 0.6f + 0.7f * env + 0.15f * float((h >> 8) & 255u) / 255.0f;
+    return a > 0.01f;
+}
+
 SDL_Texture* makeWeldGlowTexture(SDL_Renderer* r) {
     constexpr int N = 64;
     std::vector<std::uint32_t> px(std::size_t(N) * N);
@@ -88,7 +122,12 @@ void PackAnchors::load(const ArtPack* pack, const formats::Templates& t) {
         float scale = 1, yawDeg = 0, y = 0;
         std::vector<Point> pts;  // glb coordinates (x east, y up, z south; tiles) in dx / z / dy
         std::vector<Point> lights;  // fx_light* (vehicles), the same layout
+        std::vector<Point> muzzles;  // fx_muzzle* (vehicles), the same layout
+        std::vector<std::uint8_t> muzzleTurret;  // per muzzle: "turret" (turns with the turret)
+        float pivot[3] = {0, 0, 0};  // turret_pivot (glb axes)
         float dy2d = 0;  // vehicles: px the rendered frames draw the model origin below the unit position
+        bool overlayOff = false, overlayKeep = false;  // buildings: overlay = off | keep
+        std::uint8_t glow = 0;                       // glow = blink (1) | pulse (2)
     };
     std::map<std::string, Section> secs;
     {
@@ -113,10 +152,24 @@ void PackAnchors::load(const ArtPack* pack, const formats::Templates& t) {
             else if (k == "yaw") s.yawDeg = std::strtof(val.c_str(), nullptr);
             else if (k == "y") s.y = std::strtof(val.c_str(), nullptr);
             else if (k == "anchor2d_dy") s.dy2d = std::strtof(val.c_str(), nullptr);
-            else if (k.rfind("anchor.fx_weld", 0) == 0) {
+            else if (k == "overlay") s.overlayOff = val == "off" || val == "0", s.overlayKeep = val == "keep";
+            else if (k == "glow") s.glow = val == "blink" ? 1 : val == "pulse" ? 2 : 0;
+            else if (k.rfind("anchor.fx_weld", 0) == 0 || k.rfind("anchor.fx_landing", 0) == 0 ||
+                     k.rfind("anchor.fx_work", 0) == 0 || k.rfind("anchor.fx_launch", 0) == 0) {
                 Point p;
                 p.name = k.substr(7);
                 if (std::sscanf(val.c_str(), "%f %f %f %f", &p.dx, &p.z, &p.dy, &p.size) >= 3) s.pts.push_back(p);
+            } else if (k == "turret_pivot") {
+                std::sscanf(val.c_str(), "%f %f %f", &s.pivot[0], &s.pivot[1], &s.pivot[2]);
+            } else if (k.rfind("anchor.fx_muzzle", 0) == 0) {
+                Point p;
+                p.name = k.substr(7);
+                char flag[16] = {};
+                const int n = std::sscanf(val.c_str(), "%f %f %f %f %15s", &p.dx, &p.z, &p.dy, &p.size, flag);
+                if (n >= 3) {
+                    s.muzzles.push_back(p);
+                    s.muzzleTurret.push_back(n >= 5 && std::string(flag) == "turret");
+                }
             } else if (k.rfind("anchor.fx_light", 0) == 0) {
                 Point p;
                 p.name = k.substr(7);
@@ -126,16 +179,30 @@ void PackAnchors::load(const ArtPack* pack, const formats::Templates& t) {
     }
     const float e = 45.0f * 3.14159265f / 180.0f, se = std::sin(e), ce = std::cos(e);
     types_.resize(std::size_t(formats::kMaxBuildingTypes));
-    bool any = false;
+    overlayOff_.assign(std::size_t(formats::kMaxBuildingTypes), 0);
+    glowBlink_.assign(std::size_t(formats::kMaxBuildingTypes), 0);
+    overlayKeep_.assign(std::size_t(formats::kMaxBuildingTypes), 0);
+    bool any = false, anyFlag = false;
     for (int i = 0; i < int(t.bin.buildingCount) && i < formats::kMaxBuildingTypes; ++i) {
         std::string key(t.bin.buildingNames[i], strnlen(t.bin.buildingNames[i], sizeof t.bin.buildingNames[i]));
         for (char& c : key) c = c == ' ' ? '_' : char(std::toupper(static_cast<unsigned char>(c)));
-        const auto it = secs.find(key);
-        if (it == secs.end() || it->second.pts.empty()) continue;
         const auto& bt = t.bin.buildings[i];
+        auto it = secs.find(key);
+        if (it == secs.end() && bt.buildingGroup < formats::kMaxBuildingTypes) {  // a shared model (REPAIR_PAD)
+            std::string g(t.bin.buildingGroupNames[bt.buildingGroup],
+                          strnlen(t.bin.buildingGroupNames[bt.buildingGroup], sizeof t.bin.buildingGroupNames[bt.buildingGroup]));
+            for (char& c : g) c = c == ' ' ? '_' : char(std::toupper(static_cast<unsigned char>(c)));
+            it = secs.find(g);
+        }
+        if (it == secs.end()) continue;
         if (bt.buildingArt < 0 || bt.buildingArt >= formats::kMaxBuildingArt) continue;
         const int first = t.buildingArtFirstFrame[std::size_t(bt.buildingArt)];
         if (!pack->hasFrame(first + 1) && !pack->hasFrame(first)) continue;  // drawn with the original art
+        overlayOff_[std::size_t(i)] = it->second.overlayOff;
+        glowBlink_[std::size_t(i)] = it->second.glow;
+        overlayKeep_[std::size_t(i)] = it->second.overlayKeep;
+        anyFlag |= it->second.overlayOff || it->second.glow || it->second.overlayKeep;
+        if (it->second.pts.empty()) continue;
         // The glb origin: the occupied cells' centre on the ground (render_pack.py, footprint()).
         int n = 0, sx = 0, sy = 0;
         for (int q = 0; q < 16; ++q)
@@ -159,7 +226,29 @@ void PackAnchors::load(const ArtPack* pack, const formats::Templates& t) {
                   [](const Point& a, const Point& b) { return a.name < b.name; });
     }
     if (!any) types_.clear();
-    else SDL_Log("Art pack: fx_weld anchors from models.ini");
+    else SDL_Log("Art pack: building anchors (fx_weld, fx_landing, fx_work, fx_launch) from models.ini");
+    if (!anyFlag) overlayOff_.clear(), glowBlink_.clear(), overlayKeep_.clear();
+    // Original overlays still drawn over a redesigned main frame (the pack has none of the overlay's
+    // frames and the building neither replaces it by weld flashes nor switches it off): a hint for
+    // the pack's models.ini (`overlay = off`).
+    std::string mixed;
+    for (int i = 0; i < int(t.bin.buildingCount) && i < formats::kMaxBuildingTypes; ++i) {
+        const auto& bt = t.bin.buildings[i];
+        const int a = bt.buildingAnimation;
+        if (!(bt.flags & 0x40) || a >= formats::kMaxBuildingTypes || bt.buildingArt >= formats::kMaxBuildingArt) continue;
+        if (!pack->hasFrame(t.buildingArtFirstFrame[std::size_t(bt.buildingArt)] + 1)) continue;
+        bool weld = false;
+        if (!types_.empty())
+            for (const Point& q : types_[std::size_t(i)]) weld |= q.name.rfind("fx_weld", 0) == 0;
+        if (buildingOverlayOff(i) || weld) continue;
+        const int af = t.buildingAnimationFirstFrame[std::size_t(a)];
+        bool packed = false;
+        for (int k = 0; k < int(t.bin.buildingAnimationFrames[a]) && !packed; ++k) packed = pack->hasFrame(af + k);
+        if (!packed)
+            mixed += std::string(mixed.empty() ? "" : ", ") +
+                     std::string(t.bin.buildingNames[i], strnlen(t.bin.buildingNames[i], sizeof t.bin.buildingNames[i]));
+    }
+    if (!mixed.empty()) SDL_Log("Art pack: original overlay over the redesigned art: %s", mixed.c_str());
     // Vehicles drawn from the pack (their first frame is the pack's, with its own hotspot): fx_light* lamps.
     unitTypes_.resize(std::size_t(formats::kMaxUnitTypes));
     bool anyUnit = false;
@@ -174,10 +263,11 @@ void PackAnchors::load(const ArtPack* pack, const formats::Templates& t) {
         const int first = t.unitArtFirstFrame[std::size_t(ut.unitArt)];
         int hx = 0, hy = 0;
         if (!pack->hotspot(first, hx, hy)) continue;  // drawn with the original art
+        auto useful = [](const Section& s) { return !s.lights.empty() || !s.muzzles.empty(); };
         auto it = secs.find(keyOf(t.bin.unitNames[i], sizeof t.bin.unitNames[i]));
-        if ((it == secs.end() || it->second.lights.empty()) && ut.unitGroup < formats::kMaxUnitTypes)
+        if ((it == secs.end() || !useful(it->second)) && ut.unitGroup < formats::kMaxUnitTypes)
             it = secs.find(keyOf(t.bin.unitGroupNames[ut.unitGroup], sizeof t.bin.unitGroupNames[ut.unitGroup]));
-        if (it == secs.end() || it->second.lights.empty()) continue;
+        if (it == secs.end() || !useful(it->second)) continue;
         const Section& s = it->second;
         const float yr = s.yawDeg * 3.14159265f / 180.0f, cy = std::cos(yr), sn = std::sin(yr);
         for (const Point& p : s.lights) {
@@ -185,24 +275,37 @@ void PackAnchors::load(const ArtPack* pack, const formats::Templates& t) {
             unitTypes_[std::size_t(i)].push_back(UnitPoint{p.name, X * cy - Z * sn, Y, X * sn + Z * cy, p.size, s.dy2d});
             anyUnit = true;
         }
+        const float PX = s.pivot[0] * s.scale, PZ = s.pivot[2] * s.scale;
+        for (std::size_t m = 0; m < s.muzzles.size(); ++m) {
+            const Point& p = s.muzzles[m];
+            const float X = p.dx * s.scale, Y = p.z * s.scale + s.y, Z = p.dy * s.scale;
+            UnitPoint up{p.name, X * cy - Z * sn, Y, X * sn + Z * cy, p.size, s.dy2d};
+            up.turret = s.muzzleTurret[m] != 0;
+            up.pivotX = PX * cy - PZ * sn;
+            up.pivotZ = PX * sn + PZ * cy;
+            unitTypes_[std::size_t(i)].push_back(up);
+            anyUnit = true;
+        }
         std::sort(unitTypes_[std::size_t(i)].begin(), unitTypes_[std::size_t(i)].end(),
                   [](const UnitPoint& a, const UnitPoint& b) { return a.name < b.name; });
     }
     if (!anyUnit) unitTypes_.clear();
-    else SDL_Log("Art pack: vehicle fx_light anchors from models.ini");
+    else SDL_Log("Art pack: vehicle fx_light / fx_muzzle anchors from models.ini");
 }
 
 bool PackAnchors::unitAnchors(const game::World& w, int side, int unit, std::string_view prefix,
                               std::vector<EffectAnchor>& out) const {
     out.clear();
-    if (unitTypes_.empty() || prefix.rfind("fx_light", 0) != 0 || side < 0 || side >= int(w.sides().size())) return false;
+    if (unitTypes_.empty() || (prefix.rfind("fx_light", 0) != 0 && prefix.rfind("fx_muzzle", 0) != 0) || side < 0 ||
+        side >= int(w.sides().size()))
+        return false;
     const auto& sd = w.sides()[std::size_t(side)];
     if (unit < 0 || unit >= int(sd.units.size())) return false;
     const game::Unit& u = sd.units[std::size_t(unit)];
     if (!u.alive || u.type < 0 || u.type >= int(unitTypes_.size()) || unitTypes_[std::size_t(u.type)].empty()) return false;
-    float facing = float(u.facing & 31);
+    float facing = float(u.facing & 31), turret = float(u.facingTurret & 31);
     if (fx_)
-        if (const Effects::UnitVisual* v = fx_->unitVisual(side, unit)) facing = v->facing;
+        if (const Effects::UnitVisual* v = fx_->unitVisual(side, unit)) facing = v->facing, turret = v->turret;
     // The model turns clockwise seen from above (render_pack / blender_render set_angle; the 3D yawM).
     const float a = facing * (2 * 3.14159265f / 32), c = std::cos(a), sn = std::sin(a);
     const float e = 45.0f * 3.14159265f / 180.0f, se = std::sin(e), ce = std::cos(e);
@@ -211,7 +314,15 @@ bool PackAnchors::unitAnchors(const game::World& w, int side, int unit, std::str
     const float lift = (u.flags & 0x140) ? float(game::fixToPixel(u.posZ) & 0xff) : 0.0f;
     for (const UnitPoint& p : unitTypes_[std::size_t(u.type)])
         if (p.name.compare(0, prefix.size(), prefix) == 0) {
-            const float x = p.x * c - p.z * sn, z = p.x * sn + p.z * c;
+            float x = p.x * c - p.z * sn, z = p.x * sn + p.z * c;
+            if (p.turret) {
+                // The turret frames: the turret turned about its pivot, the pivot where it is at
+                // body facing 0 (render_pack.py / blender_render set_angle).
+                const float ta = turret * (2 * 3.14159265f / 32), tc = std::cos(ta), ts = std::sin(ta);
+                const float rx = p.x - p.pivotX, rz = p.z - p.pivotZ;
+                x = p.pivotX + rx * tc - rz * ts;
+                z = p.pivotZ + rx * ts + rz * tc;
+            }
             // Orthographic, looking north 45 degrees down: screen y = ground y * sin - height * cos.
             out.push_back(EffectAnchor{ux + 32.0f * x, uy + p.dy2d + 32.0f * z * se, 32.0f * p.y * ce + lift, p.size});
         }
@@ -221,7 +332,11 @@ bool PackAnchors::unitAnchors(const game::World& w, int side, int unit, std::str
 bool PackAnchors::buildingAnchors(const game::World& w, int side, int building, std::string_view prefix,
                                   std::vector<EffectAnchor>& out) const {
     out.clear();
-    if (types_.empty() || prefix.rfind("fx_weld", 0) != 0 || side < 0 || side >= int(w.sides().size())) return false;
+    if (types_.empty() ||
+        (prefix.rfind("fx_weld", 0) != 0 && prefix.rfind("fx_landing", 0) != 0 && prefix.rfind("fx_work", 0) != 0 &&
+         prefix.rfind("fx_launch", 0) != 0) ||
+        side < 0 || side >= int(w.sides().size()))
+        return false;
     const auto& sd = w.sides()[std::size_t(side)];
     if (building < 0 || building >= int(sd.buildings.size())) return false;
     const game::Building& b = sd.buildings[std::size_t(building)];

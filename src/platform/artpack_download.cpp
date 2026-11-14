@@ -2,6 +2,7 @@
 
 #include "formats/sha256.hpp"
 #include "formats/zip_reader.hpp"
+#include "platform/app_update.hpp"
 #include "platform/http_client.hpp"
 #include "render/art_pack.hpp"
 
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 
@@ -115,6 +117,8 @@ void ArtPackDownloader::previewState(State s, const formats::ArtPackManifest& m,
     st_.total = m.size;
     st_.bytesPerSec = s == State::Downloading ? 6.4e6 : 0;
     st_.error = error;
+    st_.startedMs = 0;
+    st_.checkedAt = s == State::Checking || s == State::Idle ? 0 : previewCheckedAt();
     autoChecked_ = true;
 }
 
@@ -152,6 +156,7 @@ void ArtPackDownloader::fail(State s, const std::string& error) {
     std::lock_guard l(m_);
     st_.state = cancel_.load() ? State::Cancelled : s;
     st_.error = cancel_.load() ? std::string() : error;
+    if (s == State::CheckFailed) st_.checkedAt = std::int64_t(std::time(nullptr));
     SDL_Log("Art pack: %s", error.c_str());
 }
 
@@ -166,6 +171,10 @@ bool ArtPackDownloader::fetchManifest() {
         return false;
     }
     setState(State::Checking);
+    {
+        std::lock_guard l(m_);
+        st_.startedMs = SDL_GetTicks();
+    }
     const std::string url = manifestUrl();
     std::string body;
     const http::Response r = http::getText(url, body, 256 * 1024, cancel_);
@@ -184,6 +193,7 @@ bool ArtPackDownloader::fetchManifest() {
     st_.haveManifest = true;
     st_.state = State::Checked;
     st_.error.clear();
+    st_.checkedAt = std::int64_t(std::time(nullptr));
     rawManifest_ = body;
     SDL_Log("Art pack manifest: %s %s, %s (%s)", m.name.c_str(), m.version.c_str(), formatBytes(m.size).c_str(), url.c_str());
     return true;

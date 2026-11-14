@@ -13,20 +13,21 @@ class Ui;
 struct Settings;
 
 // Main menu Options: the gameplay rows only - game speed, scroll speed, mouse controls, smooth
-// motion | frame-time overlay, production queue, cheats | factory rally points. The graphics
+// motion | frame-time overlay, production queue, cheats | factory rally points, order limit,
+// unit limit. The graphics
 // values live on the Graphics page (graphicsPresetTabs / graphicsOptionList below).
 // row(i) gives the i-th row rect. Returns the number of rows used (kGameplayOptionRows).
 int gameplayOptionRows(Ui& ui, Settings& settings, const std::function<SDL_FRect(int)>& row);
-constexpr int kGameplayOptionRows = 6;
+constexpr int kGameplayOptionRows = 8;
 
 // The in-game options of the pause menu (unchanged by the graphics presets page): resolution
 // (Original) / UI scale (Enhanced, 3D), game speed, scroll speed, controls, smooth motion | frame
 // time, production queue, cheats | render resolution, the Enhanced art | effects, health bars |
-// shroud, factory rally points (| 3D sun shadows) and (Enhanced / 3D only) the panel
+// shroud, factory rally points (| 3D sun shadows), order limit, unit limit and (Enhanced / 3D only) the panel
 // transparency | terrain, time of day | lighting, the classic view key and the touch layout | phone UI size. No graphics-mode row: the mode is chosen in
 // the main menu only. A change to a preset value marks the graphics preset Custom.
 int inGameOptionRows(Ui& ui, Settings& settings, const std::function<SDL_FRect(int)>& row);
-constexpr int kInGameOptionRows = 14;  // the most rows (Enhanced)
+constexpr int kInGameOptionRows = 21;  // the most rows (Enhanced: + Brightness, Contrast, Gamma, Saturation, Reset)
 
 // The Graphics page's Custom tab (main menu): every graphics value grouped under headers - Mode,
 // Terrain, Art, Effects, Lighting, Quality, Shroud, Interface, 3D, Display, Classic view. `rect(y, h)` maps a
@@ -56,22 +57,27 @@ float graphicsOptionList(Ui& ui, Settings& settings, const OptionListLayout& lay
                          PictureProbe* probe = nullptr);
 // `s` with option `o` stepped by `dir` like the row's choice / toggle would (false: no such row).
 bool stepPictureOption(Settings& s, PictureOption o, int dir);
+// `dst` with option `o` set to the value it has in `src` (only that row's fields; Quality: HDR / MSAA /
+// filtering as `src` has them).
+void setPictureOption(Settings& dst, const Settings& src, PictureOption o);
 const char* pictureOptionLabel(PictureOption o);  // the row's label (untranslated)
 std::string pictureOptionValue(const Settings& s, PictureOption o);  // its current value, translated
-// Its height (for the scroll area before it is drawn): 11 headers, 18 rows.
-// Display rows (displayOptionList): resolution, fullscreen / render, touch, vsync / limit, HDR rendering / display; Windows: + graphics API.
+// Its height (for the scroll area before it is drawn): 11 headers, 15 rows + the Display rows (Effects and
+// Interface gained a row each - vehicle animation, group numbers - and the height had not followed).
+// Display rows (displayOptionList): resolution, fullscreen / render, touch, vsync / limit, HDR rendering / display,
+// brightness, contrast, gamma, saturation, reset picture + test pattern; Windows: + graphics API.
 #if defined(_WIN32)
-inline constexpr int kDisplayOptionRows = 6;
+inline constexpr int kDisplayOptionRows = 11;
 #else
-inline constexpr int kDisplayOptionRows = 5;
+inline constexpr int kDisplayOptionRows = 10;
 #endif
 inline float graphicsOptionListHeight(const OptionListLayout& L) {
-    return 11 * (L.headerH + L.gap) + (13 + kDisplayOptionRows) * (L.rowH + L.gap);
+    return 11 * (L.headerH + L.gap) + (15 + kDisplayOptionRows) * (L.rowH + L.gap);
 }
 // The GPU backend this run uses ("vulkan", "direct3d12", ...; "" = none), for the graphics API row's label.
 void setActiveGpuDriver(const char* driver);
 // The Display rows alone (resolution / UI scale, fullscreen | render resolution, touch layout |
-// phone UI size, VSync | frame limit), also shown under
+// phone UI size, VSync | frame limit, HDR, the display adjustments), also shown under
 // the preset tabs: they are not part of a preset. Returns the content height used.
 float displayOptionList(Ui& ui, Settings& settings, const OptionListLayout& layout, float y0, SDL_Window* window);
 

@@ -320,8 +320,11 @@ int World::addUnit(int side, int type, int x, int y, int tx, int ty, int pxOffX,
     }
     Side& s = sides_[side];
     if (!s.participates) return -1;
-    const int idx = s.allocObject();
-    if (idx < 0) return -1;  // "ReachedUnitLimit"
+    const int idx = s.allocObject(unlimitedObjects_);
+    if (idx < 0) {  // QueueMessage(GetTextString("ReachedUnitLimit")) - for any side, like the original
+        messages_.push_back({kTextReachedUnitLimit, gameTicks_});
+        return -1;
+    }
     ++s.unitsBuilt;
     ++s.unitsBuiltPerType[type];
 
@@ -508,8 +511,11 @@ int World::addBuilding(int side, int type, int x, int y, bool placeConcrete, boo
     if (side < 0 || side >= kMaxSides || type < 0 || type >= formats::kMaxBuildingTypes) return -1;
     Side& s = sides_[side];
     if (!s.participates) return -1;
-    const int idx = s.allocObject();
-    if (idx < 0) return -1;
+    const int idx = s.allocObject(unlimitedObjects_);
+    if (idx < 0) {  // "ReachedUnitLimit" as in ModelAddUnit
+        messages_.push_back({kTextReachedUnitLimit, gameTicks_});
+        return -1;
+    }
     const auto& t = T.bin.buildings[type];
     ++s.buildingsBuilt;
     ++s.buildingsBuiltPerType[type];

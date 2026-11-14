@@ -291,7 +291,7 @@ Building* World::findUnitExitBuilding(int type, int side, int& sx, int& sy, int&
         return !needFree || !inBounds(sx, sy) || (cell(sx, sy).flags & kAnyUnit) == 0;
     };
     if (idx != kNoIndex) {
-        Building& b = s.buildings[static_cast<std::size_t>(idx) % kObjectsPerSide];
+        Building& b = s.buildings[static_cast<std::size_t>(idx) % s.buildings.size()];
         if ((ut.prereq1OwnerHouse & buildingTemplate(b).ownerHouse) && exits(b)) return &b;
     }
     for (int i = s.firstBuilding; i != -1; i = s.nextObject(i)) {
@@ -598,7 +598,7 @@ void World::setBuildingAsPrimary(int side, int index) {
     default: return;
     }
     const int old = s.primaryBuilding[slot];
-    if (old != kNoIndex) s.buildings[static_cast<std::size_t>(old) % kObjectsPerSide].flags &= ~clear;  // (DebugFatal if none)
+    if (old != kNoIndex) s.buildings[static_cast<std::size_t>(old) % s.buildings.size()].flags &= ~clear;  // (DebugFatal if none)
     s.primaryBuilding[slot] = index;
     b->flags |= building_flags::kPrimary;
 }
@@ -1146,18 +1146,11 @@ bool World::orderDockAtRefinery(int side, int unitIndex, int refineryIndex) {
     return true;
 }
 
-// GenerateUnitGuardOrder 0x459980: selected, alive, armed (primary weapon) units, max 64.
+// GenerateUnitGuardOrder 0x459980: selected, alive, armed (primary weapon) units, max 64 (orderGroup).
 bool World::orderGuardSelected(int side) {
-    if (side < 0 || side >= kMaxSides) return false;
-    const Side& s = sides_[side];
-    int n = 0;
-    for (int i = s.firstUnit; i != -1 && n < 64; i = s.nextObject(i)) {
-        const Unit& u = s.units[i];
-        if (!u.selected || u.state == UnitState::Dead || unitTemplate(u).primaryWeapon == -1) continue;
-        orders_.push_back({Order::Guard, side, i, 0, 0});
-        ++n;
-    }
-    return n != 0;
+    const std::vector<int> group = orderGroup(side, [&](const Unit& u) { return unitTemplate(u).primaryWeapon != -1; });
+    for (int i : group) orders_.push_back({Order::Guard, side, i, 0, 0});
+    return !group.empty();
 }
 
 // Retreat button (0x4433a0): needs a selected unit and a base position, then
@@ -1169,14 +1162,9 @@ bool World::orderRetreatSelected(int side) {
     for (int i = s.firstUnit; i != -1 && !any; i = s.nextObject(i)) any = s.units[i].selected;
     int x = 0, y = 0;
     if (!any || !findBestBasePosition(side, x, y)) return false;
-    int n = 0;
-    for (int i = s.firstUnit; i != -1 && n < 64; i = s.nextObject(i)) {
-        const Unit& u = s.units[i];
-        if (!u.selected || u.state == UnitState::Dead) continue;
-        orders_.push_back({Order::Retreat, side, i, x, y});
-        ++n;
-    }
-    return n != 0;
+    const std::vector<int> group = orderGroup(side);
+    for (int i : group) orders_.push_back({Order::Retreat, side, i, x, y});
+    return !group.empty();
 }
 
 bool World::findBestBasePosition(int side, int& ox, int& oy) const {
@@ -1196,7 +1184,7 @@ bool World::findBestBasePosition(int side, int& ox, int& oy) const {
     }
     int ci = S.primaryBuilding[0];
     if ((ci & 0xffff) == 0xffff) ci = S.firstBuilding;
-    const Building& c = S.buildings[ci % kObjectsPerSide];
+    const Building& c = S.buildings[ci % S.buildings.size()];
     const int cx = ((c.posX >> 16) / 32) & 0xff, cy = ((c.posY >> 16) / 32) & 0xff;
     int sx = 0, sy = 0, n = 0;
     for (int i = S.firstBuilding; i != -1; i = S.nextObject(i)) {

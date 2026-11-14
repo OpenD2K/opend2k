@@ -18,6 +18,7 @@
 #include "formats/templates.hpp"
 #include "render/effect_anchors.hpp"
 #include "render3d/camera3d.hpp"
+#include "render3d/light_buffer.hpp"
 #include "render3d/lights.hpp"
 #include "render3d/terrain.hpp"
 #include "render3d/terrain_v2.hpp"
@@ -27,6 +28,7 @@
 #include <cmath>
 #include <memory>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -44,6 +46,8 @@ class Effects;
 class SceneLights;
 class Bloom;
 class Hdr;
+class TtfFont;
+class VehicleMotion;
 struct SceneLight;
 struct Sprite;
 }  // namespace d2k::render
@@ -80,8 +84,10 @@ struct ModelFrame {
     SDL_GPUSampler* shadowSampler = nullptr;
     SDL_GPUTextureFormat shadowFormat = SDL_GPU_TEXTUREFORMAT_INVALID;
     float shadow[4] = {};
-    // Dynamic point lights (render3d/lights.hpp, fragment uniform buffer 1 of model_fs); nullptr = none.
+    // Dynamic lights (render3d/lights.hpp): fragment uniform buffer 1 of model_fs (nullptr = none) and the
+    // light grid, fragment storage buffer 0 (nullptr = a stand-in; no lights are read then).
     const PointLightsU* lights = nullptr;
+    SDL_GPUBuffer* lightGrid = nullptr;
     // Emission of the models' glowing surfaces (docs/3d-models.md "Emission"): the time of day's lamp
     // strength (render::SceneLight::lamps; 0 = none, Day + Classic) and the effect clock (s) for pulses.
     float lamps = 0;
@@ -120,6 +126,31 @@ public:
                              std::string_view /*prefix*/, std::vector<AnchorWorld>& /*out*/) const {
         return false;
     }
+    // The model's top surface near ground point (gx, gy) (render::EffectAnchors::buildingSurface):
+    // moves (gx, gy) onto it, top = its absolute height (world y). False = no model there.
+    virtual bool buildingSurface(const game::World& /*w*/, const Terrain& /*terr*/, int /*side*/, int /*building*/,
+                                 float& /*gx*/, float& /*gy*/, float& /*top*/) const {
+        return false;
+    }
+    // Picking (docs/3d-mode.md "Picking"): the ray parameter t (origin + t * dir, dir normalised)
+    // where the ray first meets the object's model as drawn this frame (buildings: its triangles,
+    // units: the model's box), < 0 = missed / no model.
+    virtual float rayBuilding(const game::World& /*w*/, const Terrain& /*terr*/, int /*side*/, int /*building*/,
+                              const Vec3& /*o*/, const Vec3& /*d*/) const {
+        return -1;
+    }
+    virtual float rayUnit(const game::World& /*w*/, const Terrain& /*terr*/, int /*side*/, int /*unit*/,
+                          const Vec3& /*o*/, const Vec3& /*d*/) const {
+        return -1;
+    }
+    // models.ini glow = blink of the building type's model (render::EffectAnchors::buildingGlowBlink).
+    virtual int buildingGlowBlink(int /*buildingType*/) const { return 0; }
+    // "Vehicle animation: Modern" (render/vehicle_motion.hpp): the hull poses the unit models are
+    // drawn (and their anchors placed) with this frame; nullptr = rigid.
+    virtual void setVehicleMotion(const render::VehicleMotion* /*vm*/) {}
+    // Modern effects (nullptr = Classic): the eased facings of ground vehicles (Effects::unitVisual)
+    // the unit models are turned by, as the 2D sprites, headlights and muzzles are.
+    virtual void setEffects(const render::Effects* /*fx*/) {}
     // Before the render pass (uploads, own copy pass on `cmd`), then inside it right after the
     // terrain (opaque, depth-writing meshes; the billboards follow). draw returns its draw calls.
     virtual void prepare(SDL_GPUDevice* /*dev*/, SDL_GPUCommandBuffer* /*cmd*/, const ModelFrame& /*f*/) {}
@@ -158,6 +189,8 @@ public:
         bool showShroud = true;
         int playerSide = 0;
         int healthBars = 2;  // Settings::healthBars: 0 selected, 1 damaged buildings, 2 always
+        int groupNumbers = 0;  // Settings::groupNumbers: 0 off, 1 selected units, 2 always (own units)
+        render::TtfFont* groupFont = nullptr;  // the badges' font (UiSkin's Play bold)
         bool snapCamera = false;  // jump to the wanted pose (first frame, screenshots, loads)
         // Modern effects (Settings::effects = Modern; nullptr = Classic): particles, lights,
         // tread marks in world space; shake is added to the look-at point.
@@ -182,6 +215,13 @@ public:
         const render::EffectAnchors* packAnchors = nullptr;
         render::Bloom* bloom = nullptr;
         render::Hdr* hdr = nullptr;  // the tone map of an HDR scene (Quality::hdr; render/hdr.*)
+        // 3D resolution (docs/3d-mode.md "Performance"): the 3D pass renders at this fraction of the
+        // view's pixels per axis (0.25..1) and is scaled up (linear) into the view; the UI and the
+        // overlays stay at the full resolution.
+        float renderScale = 1.0f;
+        // The largest renderScale expected for this view (the targets are allocated at it; a smaller
+        // renderScale draws into their top-left part, so a dynamic scale never reallocates them).
+        float renderScaleMax = 1.0f;
     };
     // Draws the battlefield into (0, 0, viewW, viewH) of the current render target.
     void render(const game::World& w, const CameraPose& want, int viewW, int viewH, float dt, const Options& o);
@@ -207,7 +247,16 @@ public:
                          std::vector<render::EffectAnchor>& out) const override;
     bool unitAnchors(const game::World& w, int side, int unit, std::string_view prefix,
                      std::vector<render::EffectAnchor>& out) const override;
+    bool buildingSurface(const game::World& w, int side, int building, float& gx, float& gy, float& z) const override;
+    // The model's models.ini glow = blink; a building drawn as a pack sprite card: the pack's.
+    int buildingGlowBlink(int buildingType) const override;
     void setModelHook(ModelHook* hook) { models_ = hook; }
+    // "Vehicle animation: Modern": hull poses for the unit models and sprite billboards this frame
+    // (set before the effects' update, which asks for the models' muzzle anchors); nullptr = none.
+    void setVehicleMotion(const render::VehicleMotion* vm) {
+        vm_ = vm;
+        if (models_) models_->setVehicleMotion(vm);
+    }
     // A screen-space line / flag helper for overlays: view pixels per world pixel at a ground point.
     float pixelsPerWorld(float wx, float wy) const { return ppwAt(wx, wy, 0); }
     bool ready() const { return terrainBuilt_; }
@@ -217,6 +266,9 @@ public:
     double lastShadowMs() const { return shadowMs_; }  // CPU time of the shadow pass setup + recording
     int lastDrawCalls() const { return drawCalls_; }
     int lastSprites() const { return int(insts_.size()); }
+    // The size the last frame's 3D pass was rendered at (renderScale applied).
+    int lastRenderW() const { return rw_; }
+    int lastRenderH() const { return rh_; }
 
 private:
     Renderer3D(SDL_Renderer* r, SDL_GPUDevice* dev, render::SpriteCache& sprites, const formats::Templates& t);
@@ -229,7 +281,9 @@ private:
     void addBuilding(const game::World& w, const game::Building& b);
     void addFlyers(const game::World& w);
 
-    enum Pipe : std::uint8_t { kAlpha, kAdd, kSub, kMul, kLight, kPipeCount };
+    // kEmit: straight alpha like kAlpha, but unlit (no sun shadow / time-of-day tint / point lights):
+    // things that glow on their own (the Modern effects' flames, render::Effects::Blend::Glow).
+    enum Pipe : std::uint8_t { kAlpha, kAdd, kSub, kMul, kLight, kEmit, kPipeCount };
     struct Inst {
         SDL_GPUTexture* tex = nullptr;
         Pipe pipe = kAlpha;
@@ -249,10 +303,24 @@ private:
     bool pointHidden(float wx, float wy) const { return cellHidden(int(std::floor(wx / 32)), int(std::floor(wy / 32))); }
     bool buildingHidden(const game::Building& b) const;
     void addEffects(const render::Effects& fx);
-    // The frame's dynamic point lights from the Modern effects' light list (strongest visible first).
-    void buildPointLights(const Options& o, int viewW, int viewH);
+    // The frame's dynamic lights (the Modern effects' light list + the lamps of the time of day) binned into the
+    // light grid and uploaded (its own copy pass; call before the main render pass). dt: frame seconds for the
+    // lamps' fades; snap: no fades (loads, one-frame runs).
+    void buildPointLights(const Options& o, int viewW, int viewH, SDL_GPUCommandBuffer* cmd, float dt, bool snap);
     PointLightsU lightsU_{};
-    std::vector<std::pair<float, int>> lightPick_;
+    LightGridBuffer lightBuf_;  // fragment storage buffer 0 of the lit shaders
+    LightGrid lightGrid_;
+    LightGridBuffer lightFallback_;
+    struct LightCand {
+        float score;
+        int src;  // 0 = effect light, 1 = lamp (index into the lamp list)
+        int index;
+    };
+    std::vector<LightCand> lightCand_;
+    std::vector<GridLight> gridLights_;
+    // Lamps fading in / out when the budget drops / takes them (render::Lamp::id -> weight 0..1).
+    std::unordered_map<std::uint32_t, float> lampFade_, lampFadeNext_;
+    int lightStats_[4] = {};  // candidates, drawn, max per cell, dropped cell entries (D2K_LIGHT_LOG)
     // Sprite helpers: `level` picks the mip for the on-screen size; nullptr textures are skipped.
     const render::Sprite* sprite(int frame, int house);
     // An object's billboard frame (a type the model pack has no model for, docs/3d-mode.md "Objects"):
@@ -360,8 +428,10 @@ private:
     SDL_GPUTexture* depthTex_ = nullptr;
     SDL_Texture* sceneSdl_ = nullptr;
     int tw_ = 0, th_ = 0;
+    int rw_ = 0, rh_ = 0;        // the part of the targets this frame renders (renderScale)
 
     ModelHook* models_ = nullptr;
+    const render::VehicleMotion* vm_ = nullptr;
     const game::World* frameWorld_ = nullptr;  // the world collect() is drawing
     bool frameShroud_ = true;
     std::vector<Inst> insts_;

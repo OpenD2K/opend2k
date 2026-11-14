@@ -22,6 +22,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <cstdlib>
 #include <sstream>
 #include <vector>
 
@@ -179,6 +180,37 @@ void presetPreviewScene(game::World& w, int me) {
     if (harvester >= 0) w.orderMove(me, harvester, 21, 7);  // onto the spice: harvests
 }
 
+void facingDemoScene(game::World& w, int me, const char* types, int x0, int y0) {
+    const auto& T = w.rules().templates->bin;
+    // Army scenes (light / performance checks): "NAME*R" = R rows of that type; D2K_FACING_DEMO_COLS units per
+    // row (default 8, the facings repeat), D2K_FACING_DEMO_STEP tiles apart (default 3).
+    const int cols = std::getenv("D2K_FACING_DEMO_COLS") ? std::max(1, std::atoi(std::getenv("D2K_FACING_DEMO_COLS"))) : 8;
+    const int step = std::getenv("D2K_FACING_DEMO_STEP") ? std::max(1, std::atoi(std::getenv("D2K_FACING_DEMO_STEP"))) : 3;
+    std::stringstream ss(types ? types : "");
+    std::string name;
+    int row = 0;
+    while (std::getline(ss, name, ',')) {
+        int rows = 1;
+        if (const auto star = name.find('*'); star != std::string::npos) {
+            rows = std::max(1, std::atoi(name.c_str() + star + 1));
+            name.resize(star);
+        }
+        int ty = -1;
+        for (int i = 0; i < int(T.unitCount); ++i)
+            if (name == T.unitNames[i]) ty = i;
+        if (ty < 0) continue;
+        for (int r = 0; r < rows; ++r, ++row)
+            for (int f = 0; f < cols; ++f) {
+                const int x = x0 + f * step, y = y0 + row * step;
+                const int i = w.addUnit(me, ty, x, y, x, y);
+                if (i < 0) continue;
+                auto& u = w.sides()[std::size_t(me)].units[std::size_t(i)];
+                u.facing = (f * 4 + r * 4) & 31;
+                u.facingTurret = u.facingTurretTarget = u.facing;
+            }
+    }
+}
+
 GraphicsPreviews::GraphicsPreviews(SDL_Renderer* r, render::TextRenderer* font)
     : r_(r), ui_(std::make_unique<Ui>(r)) {
     ui_->setFont(font);
@@ -228,6 +260,30 @@ bool GraphicsPreviews::presetSettings(int preset, const Settings& current, Setti
     out.models3d = Settings::Models3D::New;
     if (render3d::ModelRenderer::packPath(out.modelPack).empty()) out.modelPack.clear();
     return !render3d::ModelRenderer::packPath(out.modelPack).empty();
+}
+
+Settings GraphicsPreviews::standardScene(const Settings& current) {
+    Settings d;  // the defaults (what --render-previews starts from)
+    d.dataDir = current.dataDir;
+    d.artPack = current.artPack;
+    d.modelPack = current.modelPack;
+    d.ps1Image = current.ps1Image;
+    d.deviceProfile = current.deviceProfile;
+    Settings enhanced, out;
+    presetSettings(1, d, enhanced);
+    const int mode = current.threeD() ? 2 : current.enhanced() ? 1 : 0;
+    presetSettings(mode, enhanced, out);  // (3D without a model pack: unavailable either way)
+    return out;
+}
+
+void GraphicsPreviews::comparison(const Settings& current, PictureOption o, int dir, Settings& now, Settings& next) {
+    const Settings base = standardScene(current);
+    now = base;
+    setPictureOption(now, current, o);
+    Settings stepped = current;
+    stepPictureOption(stepped, o, dir);
+    next = base;
+    setPictureOption(next, stepped, o);
 }
 
 // Only what the picture of this mode depends on: Original ignores every Enhanced / 3D value, 2D
@@ -667,10 +723,10 @@ void GraphicsPreviews::prefetch(const Settings& current) {
     else rows = {P::Mode};
     for (P o : rows) {
         const PreviewShot shot = previewShotFor(o);
-        Settings next = current;
-        stepPictureOption(next, o, 1);
-        picture(current, shot, true);
-        if (!samePicture(current, next, shot)) picture(next, shot, true);
+        Settings now, next;
+        comparison(current, o, 1, now, next);
+        picture(now, shot, true);
+        if (!samePicture(now, next, shot)) picture(next, shot, true);
     }
 }
 
@@ -950,16 +1006,18 @@ int GraphicsPreviews::renderShippedSet(const std::string& outDir, const Settings
         bool modeRow = true;
     };
     std::vector<Base> bases;
+    // (The same bases as the Custom tab's comparisons: standardScene.)
     Settings enhanced;
     presetSettings(1, current, enhanced);
     for (int preset = 0; preset < 3; ++preset) {
         static const char* const kPresetNames[] = {"Original", "Enhanced", "3D"};
-        Settings s;
+        Settings mode = current, s;
+        mode.graphics = static_cast<Settings::Graphics>(preset);
         if (!presetSettings(preset, enhanced, s)) {
             SDL_Log("--render-previews: the %s preset cannot be previewed here (no 3D art pack?)", kPresetNames[preset]);
             continue;
         }
-        bases.push_back({kPresetNames[preset], s});
+        bases.push_back({kPresetNames[preset], standardScene(mode)});
     }
     if (render::ArtPack::isRedesign(enhanced.artPack)) {
         Settings s = enhanced;
@@ -1110,14 +1168,15 @@ void customPreviewColumn(Ui& ui, GraphicsPreviews& previews, const Settings& s, 
                    theme::kDim, ts);
         return;
     }
+    // On the standard scene (shipped pictures: instant), not the player's whole combination.
     const PreviewShot shot = previewShotFor(probe.option);
-    Settings next = s;
-    stepPictureOption(next, probe.option, probe.dir);
-    caption(tr(pictureOptionLabel(probe.option)), theme::kAccent);
+    Settings now, next;
+    GraphicsPreviews::comparison(s, probe.option, probe.dir, now, next);
+    caption(std::string(tr(pictureOptionLabel(probe.option))) + " - " + tr("preview: standard scene"), theme::kAccent);
     caption(std::string(tr("Now")) + ": " + pictureOptionValue(s, probe.option), theme::kText);
-    drawPreviewCard(ui, SDL_FRect{cx, y, cw, cardH}, previews.picture(s, shot), "", nullptr, ts);
+    drawPreviewCard(ui, SDL_FRect{cx, y, cw, cardH}, previews.picture(now, shot), "", nullptr, ts);
     y += cardH + 4;
-    if (previews.samePicture(s, next, shot)) {
+    if (previews.samePicture(now, next, shot)) {
         ui.wrapped(tr("No visible change with the current graphics mode."), SDL_FRect{area.x, y, area.w, area.h - (y - area.y)},
                    theme::kDim, ts);
         return;

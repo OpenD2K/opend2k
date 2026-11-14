@@ -15,6 +15,7 @@ their own RNG (xorshift), so the game RNG, the saves and `--simtest` do not chan
 | `graphicsPreset` | `original`, `enhanced`, `3d`, `custom` | new players: `enhanced` (no key: the preset the values match, else `custom`) | Options → Graphics: the tabs; original SETTINGS page: "Graphics:" button. See "Presets" below |
 | `artPack` | `original`, `upscaled`, or an art-pack folder name | `upscaled` (built-in default; the Enhanced / 3D presets set `original` unless a redesign pack is chosen) | Graphics page → Custom: "Art"; in-game options |
 | `effects` | `classic`, `modern` | `modern` | Graphics page → Custom: "Effects"; in-game options; Original UIL game options: "Modern effects" |
+| `vehicleAnimation` | `original`, `modern` | `modern` (the Enhanced / 3D presets: `modern`; inert in Graphics: Original) | Graphics page → Custom → Effects: "Vehicle animation"; `--vehicle-animation`. See "Vehicle animation" below |
 | `shroud` | `classic`, `soft` | `soft` (absent key: `soft` with Modern effects, `classic` with Classic) | Graphics page → Custom: "Shroud"; in-game options (row shared with "Health") |
 | `healthBars` | `selected`, `damaged`, `always` | `selected` | Graphics page → Custom → Interface: "Health bars"; in-game options |
 | `panelTransparency` | `off`, `light`, `medium` | `off` | Graphics page → Custom → Interface; in-game options |
@@ -56,8 +57,14 @@ pictures. Anything else is rendered from the player's own data as below: a curat
 a Harkonnen raid fought by tanks, infantry and two turrets, the barracks burning; map objects and events stripped,
 `presetPreviewScene`, `SessionConfig::presetPreview`) drawn by a second, offscreen `Session` with its own Settings into a
 640x400 target, the same framing for every preset (3D: tilt 50, yaw 14). The 3D tab needs a model pack (else "Needs
-the 3D art pack"). The Custom tab gets a preview column: the row under the mouse (else the focused one) compared -
-the current setup and the value a click would choose (`stepPictureOption`; the left arrow = the previous value), each
+the 3D art pack"). The Custom tab gets a preview column: the row under the mouse (else the focused one) compared on
+the **standard scene** (owner 2026-11-14: what the option does, not the player's exact combination;
+`GraphicsPreviews::standardScene` / `comparison`): the default setup with the preset of the player's graphics mode -
+the same bases the shipped set steps from - with only that row set to the player's value ("Now") and to the value a
+click would choose (`stepPictureOption` + `setPictureOption`; the left arrow = the previous value), so both are
+shipped pictures and appear at once. Only the player's install stays (art / model pack choice, PS1 disc, device
+profile): another pack version, the lite profile, a "Custom" quality level (HDR / MSAA / filtering mixed) or PS1 models
+without a disc still render locally. Each
 option with a framing that shows it (`previewShotFor`: effects / health bars / MSAA the fight close up, time of day /
 lighting / HDR the base, terrain / shadows / filtering the ridge, the rest the whole frame); rows that change nothing in
 the current mode say so, rows that never change the picture (display, classic view) show the current setup. Work is
@@ -186,6 +193,13 @@ rubble, the heap grows back, then sinks away).
 ### Loading and filtering
 - Frames are decoded lazily on first use (`SDL_LoadPNG`), tinted per house, and cached per
   (frame, house, grey) like the original frames.
+- Texture memory (`SpriteCache::setMemoryBudget`, set by Session): unlimited on the desktop; iPad 384 MB,
+  iPhone 256 MB as an LRU budget (sprites no frame drew for 2 frames freed oldest first down to 90 %),
+  and the touch profiles prefetch one neighbour each side and only the objects in the 2D view.
+  `D2K_SPRITE_BUDGET_MB` / `D2K_SPRITE_RADIUS` try it on the desktop. Measured (H5V1 --battle, 25 s
+  zoom 1 -> 2.5 + pan across the map, LG 100 Hz, 4800x2000 px, 2 runs): unlimited peak 407-408 MB;
+  384 MB: peak 385, 74 evicted, 183-185 sync builds (unlimited 139-144); 256 MB: peak 257, 455 evicted,
+  263-268 sync builds, 3.8-4.5 ms of eviction in total; frame p50 10.0 / p99 11.6-14.3 ms in all.
 - Textures use linear filtering. SDL_Renderer has no mipmaps, so `SpriteCache` builds a
   premultiplied 2x box-filtered mip chain down to 1 texel per world pixel. `Sprite::level(zoom)`
   picks the sharpest level that is minified at most 2x.
@@ -233,7 +247,9 @@ re-bakes soften shadows by the same world px as whole chunks). Scheduling (`upda
 `drawTerrain`, so new tiles show in the same frame): the first frame after a build bakes every visible
 tile at once (part of the build pause; screenshots are sharp); later the missing tiles of the wanted
 level from the view centre out, then a one-tile ring around the view, ~1 M texels per frame (one
-256-tile, two 192-tiles, four 128-tiles), not until the level has been the same for 6 frames (a wheel
+256-tile, two 192-tiles, four 128-tiles; after 30 frames without a bake the budget starts at 1/8 and doubles
+per baking frame - the GPU at rest runs at a low clock: 0.15 M texels took 3.9 ms after 5 s at rest, 0.7 ms
+right after other work; no new tiles while the last bake's fence is still pending), not until the level has been the same for 6 frames (a wheel
 zoom passes through levels without baking them); meanwhile each tile shows the nearest resident level
 still sharper than the chunks, else the chunks. Cache: LRU under a budget of 160 MB (never a tile of the
 current frame; a tile no view used for 1800 frames is freed). Spice / concrete changes mark resident
@@ -452,13 +468,63 @@ bullet ModelAddBullet created in the last 16 ticks with its muzzle point, aim po
 delay). Machine-gun bullets (LMG, HMG, M_LMG / M_HMG, FREMEN_S / L: 351 px per tick) are created and
 land within the same tick, so they never exist when a frame is drawn and only their impacts showed
 (the trike "not firing"); the log carries every shot exactly once, at its real rate. Each shot whose
-fire tick (creation + delay) passed since the last update gets its muzzle flash (`spawnShot`): at the
-end of the gun - the bullet starts at the firer + ShootOffset (2-5 px, inside the body), the flash is
-pushed along the aim to infantry 6 px, vehicles 2 x offset + 4 px (trike / raider / quad 10, tanks 14,
-devastator 18), turrets 12 px - plus, for machine guns, a tracer streak muzzle -> aim point
-(1100 px/s, 24 px, with a faint full-length line for 0.06 s) and a short light (58 px, 0.08 s).
+fire tick (creation + delay) passed since the last update gets its muzzle flash (`spawnShot`) at the
+**barrel tip** (below) - plus, for machine guns, a tracer streak muzzle -> aim point (1100 px/s, 24 px,
+with a faint full-length line for 0.06 s) and a short light (58 px, 0.08 s).
 `D2K_VFX_DEMO=units --vfx-demo --at X Y` puts a column of real units (trike, raider, quad, infantry,
-tanks) shooting at the ground through the real FireAt path.
+tanks) shooting at the ground through the real FireAt path; `D2K_VFX_DEMO=column` a vehicle column
+(the three combat tanks, siege, devastator, missile tank, quad, trike) that sets off, stops, fires,
+drives a diagonal and turns about (period 400 ticks; H5V1: `--at 30 40`).
+
+### Barrel tips (`Effects::muzzlePoints`, `render/muzzle_tips.*`)
+The bullet starts at the firer + ShootOffset (2-5 px along the facing, inside the hull). Muzzle flashes,
+tracers and the drawn projectile start at the gun's real end instead, from the first source that has it:
+1. **the model's `fx_muzzle_N` anchors** - Graphics: 3D with models: the 3D model's (under `turret`: turned
+   by the turret about its pivot, `ModelRenderer::unitAnchors`, with the hull pose below); Enhanced 2D with a
+   rendered pack: the same points from the pack's `models.ini` (`anchor.fx_muzzle_N = x y z size [turret]`
+   + `turret_pivot`, written by `tools/models/muzzle_anchors.py PACK --write [--front DEVASTATOR_TANK]` from
+   the glbs' `fx_muzzle*` nodes, else the tip of the `barrel` node's mesh, else the front-most body
+   vertices) projected like render_pack's frames (`PackAnchors::unitAnchors`: turret anchors turn with the
+   eased turret facing about the pivot, which the pack's turret frames keep where it is at body facing 0;
+   the origin `anchor2d_dy` below the unit). A unit with several guns fires them in turn (per slot shot
+   counter); the devastator both cannons at once;
+2. **measured on the original sprites** (`MuzzleTips`, Enhanced with the original / upscaled art, 3D sprite
+   cards, types without anchors): the turret frame (turreted units) or the body frame - the opaque pixel
+   furthest along the facing's screen direction within 2 (3.5, 6) px of the axis through the anchor, cached
+   per frame, turned with the eased facing's residual like the sprite; height 7 px (turrets) / 5 px;
+3. infantry: the rifle - 7 px ahead, 1.5 px right, 6 px up; buildings and the rest: the old push along
+   the aim (turrets 12 px from their centre).
+The projectile (rockets, shells, plasma, gas ...) is drawn from that point too: the offset tip - bullet
+start, taken when the bullet first appears, shrinks linearly with the bullet's remaining distance to its
+target (`SlotSeen::ox/oy/oz/d0`), so it flies from the barrel to the same impact. Render-only.
+
+### Vehicle animation (`render/vehicle_motion.*`, Settings `vehicleAnimation`)
+"Vehicle animation: Modern" (Enhanced / 3D; the presets' default) gives ground vehicles render-only hull
+motion on top of their simulated position (`VehicleMotion::update` once per frame from the drawn, smooth-
+motion positions and the shot log; damped springs in effect time, so a pause freezes them; nothing is
+written back - the world hash of a run is the same with Original / Modern / Graphics: Original):
+- **pitch**: the original starts and stops at full speed; the difference of two low-passed speeds
+  (0.06 s / 0.28 s) is the "acceleration": squat (nose up, up to ~4 deg) when setting off, nose dip on
+  stopping, with a little overshoot (2.2 Hz, damping 0.42);
+- **roll** out of a turn: turn rate x 0.008 x speed (a hull turning in place stays level); the turn rate
+  comes from the facing eased into a continuous heading (60 ms), so the 32 facing steps give no ripple;
+- **suspension**: one bounce where the ground class changes (sand / dunes / rock / concrete), 3.4 Hz;
+- no random rough-ground bumps and no idling engine tremble (removed 2026-11-14, owner: "every unit has some
+  small shaking"): a standing vehicle does not move at all except for its recoil;
+- **recoil** per shot (strength by gun: siege 1.4, devastator 1.2, combat tanks 1.0, missile / deviator
+  0.45, sonic 0.35, trike / quad / raider 0.14): the hull pushed back against the shot (~1-2 px), the turret
+  further (~2-3 px), the hull rocking away from it (pitch / roll by the shot's direction to the hull);
+- **dust** (with Modern effects): a puff kicked up behind and beside a vehicle that sets off after standing
+  0.6 s (`Effects::setVehicleAnimation`).
+2D (`MapRenderer::drawUnit` -> `blitScreen` with `warp_`): body and turret sprites are drawn as quads whose
+points move vertically by a linear field - a sprite pixel d screen px from the anchor is taken as the ground
+point (d.x, d.y / sin 45), its height change pitch (g . forward) - roll (g . right) + lift drawn cos 45 higher
+(a shear / squash that stays sub-pixel smooth with the linearly filtered art; nearest-sampled pixel art only
+gets whole-pixel offsets); the recoil shifts them against the shot; the shadow stays on the ground; the
+position is the simulated one (no lag). 3D models (`ModelRenderer::unitPlacement`): pitch / roll about the
+model's ground origin, lift and recoil as translations, the turret pushed back along its barrel; sprite cards
+get the lift and recoil only. Infantry: none (a separate roadmap item). Wheels / tracks: the redesign's
+vehicle glbs have one `body` mesh (no wheel / track nodes), so nothing turns or scrolls yet.
 
 ### Effects
 | trigger | effect |
@@ -467,8 +533,8 @@ tanks) shooting at the ground through the real FireAt path.
 | EX_MG / EX_HMG impacts | sparks, a small dust puff tinted by the terrain, a short glow |
 | MUZ_* / EX_FLASH | muzzle glow |
 | EX_TRAIL / EX_SMOKE4 / EX_PUFF | nothing (the bullets draw their own trails) |
-| EX_SMOKE3 (damage smoke, see "Original events") | a dark smoke puff per event: buildings bigger / denser with damage, vehicles smaller; nearly dead vehicles flare up now and then |
-| EX_FLAME / EX_FLAME2 (building damage flames) | a lick of fire of varying size with a timed light, 12 % a brief flare-up with embers |
+| EX_SMOKE3 (damage smoke, see "Original events") | on a building: feeds its fire record (see "Building fires"); on a vehicle: a smaller dark puff, nearly dead vehicles flare up now and then |
+| EX_FLAME / EX_FLAME2 (building damage flames) | feeds the building's fire record (see "Building fires") |
 | EX_WORM / EX_WORMDUST / EX_WORMSN1..6 + the worm's sand particles | the sandworm's own sand (see "Original events"): the maw art stays, the rest is replaced |
 | EX_HARVDUST* | modern harvest dust (see "Original events") |
 | EX_DHM (Death Hand missile trail, one per flight tick) | smoke puff, as EX_TRAIL |
@@ -565,12 +631,42 @@ simulation is untouched; Effects: Classic, the classic view and Graphics: Origin
   vehicle every ~4 ticks while its smoke timer runs (64..191, set by each hit below half health, one
   less every 4 ticks: 13-38 s) and, for a selectable building below half health, EX_SMOKE3 / EX_FLAME
   at each BUILEXP.BIN point whose bit is set, with the point's period (3-12 ticks), the bits clearing at
-  random over the timer's last 200 ticks. Each EX_SMOKE3 becomes a puff: on a building (the smoking
-  building whose art box holds the point: 2 dark puffs, denser / larger with damage, started at roof
-  height in 3D = the same drawn point in 2D), on a vehicle a smaller puff (under 25 % health a flame
-  lick + flicker 20 % of the time). EX_FLAME: a lick of fire (size 0.65-1.15) and a timed light, 12 %
-  a flare-up with embers. So smoke flares up after hits and dies out with the original's; walls,
+  random over the timer's last 200 ticks. On a building both feed its fire record ("Building fires"
+  below); on a vehicle each EX_SMOKE3 becomes a smaller puff (under 25 % health a flame lick + flicker
+  20 % of the time). So smoke and fire flare up after hits and die out with the original's; walls,
   concrete and other structures without the kSelectable template flag never smoke or burn.
+
+#### Building fires (`render/effects_fire.cpp`)
+Every EX_SMOKE3 / EX_FLAME at a damaged building's BUILEXP.BIN point (`feedBurn`: the building whose art
+box holds the point) refreshes a record per building and point (`BurnSite` / `BurnPoint`): full heat while
+the events keep coming, held 1.3 s after the last one, then dying down over 2.6 s - so the fire follows the
+original's smoke timer exactly. How big it burns follows the health (severity 0 at 50 % .. 1 at 10 %):
+flame points burn at 0.55-1.4, smoke points smoke (a light grey wisp just below half health, a thick black
+column near destruction) and catch fire below ~30 %. Per burning point:
+- **Flame tongues** (`flameLick`): 1-4 tongues spread along the roof edge around the point (count by size
+  and Quality), each a stream of coloured tongue sprites (`kTongue` / `kTongue2` atlas cells with the colour
+  baked in: white-yellow core low on the axis, yellow, orange, dark red edges and tip) that rise, thin out,
+  lean with a gently varying wind and cool (colour x c0 -> c1, t^2), plus a billowing orange body
+  (`kFire`) at their feet; a small additive yellow core glow and a wide orange halo (per frame, `beams_`).
+- **Embers** drifting up with the wind, **lit smoke**: the column's foot tinted orange by the fire.
+- **Smoke column**: dark puffs (graded by the time of day like other smoke), darker / bigger / longer with damage.
+- **Firelight**: one flickering warm light per building at its fires' heat-weighted centre (the light list:
+  2D glow, 3D point light on the building and the ground), 2D stronger at night (by the grade's luminance).
+- **Soot** (`burnMarks`): kScorch ground marks under the fires at the footprint's south wall and the nearer
+  side wall, building up while it burns (0.05-0.17 / s) and fading slowly once it is out.
+Flames, glows and lit smoke use `Blend::Glow`: over-blending (they replace the colour under them) that the
+time of day does not darken (2D: no grade; 3D: the unlit straight-alpha pipe `kEmit`). Additive orange on
+the blue night picture read pink / purple (red saturates, the background's blue stays).
+**Placement**: a model's `fx_fire*` anchors when it has them (3D, point i -> anchor i mod n); else the event's
+drawn point split into ground point + height inside the solid cells' box (x clamped into it, ground y = south
+edge - 0.55 x height above it, the drawn point kept but never above the box's north edge: on the roof or the
+front, never in the air beside the building); 3D with models then moves it onto the model's top surface
+(`EffectAnchors::buildingSurface`: the nearest cell within 16 px of the model's top-down height map that
+stands at least a third of the model's height; `ModelRenderer::roof`), 3D sprite cards onto the card. A dying
+building (state 17) hands over to the wreck's fire. Rates scale with `Effects::setDetail` (Quality Low 0.45,
+Medium 0.7, High 1) and the particle budget. The small fires of ruins / debris / wrecks use the same tongues.
+`D2K_VFX_DEMO=fire ./build/d2k --map H5V1.MAP --vfx-demo --at 9 9 --zoom 3`: refinery, heavy factory, light
+factory and barracks of three houses at 40 % (north row) and 15 % (south row), hit every 200 ticks.
 - **Walls breaking** (destroyed non-selectable structures, `Wreck::lite`): a short flash, a small kick
   (trauma 0.08), chunks (no burning / smoking ones) and dust; the EX_BUILDING bursts become small
   Medium bursts; no fireball chain, no smoke column, no ruin fires, sparks or embers, a faint scorch.
@@ -667,18 +763,23 @@ y - z), the height of the source above the ground, the reach in world px and an 
 alpha is the intensity (255 = 1). Lights under full shroud are dropped.
 - **2D** (`drawAir`): each light is a soft glow (`kGlowPM`) of diameter `size` drawn with the Light
   blend `dst * (1 + 1.6 * c * a)` after the objects, so it brightens the ground, the units and the
-  buildings under it (a backend without custom blending falls back to dimmed additive).
-- **3D**: `Renderer3D::buildPointLights` turns the strongest 48 visible lights into shader point
-  lights (`render3d/lights.hpp`, docs/3d-mode.md "Dynamic lights"); the terrain, rocks, models and
-  sprites / smoke are lit per pixel.
+  buildings under it (a backend without custom blending falls back to dimmed additive). Under a time-of-day
+  grade the colour is divided by the grade (in up to three passes, as the lamps): the light lights the
+  ground's own colour, not the moonlit one (without it a warm light on the blue night kept the blue and
+  read pink / purple).
+- **3D**: `Renderer3D::buildPointLights` turns every visible light into a shader light, binned into a
+  ground grid that each fragment reads only its cell of (clustered forward lighting, `render3d/lights.hpp`,
+  docs/3d-mode.md "Dynamic lights"; budget 768, 192 on phones); the terrain, rocks, models and sprites /
+  smoke are lit per pixel.
 - **Lamps** of the time of day (vehicle head / tail lights, building lamps, floodlights) are a second,
   independent list (`render::SceneLights`, also without Modern effects; see "Lighting" below): 2D draws it
-  before the effects, 3D gives it the slots the effects leave (spot lights for headlight beams). The time of
+  before the effects, 3D adds them to the same light grid (spot lights for headlight beams). The time of
   day itself scales the sun / ambient terms (the point-light block's head) and leaves the lights additive.
 
-Textures are all procedural (no external assets): one 2304x128 atlas of 18 cells of 128 px (glow,
+Textures are all procedural (no external assets): one atlas of 128 px cells (glow,
 smoke, spark, debris, flame, ring, soft, premultiplied glow, wave, gas, arc, line, fire, muzzle
-star, tracer streak, capsule, scorch, shock ring) built from value noise at start-up.
+star, tracer streak, capsule, scorch, shock ring, mound, two coloured flame tongues) built from value
+noise at start-up (grey cells tinted by the vertex colour; the tongues carry their own fire colours).
 
 Checking it: `--vfx-demo --at X Y` fires every weapon kind in rows and repeats vehicle deaths, a
 heavy shell, a missile hit, a devastator hit and a Death Hand around the tile; `--record DIR` saves
@@ -762,10 +863,10 @@ flat-shaded `fx_*` skin / cloth) now follow the light (`lit` 0.35 in `model_gltf
 a material whose name contains GLOW / LIGHT / LAMP / FLASH keeps glowing at night (devastator `GLOW`,
 thumper `fx_lamp`, muzzle `FLASH`).
 
-Point lights may be **spot lights** now: `spot[i]` = beam direction + cos of the half angle (w < -1: a point
-light); the beam fades over the outer 45 % of its cone. `buildPointLights`: the effects' lights first (strongest,
-at most 2/3 of the 48 slots while lamps are on), then the lamps by priority x intensity x reach, falling off with
-the distance from the view centre. Headlight cones are spot lights from the lamp tilted to reach the ground half
+Point lights may be **spot lights** now: `spot` = beam direction + cos of the half angle (w < -1: a point
+light); the beam fades over the outer 45 % of its cone. `buildPointLights` (2026-11-14: clustered, no small cap):
+all visible effect lights and lamps; past the budget by priority x intensity x screen coverage across the whole
+view (effects first), lamps fading in / out over 0.3 s when the budget takes / drops them. Headlight cones are spot lights from the lamp tilted to reach the ground half
 way along the beam; pools are point lights above their point. The lamps' flares are additive billboards pulled
 14 px towards the eye (so a model's own surface does not hide them).
 
@@ -802,6 +903,19 @@ or the original frame's index-1 pixels - so this works for the redesigned art an
   `dst x lerp(1, mask, a)` (src = DST_COLOR, dst = ONE_MINUS_SRC_ALPHA, vertex colour = a): `a` = the 2D bake's
   shade loss (ambient 0.46 / diffuse 0.78 under this light) against Day's, at most 1, times a fade of up to a
   quarter for long shadows (k 1 → 2).
+- **Units from 3D-rendered frames cast their silhouette** (`MapRenderer::drawSilhouetteShadow`, owner 2026-11-14:
+  "not correct shadows" - a thin dark slanted strip beside a tank at dusk): the pack's `.shadow.png` holds only
+  the rim of the 58-degree sun's shadow that sticks out from under the model, which turned / stretched became a
+  streak. Instead the body frame's alpha (and the turret's, on the body's ground) is taken as the unit seen from
+  45 degrees - its footprint swept up by its height: rows above the lowest opaque row are squeezed towards it by
+  1 - beta (beta = the height's share of the screen rise: vehicles 0.42, infantry 0.8), then the footprint is
+  stretched along the shadow direction by the cast length (beta x rise x cot 58 x kPack) - the sweep of the
+  footprint, i.e. a box's shadow. Darkness: alpha x 0.5 x strength (`dst x (1 - a)`), drawn before the body and
+  turret (no turret shadow on the hull), without the vehicle-motion shear. `SpriteShadowWarp::silhouette` fades
+  it in away from Day (|dAz| / 15 degrees, |kPack - 1| / 0.3) while the pack's own shadow fades out, so the Cycle
+  has no pop; at Day the pack's shadow is drawn as before. Buildings and original-art units keep the warp above.
+- Check scene: `D2K_FACING_DEMO="ATREIDES COMBAT TANK,TRIKE,..."` puts one row per unit type, the 8 body
+  facings 3 tiles apart, from `--at` - 10 / - 3 (e.g. H5V1 `--at 22 38 --reveal`).
 - Day (dAz 0, elK 1), Classic lighting and Original graphics: inactive, the old `SDL_BLENDMODE_MOD` blit
   (pixel-identical). Not warped: flyers' ground silhouettes and the collapse of destroyed buildings.
 - Checks: `D2K_NO_SHADOW_WARP=1` draws the shadows as before; `D2K_PREVIEW_SCENE=1` puts the Graphics previews'
@@ -814,18 +928,24 @@ flicker. Strength = `SceneLight::lamps` (the visible lamps themselves at least 0
 beacons show faintly by day with Modern lighting). Blinking uses the effect clock and a per-object phase.
 - **Vehicles** (by template: small = trike / quad / raider, big = harvester / MCV / devastator, else medium; the
   Modern effects' eased facing when available): a warm headlight cone ahead (64 - 92 px, ±24°) + two headlamps,
-  two red tail lights + a faint red pool; harvester / MCV: an amber rotating beacon on the roof; a harvesting
+  two small red tail lights (no pool, no light on the ground); harvester / MCV: an amber rotating beacon on the roof; a harvesting
   harvester: amber work lamps on both sides. These offsets were measured on the original sprites.
 - **Redesigned vehicles and flyers** (the owner: "what is the floating light over the harvester?"): a unit type drawn
   from a redesigned art - a 3D model (`ModelHook::hasUnitModel`) or pack frames with their own hotspot - gets only the
   lamps its model carries as anchors (`SceneLights::addModelUnit`): `fx_light_head*` (white lamp + the headlight cone
-  from their middle), `fx_light_tail*` (red + pool), `fx_light_beacon*` (rotating amber), `fx_light_work*` (amber, lit
+  from their middle), `fx_light_tail*` (small red points), `fx_light_beacon*` (rotating amber), `fx_light_work*` (amber, lit
   while harvesting, the pool thrown ahead), flyers `fx_light_port*` / `_starboard*` / `_strobe*`; flares pulled only 3 px.
   No anchors: no lamps. 3D takes the model's anchors through its placement; 2D (`PackAnchors::unitAnchors`) projects
   the pack's models.ini anchors as render_pack renders them (turned by the eased facing, orthographic 45 degrees) from the
   unit position + `anchor2d_dy` (where the rendered frames draw the model origin: render_pack's vertical centroid
   alignment, e.g. harvester 6.5 px, MCV 5; flyers add their flight height). Original-art units keep the old offsets.
   `D2K_VFX_DEMO=mcv --vfx-demo --at 6 12` (H5V1): three MCVs - one driving, one deploying at tick 120, one standing.
+- **Headlight beams in 2D** (owner 2026-11-14, a tank at dusk with "orange cones" at both ends): the glow at the
+  rear was the tail lights' red pool on orange ground - gone, tail lights are only small red flares now. A beam
+  multiplies the ground less (x 0.7) and adds a faint veil of its own warm white (ADD, 0.16, not divided by the
+  grade): white light on orange sand clipped to orange (red saturates first), the veil keeps it warm white.
+  Beams point along the eased body facing; every redesigned vehicle's `fx_light_head*` anchors lie at its front
+  (`D2K_FACING_DEMO`, below).
 - **Flyers** (carryall, ornithopter, frigate): red port / green starboard lights, a white tail strobe.
 - **Buildings** (per kind from the special behaviour / building group; points on the footprint): construction
   yard and factories - a floodlight pool on the apron in front, lamps on the door posts, a red beacon; refinery -
@@ -850,11 +970,18 @@ beacons show faintly by day with Modern lighting). Blinking uses the effect cloc
   primary star port runs its one-shot building animation while the CHOAM frigate carries its cargo in
   (re/notes/starport.md "Flight"); the 2D pack's overlay frames are those landing lights (the check pack driver's
   "dots"), and now also their own glow layers (`render_glow.py --overlay-lights`, the repair pad's guide lights too;
-  `MapRenderer` queues the overlay frame's glow like the main frame's). 3D: the redesigned star port models have
-  `fx_landing_N` anchors (the pack's models.ini: the lamp sockets in the pit, Atreides / Harkonnen 8, Ordos 7) and
-  `SceneLights` lights them in sequence with the animation frame (green, every third amber, the last red), blinking
-  over the last frames, plus a faint green pool. The smuggler star port has the same 7 anchors on its pad
-  (the Ordos star port's pattern; 3D only: its 2D overlay frames are still the original's).
+  `MapRenderer` queues the overlay frame's glow like the main frame's). The redesigned star port models have
+  `fx_landing_N` anchors (the pack's models.ini: the lamp sockets in the pit, Atreides / Harkonnen 8, Ordos 7, the
+  smuggler's 7 on its pad). `SceneLights` lights them from the **frigate**, not from the building animation
+  (`render::starportLanding`): while a frigate of the side carries a delivery to the primary star port (flag 0x100,
+  not leaving), the first lamp is on, one more each step of its last 14 tiles (the newest pulsing), and all of them
+  blink while it is over the pad (descending, unloading); green, every third amber, the last red, plus a faint
+  green pool. So the smuggler star port, whose template has no animation (flags 0x700, no HAS_ANIMATION), lights
+  too. 3D: every redesigned star port; 2D Enhanced (`PackAnchors` projects `fx_landing*` like `fx_weld*`): the star
+  ports without an overlay animation (the smuggler's; the house star ports keep their pack overlay frames).
+  Check: `D2K_VFX_DEMO=exits D2K_VFX_DEMO_HOUSE=SMUGGLER D2K_VFX_DEMO_DX=12 --vfx-demo --at 40 40 --record-fps 10`
+  (H5V1; the demo buys a delivery every 120 ticks and lets it come 40 ticks later instead of 1500: the lamps come on
+  from about frame 100, all blink from about 185).
 
 ### Emission (glowing surfaces: lamps, energy cores, lit windows)
 The owner's idea: light from inside the buildings instead of lamps beside them. The redesigned models carry glTF
@@ -892,8 +1019,9 @@ refinery's arched windows.
 
 Everything holds the 120 Hz vsync except 3D at Retina full resolution, which already misses it at Day / Classic (GPU
 bound; the night adds ~1.2 ms: 8 lamp lights + bloom). The lamp budget came from the wide 3D view: with all ~40 lamps
-as lights it ran at 9.68 ms (p95 13.1); 0 / 12 lamp slots 8.34 ms (`D2K_LAMP_SLOTS`). The 2D lamps are quads (no
-budget). Lite profile: no lamps, no bloom.
+as lights it ran at 9.68 ms (p95 13.1); 0 / 12 lamp slots 8.34 ms (`D2K_LAMP_SLOTS`, since replaced by
+`D2K_MAX_LIGHTS`). That budget is gone since the clustered light grid (docs/3d-mode.md "Dynamic lights"): every
+lamp in view is lit. The 2D lamps are quads (no budget: every lamp of the view + 160 px is drawn). Lite profile: no lamps, no bloom.
 
 ## Quality: HDR rendering, tone mapping, EDR output, MSAA, anisotropy, VSync (`render/hdr.*`)
 
@@ -924,9 +1052,12 @@ MSAA texture), wrapped the same way. Then:
    `tonemap_fs`, MSL in `shaders_msl.hpp` + HLSL twin in `shaders.hlsl` → SPIR-V; slot 0 = the scene, slot 1 = the
    bloom): `scene + srgbEncode(bloom) * strength` (the 8-bit path adds the bloom that way: SDL encodes the linear
    bloom texture) → linear light → exposure (1; `D2K_EXPOSURE` for tests) → a **hue-preserving filmic shoulder**:
-   identity up to 0.8 linear (sRGB ~0.91, so sunlit sand is untouched), then `knee + room * (1 - exp(-(m - knee) / room))`
+   identity up to the knee - 0.8 linear with EDR output (sRGB ~0.91, so sunlit sand is untouched), **0.6 on an SDR
+   output** (sRGB ~0.80; see "SDR output" below) - then `knee + room * (1 - exp(-(m - knee) / room))`
    on the largest channel, approaching the peak (1 = SDR white); pixels hotter than the peak drift towards white
-   (fire cores, flashes) → sRGB.
+   (fire cores, flashes) - towards the same shoulder applied per channel, so the brightest channel saturates first
+   and the others catch up (orange → yellow → white; drifting towards the grey max passed fire through salmon
+   pink) → sRGB.
 Classic lighting in a float 3D scene: no shoulder, clamped at 1 (the old picture). Without the GPU renderer
 `Hdr::available()` is false and everything stays 8-bit. The sonic haze / lens post pass samples the float scene
 raw (clamped).
@@ -951,6 +1082,52 @@ stays an sRGB one and:
   SDR white. A screenshot reads the canvas and clips at 1 (an EDR screenshot equals the SDR one except ~700
   highlight pixels). MacBook Pro XDR: "display headroom 16.00x", "extended range active (half-float backbuffer)".
   Windows HDR: the same SDL calls, not tested yet. The row reads "Restart to apply" until the next start.
+- only on a display that can show EDR (macOS: `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`
+  > 1, `platform/mac_display.mm`): an SDR monitor (LG UltraWide: 1.00) keeps the 8-bit SDR swapchain. Moving the
+  window between displays switches (`App::retargetHdr`; to EDR only windowed - a one-frame 1 px resize re-creates
+  the backbuffer). `D2K_EDR=force|off` overrides. The 10th present logs the CAMetalLayer (SDL_gpu: 3 drawables,
+  display sync on with VSync, frames in flight 1 - the GPU renderer's choice). Measured on the LG at 100 Hz
+  (4800x2000 px, idle battle, 15 s): float vs SDR swapchain p50 10.0 / p99 10.5-11.8 ms either way, WindowServer
+  36-42 % either way (BetterDisplay alone keeps it at ~55 % with the game closed).
+
+### SDR output and the display adjustments (`DisplayAdjust`, Options → Display)
+Owner (2026-11-14): on the LG (an SDR monitor, the SDR swapchain) the picture felt too contrasty. Checked:
+- **Colour management**: the SDR CAMetalLayer is tagged `kCGColorSpaceSRGB` (logged with the swapchain line at the
+  10th present: "colour space ..."), the EDR one extended linear sRGB - both colour matched by macOS, so the SDR
+  frame is not shown raw on the monitor's gamut / curve. Gamma: the renderer is an sRGB one; the tone map decodes /
+  encodes the exact sRGB curve; nothing in between is linear-vs-gamma confused.
+- **Blacks**: below the knee the tone map is the identity; no toe, no black crush in the pipeline (the near-black
+  pixels of a frame are the shroud, the vignette and the night grade).
+- **Highlights**: this was the difference. With EDR the shoulder rolls off from 0.8 to the headroom (up to 4x);
+  on SDR it went from 0.8 to 1.0 - everything hotter (headlight cones, lamps, bloom, flashes, fire) was squeezed
+  into the top 10 % of the sRGB range: hard, blown highlights next to the dark night / dusk grade. Now the SDR knee
+  is 0.6 linear (`Hdr::sdrKnee_`, `D2K_SDR_KNEE` for tests): a softer roll-off that keeps their gradation. The
+  per-channel drift towards white (the fire fix) is unchanged. The night / dusk grades and the bloom are display
+  independent (no EDR tuning). Cost to Day: the brightest sunlit sand (0.8 linear) goes from sRGB 0.906 to 0.89;
+  most of the picture (below 0.6 linear) is unchanged. EDR output: unchanged. Graphics: Original: untouched.
+  The shipped Graphics previews (Modern lighting + HDR) shift by that much in their brightest pixels - re-render
+  them with the next preview refresh (`tools/release/render_previews.sh`; `check_previews.py` only checks the
+  engine version / packs).
+
+**Display adjustments** (Options → Graphics → Display, under every tab, and the in-game options; settings.ini
+`brightness`, `contrast`, `saturation` -50..50, `gamma` 80..140 = x100; `--display B,C,G,S` for one-frame runs):
+**Brightness**, **Contrast**, **Gamma** (0.80 - 1.40), **Saturation**, a "Reset picture" button and a test pattern
+(12 grey steps from black - 0 / 8 / 16 / 28 should stay apart - then sand, red, green, blue). Defaults = the picture
+unchanged. Render only, the last colour step of the whole frame (battlefield, panel, menus - like a game's gamma
+setting), **Enhanced / 3D only**: Graphics: Original never gets it (byte-identical with any value; the row shows
+"Enhanced / 3D only" instead of the pattern) - a 1998-exact picture with a gamma shift would no longer be exact.
+- Where: `Hdr::presentCanvas` (`tonemap_fs` with `c.y` = on, `d` = the values). EDR output: the canvas was already
+  drawn through it - the adjustments are added there (values above SDR white keep their headroom). SDR: while any
+  value is not at its default the frame is drawn into the same half-float canvas (`App::beginFrame`) and resolved
+  sRGB-coded into the 8-bit backbuffer; at the defaults SDR draws straight to the window as before (no extra pass,
+  pixel-identical). A screenshot of an SDR frame resolves first, so it shows the adjustments.
+- Maths (`displayAdjust` in shaders_msl.hpp / `tmDisplayAdjust` in shaders.hlsl): saturation around the Rec.709
+  luminance in linear light (`1 + s/100`); then on the sRGB-coded value (clamped to 1; the part above 1 is added
+  back): gamma `e^(100/g)`, contrast a symmetric power curve around mid grey, `p = 1 + 2k` / `1 / (1 - 2k)` with
+  `k = c x 0.006` (black and white stay; lower contrast lifts the shadows and lowers the highlights), brightness
+  `e + b(1 - e)` / `e(1 + b)` with `b = v / 200` (lifts towards white / scales towards black - nothing clips).
+- Live preview: the whole frame changes as a slider moves - in game the battlefield behind the options, in the
+  main menu the page itself, the preset preview picture and the test pattern.
 
 ### MSAA, anisotropy (3D) and the display
 `Renderer3D::Quality {msaa, aniso, hdr}` is fixed per renderer (the pipelines depend on it); `Session::sync3d`
@@ -983,6 +1160,12 @@ uses the original pieces (a `--graphics original` screenshot is byte-identical w
   shrouded cell; the "open" factor reaches 0 on that boundary, so the forced black never shows as a
   hard edge. Net result: black from half a cell outside the boundary, a ramp to full light about two
   tiles into the revealed area.
+- **Small openings**: the bias would keep a lone revealed cell black (its "open" value stays near
+  0.47): the cell FireAt clears under a turret or trooper shooting at the player's units, e.g. at a
+  carryall or ornithopters over the enemy base (re/notes/shroud.md §6), which the radar does show.
+  A clear cell with at most 4 clear cells in its 5x5 neighbourhood therefore gets full light, and the
+  non-hidden texels of the edge cells next to it get their edge piece's brightness, like the
+  original's cell + edge ring. Ordinary boundaries are unchanged (pixel-identical).
 - **Texture**: black with alpha = darkness, `SDL_BLENDMODE_BLEND`, linear filtering, drawn over the
   whole map with the terrain's origin snapping (`round(cam * zoom)`), so it stays locked to the tiles
   at any zoom, with smooth scrolling and screen shake.

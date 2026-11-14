@@ -13,10 +13,13 @@
 #include "formats/r16.hpp"
 #include "game/world.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 struct SDL_Renderer;
+struct SDL_Cursor;
 
 namespace d2k::render {
 
@@ -77,8 +80,17 @@ public:
     // (x, y) = mouse in output pixels. Original look: integer `scale` with the hotspot snapped
     // to whole game pixels; hq = Scale2x-upscaled frames, smooth scaling (Enhanced mode).
     void draw(Cursor c, float x, float y, float scale, bool hq);
+    // The same cursor as the SYSTEM (hardware) cursor: an SDL animated colour cursor built from
+    // the 8 frames (48 x 48 cells, hotspot at the centre; the shadow pixels as 50 % black), at
+    // `scale` window points per cursor pixel on a display of `density` pixels per point. The OS
+    // moves it, so the pointer keeps following the mouse when a frame is late (a frame drawn
+    // cursor froze with the game). False when it could not be made (then draw() it).
+    bool showSystem(Cursor c, float scale, bool hq, float density);
 
 private:
+    SDL_Cursor* makeSystem(Cursor c, float scale, bool hq, float density);
+    std::unordered_map<std::uint64_t, SDL_Cursor*> system_;
+    SDL_Cursor* current_ = nullptr;
     SDL_Renderer* r_;
     formats::R16File file_;
     formats::HouseColours colours_{};

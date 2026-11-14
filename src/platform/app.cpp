@@ -23,12 +23,15 @@
 #include "platform/touch_controls.hpp"
 #include "platform/ui.hpp"
 #include "render/cursor.hpp"
+#include "render/frame_probe.hpp"
 #include "render/hdr.hpp"
+#include "platform/mac_display.hpp"
 #include "render/text.hpp"
 #include "render3d/gpu.hpp"
 
 #include <cstring>
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <exception>
 #include <fstream>
@@ -129,7 +132,17 @@ App::App(Options opt) : opt_(std::move(opt)) {
     auto onOff = [](const std::string& v) { return v == "on" || v == "1" || v == "true"; };
     if (!opt_.hdr.empty()) settings_.hdr = onOff(opt_.hdr);
     if (!opt_.hdrOutput.empty()) settings_.hdrOutput = onOff(opt_.hdrOutput);
+    if (!opt_.display.empty()) {  // --display B,C,G,S (brightness, contrast, gamma x100, saturation)
+        int b = 0, c = 0, g = 100, sa = 0;
+        if (std::sscanf(opt_.display.c_str(), "%d,%d,%d,%d", &b, &c, &g, &sa) >= 1) {
+            settings_.brightness = std::clamp(b, Settings::kMinDisplayAdjust, Settings::kMaxDisplayAdjust);
+            settings_.contrast = std::clamp(c, Settings::kMinDisplayAdjust, Settings::kMaxDisplayAdjust);
+            settings_.gamma = std::clamp(g, Settings::kMinGamma, Settings::kMaxGamma);
+            settings_.saturation = std::clamp(sa, Settings::kMinDisplayAdjust, Settings::kMaxDisplayAdjust);
+        }
+    }
     if (opt_.msaa > 0) settings_.msaa = opt_.msaa >= 4 ? 4 : opt_.msaa >= 2 ? 2 : 1;
+    if (!opt_.resolution3d.empty()) settings_.resolution3d = Settings::resolution3dFrom(opt_.resolution3d);
     if (opt_.aniso > 0) settings_.aniso = opt_.aniso >= 16 ? 16 : opt_.aniso >= 4 ? 4 : 1;
     if (!opt_.vsync.empty()) settings_.vsync = Settings::vsyncFrom(opt_.vsync);
     if (opt_.fpsLimit >= 0) settings_.fpsLimit = opt_.fpsLimit;
@@ -142,6 +155,11 @@ App::App(Options opt) : opt_(std::move(opt)) {
     if (!opt_.artPack.empty()) settings_.artPack = opt_.artPack;
     if (opt_.perfOverlay) settings_.perfOverlay = true;
     if (!opt_.effects.empty()) settings_.effects = opt_.effects == "classic" ? Settings::Effects::Classic : Settings::Effects::Modern;
+    if (!opt_.controls.empty())
+        settings_.controls = opt_.controls == "modern" ? Settings::Controls::Modern : Settings::Controls::Original;
+    if (!opt_.vehicleAnimation.empty())
+        settings_.vehicleAnimation =
+            opt_.vehicleAnimation == "original" ? Settings::VehicleAnimation::Original : Settings::VehicleAnimation::Modern;
     // Language for this run (--language / --text-language / ... ; platform/language.hpp).
     if (!opt_.language.empty()) {
         settings_.language = opt_.language;
@@ -317,8 +335,11 @@ bool App::initVideo() {
     applySync();
     if (wantHdr) {
         hdrOut_ = std::make_unique<render::Hdr>(renderer_);
-        hdrExtended_ = render3d::gpuHdrOk() && hdrOut_->available() && setHdrSwapchain(true);
-        if (!hdrExtended_) hdrOut_.reset();
+        hdrWanted_ = render3d::gpuHdrOk() && hdrOut_->available();
+        // An SDR display (no EDR headroom, e.g. an external monitor without HDR): the extended-range
+        // half-float swapchain would only cost compositing; SDR until the window is on an EDR display.
+        hdrExtended_ = hdrWanted_ && edrDisplay(true) && setHdrSwapchain(true);
+        if (!hdrWanted_) hdrOut_.reset();
         SDL_SetWindowSize(window_, winW, winH);
         if (startFull) SDL_SetWindowFullscreen(window_, true);
         hdrCheckFrames_ = hdrExtended_ ? 3 : 0;
@@ -375,9 +396,70 @@ bool App::setHdrSwapchain(bool hdr) {
     return true;
 }
 
-// The frame's target: the EDR canvas (half float, sRGB-coded values kept above 1) or the window.
+// The window's display can show EDR (macOS: its potential headroom > 1; unknown elsewhere = yes).
+// D2K_EDR=force / off overrides (measurements).
+bool App::edrDisplay(bool log) {
+    const char* e = std::getenv("D2K_EDR");
+    if (e && std::strcmp(e, "force") == 0) return true;
+    if (e && std::strcmp(e, "off") == 0) return false;
+    const float h = potentialEdrHeadroom(window_);
+    const SDL_DisplayID d = SDL_GetDisplayForWindow(window_);
+    if (log || h >= 0)
+        SDL_Log("HDR output: %s - potential EDR headroom %.2f%s", SDL_GetDisplayName(d) ? SDL_GetDisplayName(d) : "?", double(h),
+                h >= 0 && h <= 1.0f ? " (an SDR display: SDR swapchain)" : "");
+    return h < 0 || h > 1.0f;
+}
+
+// The window moved to another display: the extended-range swapchain only where it can show EDR.
+// To EDR: the GPU renderer re-creates its backbuffer in the swapchain's format only when the
+// swapchain size changes, so a window is made one pixel shorter for a frame (as at the start);
+// in fullscreen the swapchain stays SDR until the next start.
+void App::retargetHdr() {
+    if (!hdrWanted_ || !hdrOut_) return;
+    const bool want = edrDisplay(false);
+    if (want == hdrExtended_) return;
+    if (!want) {
+        setHdrSwapchain(false);
+        hdrExtended_ = false;
+        if (canvas_) SDL_DestroyTexture(canvas_);
+        canvas_ = nullptr;
+        render::setScreenTarget(nullptr);
+        SDL_Log("HDR output: SDR display - SDR swapchain");
+    } else {
+        if (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) return;
+        if (!setHdrSwapchain(true)) return;
+        hdrExtended_ = true;
+        hdrCheckFrames_ = 4;
+        int w = 0, h = 0;
+        SDL_GetWindowSize(window_, &w, &h);
+        SDL_SetWindowSize(window_, w, h - 1);
+        restoreHeight_ = h;
+        SDL_Log("HDR output: EDR display - extended range again");
+    }
+    setHdrOutputStart(settings_.hdrOutput, hdrExtended_);
+}
+
+// The display adjustments of this frame (Options -> Display; Enhanced / 3D only - Original stays
+// byte-identical): identity = none (an SDR frame is then drawn straight to the window, as before).
+render::DisplayAdjust App::displayAdjust() const {
+    if (!settings_.enhanced() || !settings_.displayAdjusted()) return {};
+    return render::DisplayAdjust::fromSettings(settings_.brightness, settings_.contrast, settings_.gamma, settings_.saturation);
+}
+
+// The frame's target: the canvas (half float, sRGB-coded values; EDR: kept above 1) or the window.
+// SDR uses the canvas only while a display adjustment is set (presentFrame applies it).
 void App::beginFrame() {
-    if (!hdrExtended_) {
+    frameResolved_ = false;
+    canvasFrame_ = hdrExtended_;
+    if (!canvasFrame_ && !displayAdjust().identity()) {
+        if (!hdrOut_) hdrOut_ = std::make_unique<render::Hdr>(renderer_);
+        canvasFrame_ = hdrOut_->available();
+    }
+    if (!canvasFrame_) {
+        if (canvas_) {  // the adjustments were reset (SDR): back to drawing straight to the window
+            SDL_DestroyTexture(canvas_);
+            canvas_ = nullptr;
+        }
         render::setScreenTarget(nullptr);
         return;
     }
@@ -393,19 +475,37 @@ void App::beginFrame() {
     SDL_SetRenderTarget(renderer_, canvas_);
 }
 
-// Present; EDR: the canvas decoded to linear light into the half-float backbuffer first.
-void App::presentFrame() {
-    if (hdrExtended_ && canvas_ && hdrOut_) {
+// The canvas into the backbuffer, with the display adjustments: EDR decoded to linear light (the
+// half-float backbuffer), SDR sRGB-coded. Once per frame (an SDR screenshot resolves first, so it
+// shows the adjusted picture; an EDR one reads the canvas).
+void App::resolveFrame() {
+    if (frameResolved_) return;
+    frameResolved_ = true;
+    if (canvasFrame_ && canvas_ && hdrOut_) {
         SDL_SetRenderTarget(renderer_, nullptr);
         SDL_SetRenderViewport(renderer_, nullptr);
         SDL_SetRenderClipRect(renderer_, nullptr);
         int w = 0, h = 0;
         SDL_GetRenderOutputSize(renderer_, &w, &h);
-        hdrOut_->presentCanvas(canvas_, SDL_FRect{0, 0, float(w), float(h)});
+        hdrOut_->presentCanvas(canvas_, SDL_FRect{0, 0, float(w), float(h)}, hdrExtended_, displayAdjust());
     } else if (SDL_GetRenderTarget(renderer_)) {
         SDL_SetRenderTarget(renderer_, nullptr);
     }
+}
+
+// Present (the canvas resolved into the backbuffer first).
+void App::presentFrame() {
+    resolveFrame();
     SDL_RenderPresent(renderer_);
+    if (++presents_ == 10) {  // the swapchain as SDL_gpu set it up (drawables, display sync, format)
+        if (const std::string info = metalLayerInfo(window_); !info.empty()) SDL_Log("Swapchain: %s", info.c_str());
+    }
+    if (restoreHeight_ > 0) {  // retargetHdr: back to the full height (the backbuffer is re-created)
+        int w = 0, h = 0;
+        SDL_GetWindowSize(window_, &w, &h);
+        SDL_SetWindowSize(window_, w, restoreHeight_);
+        restoreHeight_ = 0;
+    }
     if (hdrCheckFrames_ > 0 && --hdrCheckFrames_ == 0) {
         // The backbuffer must have become half float (the swapchain's format) by now; else SDR.
         const SDL_Rect one{0, 0, 1, 1};
@@ -439,7 +539,10 @@ void App::applySync() {
     int now = 0;
     vsync_ = SDL_GetRenderVSync(renderer_, &now) && now != SDL_RENDERER_VSYNC_DISABLED;
     if (!vsync_ && settings_.vsync != Settings::VSync::Off) SDL_Log("VSync unavailable (%s): pacing frames to the display rate", SDL_GetError());
-    SDL_Log("Display: VSync %s (%d), frame limit %s", Settings::vsyncName(settings_.vsync), now,
+    const SDL_DisplayID disp = SDL_GetDisplayForWindow(window_);
+    const SDL_DisplayMode* dm = SDL_GetCurrentDisplayMode(disp);
+    SDL_Log("Display: %s at %.0f Hz, VSync %s (%d), frame limit %s", SDL_GetDisplayName(disp) ? SDL_GetDisplayName(disp) : "?",
+            dm ? double(dm->refresh_rate) : 0.0, Settings::vsyncName(settings_.vsync), now,
             settings_.fpsLimit > 0 ? std::to_string(settings_.fpsLimit).c_str() : "none");
     if (hdrExtended_) setHdrSwapchain(true);  // SDL_SetRenderVSync may have reset it to SDR
 }
@@ -557,6 +660,7 @@ bool App::loadData(const std::string& dir) {
     }
     if (audio_) {
         sounds_ = std::make_unique<SoundBank>(dir);
+        sounds_->startPrefetch();
         music_ = opt_.noMusic ? MusicPlayer{} : MusicPlayer(dir);
     }
     if (persist_ && !settings_.speedFromFile) {
@@ -601,6 +705,7 @@ bool App::startGame(const GameStart& start) {
     cfg.battle = opt_.battle;
     cfg.vfxDemo = opt_.vfxDemo;
     cfg.selectAll = opt_.selectAll;
+    cfg.liveTiming = persist_;
     cfg.cursorMode = opt_.cursorMode;
     if (opt_.smoke) cfg.mouseAt = opt_.cursorAt;
     cfg.sidebarPage = opt_.sidebarPage;
@@ -608,7 +713,10 @@ bool App::startGame(const GameStart& start) {
     cfg.cameraTilt = opt_.cameraTilt;
     cfg.cameraYaw = opt_.cameraYaw;
     if (previews_) previews_->release();  // the preview game's GPU memory
-    if (sounds_) sounds_->setOverlay(g->modsDataDir);  // community mission sounds (cleared in the menu)
+    if (sounds_) {
+        // Community mission sounds (cleared in the menu); a new overlay is decoded in the background too.
+        if (sounds_->setOverlay(g->modsDataDir)) sounds_->startPrefetch();
+    }
     session_ = std::make_unique<Session>(renderer_, std::move(g), settings_, audio_.get(), sounds_.get(), cfg);
     if (!opt_.recordDir.empty() || opt_.fixedStep) {
         std::error_code ec;
@@ -738,7 +846,7 @@ void App::updateSound() {
         // Campaign pages: speech (territory announcements, S_SCORETICK) through QueueAudioToPlay
         // on the speech channel at volume 100, UI samples on the click channels.
         if (sounds_) {
-            sounds_->setOverlay({});  // back from a community mission: the game's own sounds
+            if (sounds_->setOverlay({})) sounds_->startPrefetch();  // back from a community mission: the game's own sounds
             ChannelOutput out(audio_.get(), sounds_.get());
             for (const MenuSound& m : menu_->takeSounds()) {
                 const int id = sounds_->idOf(m.name);
@@ -791,6 +899,9 @@ void App::drawPerfOverlay() {
 
 void App::drawCursor() {
     if (!cursor_ || !realMouse_) return;  // iPad: only for a connected mouse / trackpad
+    // Desktop, mouse over the window: the system cursor shows the game's cursor (it keeps moving
+    // when a frame is late); one-frame runs (--cursor-at, screenshots) and the iPad draw it.
+    const bool system = !kTouchPlatform && persist_ && !opt_.cursorAt && SDL_GetMouseFocus() == window_ && !systemCursorFailed_;
     float x = 0, y = 0;
     if (opt_.cursorAt) {
         x = opt_.cursorAt->first;
@@ -808,13 +919,30 @@ void App::drawCursor() {
     }
     SDL_SetRenderViewport(renderer_, nullptr);
     SDL_SetRenderClipRect(renderer_, nullptr);
+    render::Cursor id = render::Cursor::Arrow;
+    float scale = 1;
+    bool hq = false;
     if (session_) {
         const Session::CursorChoice c = session_->cursorAt(x, y);
-        cursor_->draw(c.id, x, y, c.scale, c.hq);
+        id = c.id;
+        scale = c.scale;
+        hq = c.hq;
     } else {
-        const float s = float(std::max(1, std::min(ow / 640, oh / 400)));
-        cursor_->draw(static_cast<render::Cursor>(menu_->cursorId()), x, y, s, settings_.enhanced());
+        scale = float(std::max(1, std::min(ow / 640, oh / 400)));
+        id = static_cast<render::Cursor>(menu_->cursorId());
+        hq = settings_.enhanced();
     }
+    if (system) {
+        // scale is in output pixels per cursor pixel: in points for the system cursor.
+        const float outPerPt = ww > 0 ? float(ow) / float(ww) : 1.0f;
+        if (cursor_->showSystem(id, scale / outPerPt, hq, SDL_GetWindowDisplayScale(window_))) {
+            if (!SDL_CursorVisible()) SDL_ShowCursor();
+            return;
+        }
+        systemCursorFailed_ = true;
+    }
+    if (SDL_CursorVisible()) SDL_HideCursor();
+    cursor_->draw(id, x, y, scale, hq);
 }
 
 // --install-from: unpack the Gruntmods installer (or reuse the copy) and use that data folder.
@@ -979,13 +1107,24 @@ int App::run() {
     int framesLeft = opt_.frames;  // --frames: one-frame modes run this many frames
     std::vector<double> cpuMs, frameMs;
     Uint64 frameStart = SDL_GetTicksNS();
+    // D2K_FRAME_LOG=FILE: per-frame times + sections (render/frame_probe.hpp); D2K_QUIT_AFTER=S: quit after S seconds.
+    std::FILE* frameLog = nullptr;
+    if (const char* e = std::getenv("D2K_FRAME_LOG"); e && *e) {
+        frameLog = std::fopen(e, "w");
+        render::FrameProbe::get().on = frameLog != nullptr;
+    }
+    const double quitAfter = std::getenv("D2K_QUIT_AFTER") ? std::atof(std::getenv("D2K_QUIT_AFTER")) : 0.0;
+    const Uint64 runStart = SDL_GetTicksNS();
+    Uint64 logLast = runStart;
     while (running) {
         const Uint64 cpuStart = SDL_GetTicksNS();
+        if (quitAfter > 0 && double(cpuStart - runStart) / 1e9 > quitAfter) running = false;
         SDL_Event e;
         const float pixelsPerPt = windowToPixels(window_);  // 1 unless Render resolution: Full on Retina
         while (SDL_PollEvent(&e)) {
             eventToPixels(e, pixelsPerPt);  // mouse positions in output pixels from here on (platform/pointer.hpp)
             if (e.type == SDL_EVENT_QUIT) running = false;
+            if (e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) retargetHdr();
             if (e.type == SDL_EVENT_WINDOW_HDR_STATE_CHANGED || e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) updateHdrHeadroom(false);
             if constexpr (kAndroid) {
                 // Android: the surface often starts smaller (system bars / cutout) and grows once immersive
@@ -1056,9 +1195,15 @@ int App::run() {
             const bool sessionInput = !session_->paused() && session_->endState() == game::GameEnd::None;
             if (sessionInput) touch_->update(*session_, *ui_);
             else touch_->reset();
-            session_->update();
+            {
+                render::FrameProbe::Scope ps("update");
+                session_->update();
+            }
             ui_->beginFrame();
-            session_->render(*ui_);
+            {
+                render::FrameProbe::Scope ps("render");
+                session_->render(*ui_);
+            }
             // On-screen touch buttons: always on the iPad, elsewhere once a touch screen was used.
             if (sessionInput && (kTouchPlatform || touch_->used() || session_->phoneLayout())) touch_->draw(*session_, *ui_);
             ui_->endFrame();
@@ -1098,21 +1243,27 @@ int App::run() {
         }
 
         if (!movies_->active()) drawCursor();
+        else if (cursor_ && SDL_CursorVisible()) SDL_HideCursor();  // (the system cursor: none over a movie)
         drawPerfOverlay();
         const bool lastFrame = framesLeft <= 1;
         std::string shot = !lastFrame ? std::string() : !opt_.menuScreenshot.empty() ? opt_.menuScreenshot : opt_.screenshot;
-        if (!opt_.recordDir.empty() && session_) {  // --record: every frame
+        if (!opt_.recordDir.empty() && session_) {  // --record: every frame (D2K_RECORD_FROM=N: from frame N on)
+            static const int from = [] { const char* e = std::getenv("D2K_RECORD_FROM"); return e ? std::atoi(e) : 0; }();
             char name[32];
-            SDL_snprintf(name, sizeof name, "/frame_%05d.bmp", recordFrame_++);
-            shot = opt_.recordDir + name;
+            SDL_snprintf(name, sizeof name, "/frame_%05d.bmp", recordFrame_);
+            if (recordFrame_++ >= from) shot = opt_.recordDir + name;
         }
         perfCpuEnd_ = SDL_GetTicksNS();
         if (opt_.frames > 1) cpuMs.push_back(double(perfCpuEnd_ - cpuStart) / 1e6);
+        if (!shot.empty() && !hdrExtended_) resolveFrame();  // SDR: the shot shows the display adjustments
         if (!shot.empty() && !saveScreenshot(shot)) {
             SDL_Log("Screenshot failed: %s", SDL_GetError());
             rc = 1;
         }
-        presentFrame();
+        {
+            render::FrameProbe::Scope ps("present");
+            presentFrame();
+        }
         if (!syncApplied_ || appliedVsync_ != settings_.vsync) applySync();
         {
             // Frame pacing: the frame limit (Settings::fpsLimit; also under vsync when it is below
@@ -1131,7 +1282,10 @@ int App::run() {
                 nextFrameNs_ = SDL_GetTicksNS();
             }
         }
-        updateSound();
+        {
+            render::FrameProbe::Scope ps("sound");
+            updateSound();
+        }
         if (settings_.perfOverlay) {
             const Uint64 now = SDL_GetTicksNS();
             if (perfFrameMs_.size() < 120) {
@@ -1145,6 +1299,18 @@ int App::run() {
             perfLast_ = now;
         } else {
             perfLast_ = SDL_GetTicksNS();
+        }
+        if (frameLog) {
+            render::FrameProbe& fp = render::FrameProbe::get();
+            const Uint64 now = SDL_GetTicksNS();
+            std::fprintf(frameLog, "%.3f cpu %.2f frame %.2f ticks %d", double(now - runStart) / 1e9,
+                         double(perfCpuEnd_ - cpuStart) / 1e6, double(now - logLast) / 1e6, fp.ticks);
+            for (int i = 0; i < fp.count; ++i)
+                if (fp.sections[std::size_t(i)].ns > 200000)  // > 0.2 ms
+                    std::fprintf(frameLog, " %s %.2f", fp.sections[std::size_t(i)].name, double(fp.sections[std::size_t(i)].ns) / 1e6);
+            std::fputc('\n', frameLog);
+            fp.reset();
+            logLast = now;
         }
         if (opt_.frames > 1) {
             const Uint64 now = SDL_GetTicksNS();
@@ -1198,6 +1364,7 @@ int App::run() {
             }
         }
     }
+    if (frameLog) std::fclose(frameLog);
     persistSettings();
     return rc;
 }

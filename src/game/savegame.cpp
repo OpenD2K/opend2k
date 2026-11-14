@@ -73,23 +73,52 @@ constexpr std::uint32_t kMaxElements = 1u << 20;
 
 struct CountAr {
     std::size_t n = 0;
+    std::uint32_t version = kSaveVersion;
     template <class... T> constexpr void operator()(T&...) { n += sizeof...(T); }
     template <class T, class F> constexpr void slots(std::vector<T>&, F) { ++n; }
+    constexpr void poolLinks(std::vector<ObjectLink>&) { ++n; }
+    constexpr void poolLinksTail(std::vector<ObjectLink>&) {}
 };
 
 struct OutAr {
     SaveWriter& w;
+    std::uint32_t version = kSaveVersion;
     template <class... T> void operator()(T&... v) { (one(v), ...); }
     template <class T> void one(T& v);
     // Pool slot arrays: most slots hold their freed/default contents; one byte marks those.
     template <class T, class F> void slots(std::vector<T>& v, F makeDefault);
+    // Side::links: the first kObjectsPerSide entries without a count (the layout of the former
+    // fixed array, so a 1000-slot game saves exactly as before) ...
+    void poolLinks(std::vector<ObjectLink>& v) {
+        for (std::size_t i = 0; i < std::size_t(kObjectsPerSide); ++i) {
+            ObjectLink l = i < v.size() ? v[i] : ObjectLink{};
+            one(l);
+        }
+    }
+    // ... and the entries of a grown pool (v8, at the end of the world section).
+    void poolLinksTail(std::vector<ObjectLink>& v) {
+        const std::size_t n = v.size() > std::size_t(kObjectsPerSide) ? v.size() - kObjectsPerSide : 0;
+        w.u32(static_cast<std::uint32_t>(n));
+        for (std::size_t i = 0; i < n; ++i) one(v[kObjectsPerSide + i]);
+    }
 };
 
 struct InAr {
     SaveReader& r;
+    std::uint32_t version = kSaveVersion;
     template <class... T> void operator()(T&... v) { (one(v), ...); }
     template <class T> void one(T& v);
     template <class T, class F> void slots(std::vector<T>& v, F makeDefault);
+    void poolLinks(std::vector<ObjectLink>& v) {
+        v.assign(std::size_t(kObjectsPerSide), ObjectLink{});
+        for (auto& l : v) one(l);
+    }
+    void poolLinksTail(std::vector<ObjectLink>& v) {
+        const std::uint32_t n = r.u32();
+        if (n > std::uint32_t(kMaxObjectsUnlimited - kObjectsPerSide)) throw SaveError("save game: bad pool size");
+        v.resize(std::size_t(kObjectsPerSide) + n);
+        for (std::uint32_t i = 0; i < n; ++i) one(v[kObjectsPerSide + i]);
+    }
 };
 
 }  // namespace
@@ -191,7 +220,8 @@ struct SaveAccess {
         ar.slots(s.buildings, [](int i) { Building b; b.index = i; return b; });
         ar.slots(s.bullets, [](int i) { Bullet b; b.index = i; return b; });
         ar.slots(s.explosions, [](int i) { Explosion e; e.index = i; return e; });
-        ar(s.links, s.firstUnit, s.lastUnit, s.firstBuilding, s.lastBuilding, s.firstBullet, s.lastBullet,
+        ar.poolLinks(s.links);  // entries past 1000: World io (v8)
+        ar(s.firstUnit, s.lastUnit, s.firstBuilding, s.lastBuilding, s.firstBullet, s.lastBullet,
            s.firstExplosion, s.lastExplosion, s.freeList);
         ar(s.unitsBuilt, s.buildingsBuilt, s.unitsLost, s.buildingsLost, s.unitsKilled, s.buildingsKilled,
            s.harvesterCount, s.carryallCount, s.unitsBuiltPerType, s.unitsExistPerType, s.unitsLostPerType,
@@ -223,6 +253,12 @@ struct SaveAccess {
         ar(w.ext_);  // v4
         ar(w.rallyPointsEnabled, w.rallyPoints_, w.rallyPending_);  // v5
         ar(w.scriptSide_, w.playAsHostiles_);                        // v6
+        if (ar.version >= 8) {
+            ar(w.unlimitedObjects_);
+            for (Side& s : w.sides_) ar.poolLinksTail(s.links);
+        } else {
+            w.unlimitedObjects_ = false;  // older saves: the original 1000-slot pools
+        }
     }
 
     static void save(const World& cw, SaveWriter& out) {
@@ -230,12 +266,22 @@ struct SaveAccess {
         OutAr ar{out};
         io(ar, w);
     }
-    static void load(World& w, SaveReader& in) {
+    static void load(World& w, SaveReader& in, std::uint32_t version) {
         const int width = w.width_, height = w.height_;
-        InAr ar{in};
+        InAr ar{in, version};
         io(ar, w);
         if (w.width_ != width || w.height_ != height || w.cells_.size() != std::size_t(width) * height)
             throw SaveError("save game map size does not match the loaded map");
+        for (Side& s : w.sides_) {
+            const std::size_t n = s.links.size();
+            if (s.units.size() != n || s.buildings.size() != n || s.bullets.size() != n || s.explosions.size() != n ||
+                (n > std::size_t(kObjectsPerSide) && !w.unlimitedObjects_))
+                throw SaveError("save game: inconsistent object pool");
+            for (int i : s.freeList)
+                if (i < 0 || std::size_t(i) >= n) throw SaveError("save game: bad free slot");
+            // Unlimited: the capacity a new game reserves, so growing never moves an object.
+            if (w.unlimitedObjects_) s.reservePool(kMaxObjectsUnlimited);
+        }
         w.sounds_.clear();
         w.uiSounds_.clear();
         w.shots_.clear();
@@ -387,9 +433,9 @@ D2K_SAVE_SIZE(Unit, 212);
 D2K_SAVE_SIZE(Building, 112);
 D2K_SAVE_SIZE(Bullet, 92);
 D2K_SAVE_SIZE(Explosion, 56);
-D2K_SAVE_SIZE(Side, 17096);
+D2K_SAVE_SIZE(Side, 5120);  // (links: a vector since v8)
 D2K_SAVE_SIZE(PathFinder, 24068);
-D2K_SAVE_SIZE(World, 227576);  // (+8: Rules::ext, not saved - set by the loader)
+D2K_SAVE_SIZE(World, 131784);  // (+8: Rules::ext and Rules::unlimitedObjects, not saved - set by the loader; orderUnitLimit_: a UI setting, not saved)
 #undef D2K_SAVE_SIZE
 #endif
 
@@ -426,6 +472,7 @@ void writeMeta(SaveWriter& w, const SaveMeta& m) {
 
 SaveMeta readMeta(SaveReader& r, std::uint32_t version) {
     SaveMeta m;
+    m.version = version;
     m.name = r.str();
     m.savedAt = r.i64();
     m.map = r.str();
@@ -497,9 +544,9 @@ std::vector<std::uint8_t> saveWorldState(const World& w) {
     return std::move(out.data());
 }
 
-void loadWorldState(World& w, std::span<const std::uint8_t> data) {
+void loadWorldState(World& w, std::span<const std::uint8_t> data, std::uint32_t version) {
     SaveReader in(data);
-    SaveAccess::load(w, in);
+    SaveAccess::load(w, in, version);
     if (!in.atEnd()) throw SaveError("save game: trailing data in the world section");
 }
 

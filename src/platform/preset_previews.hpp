@@ -56,6 +56,9 @@ PreviewShot previewShotFor(PictureOption o);
 // Lays the curated scene out in a freshly created world (Session::createWorld with
 // SessionConfig::presetPreview; the objects of the map and its events were stripped).
 void presetPreviewScene(game::World& world, int side);
+// Check scene (D2K_FACING_DEMO=<UNIT NAME>,<UNIT NAME>,...): one row per unit type from tile (x, y), the
+// 8 body facings (0 = north, clockwise) 3 tiles apart, rows 3 tiles apart - unit shadows and lamps per facing.
+void facingDemoScene(game::World& world, int side, const char* types, int x, int y);
 
 class GraphicsPreviews {
 public:
@@ -81,6 +84,16 @@ public:
     // pack's models). False when the preset cannot be previewed (3D without a model pack).
     static bool presetSettings(int preset, const Settings& current, Settings& out);
     Picture preset(int preset, const Settings& current, bool prefetch = false);
+    // The standard scene's settings for the graphics mode of `current` (owner 2026-11-14: the Custom
+    // tab shows what an option does, not the player's exact combination): the default setup with the
+    // preset of that mode applied - the base the shipped set steps every picture row from - keeping
+    // only what is the player's install (art / model pack choice, PS1 disc, device profile). Original
+    // mode: the Original preset over the Enhanced one (as the Original tab).
+    static Settings standardScene(const Settings& current);
+    // The Custom tab's comparison for row `o`: the standard scene with only that row set to its value in
+    // `now` ("Now") and to the value a click (`dir`) would choose ("next"). Both are shipped pictures
+    // for the released packs, so they appear at once.
+    static void comparison(const Settings& current, PictureOption o, int dir, Settings& now, Settings& next);
     Picture picture(const Settings& s, PreviewShot shot, bool prefetch = false);
     // Whether `a` and `b` draw the same preview (a row that does not change the picture here).
     bool samePicture(const Settings& a, const Settings& b, PreviewShot shot) const;
@@ -177,8 +190,9 @@ private:
 // preset badge and "Rendering preview..." (pending) or `note` / "Preview unavailable".
 void drawPreviewCard(Ui& ui, const SDL_FRect& r, const GraphicsPreviews::Picture& p, const char* badge, const char* note,
                      float textScale);
-// The Custom tab's column inside `area`: the row pointed at (probe) compared - the picture with the
-// current settings and with that row stepped as a click would - or the current setup alone.
+// The Custom tab's column inside `area`: the row pointed at (probe) compared on the standard scene
+// (GraphicsPreviews::comparison: the player's value of that row vs. the one a click would choose) -
+// or the current setup alone.
 void customPreviewColumn(Ui& ui, GraphicsPreviews& previews, const Settings& s, const PictureProbe& probe, const SDL_FRect& area,
                          float textScale);
 inline void prefetchPreviews(GraphicsPreviews& p, const Settings& s) { p.prefetch(s); }

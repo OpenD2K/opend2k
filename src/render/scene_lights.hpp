@@ -44,7 +44,9 @@ struct Lamp {
     float dirX = 0, dirY = 1;  // cone: direction on the ground (unit)
     float spread = 0.45f;      // cone: half angle (radians)
     float r = 1, g = 1, b = 1, a = 0;  // colour, a = intensity
-    float priority = 1;        // 3D point-light slots: higher first (then nearer the view centre)
+    float priority = 1;        // 3D light budget: higher first (with the lamp's screen coverage)
+    std::uint32_t id = 0;      // stable while its object lives (object kind / side / index + the lamp's number on it):
+                               // 3D fades a lamp in / out when the light budget takes / drops it
 };
 
 // The visible lamp itself: a small hot glow at (x, y - z) in 2D, a billboard in 3D.
@@ -63,8 +65,22 @@ struct Flare {
 // dayPulse (3D models): the wind trap's pulse also reads by day - it follows the rhythm of the original's
 // working animation (the building's animation counter) and adds up to ~0.5 on its peaks when the lamps
 // are low (Day + Modern: 0.2 .. 0.84; night 0.66 .. 1.2); off while the side has no power at all.
+// overlayBlink (models.ini `glow = blink`, EffectAnchors::buildingGlowBlink): instead of the steady glow the
+// surfaces blink twice per cycle of the original's overlay animation, which the redesigned art does not draw.
 float buildingGlow(const game::World& w, const formats::Templates& t, int side, int building, float lamps, double time,
-                   bool dayPulse = false);
+                   bool dayPulse = false, int overlayBlink = 0);
+
+// Star port landing lights (render only): while the CHOAM frigate carries a delivery to side `side`'s primary
+// star port `building` (frigate flag 0x100, not leaving), how many of its `lamps` landing lamps are lit: the first
+// one as soon as the frigate is inbound, one more each step of its last 14 tiles, all of them blinking (on) while
+// it is over the pad (descending, unloading); lastOn: the pulse of the newest lamp on approach. False = none.
+struct LandingLights {
+    bool active = false;
+    int lit = 0;
+    float on = 1, lastOn = 1;
+};
+bool starportLanding(const game::World& w, const formats::Templates& t, int side, int building, double time, int lamps,
+                     LandingLights& out);
 
 class SceneLights {
 public:
@@ -120,8 +136,13 @@ private:
     bool lightBlendOk_ = true;
     float boost_[3] = {1, 1, 1};
     std::vector<Lamp> lamps_;
+    std::uint32_t curId_ = 0, ord_ = 0;  // Lamp::id of the object being added, its next lamp number
+    void beginObject(std::uint32_t id) {
+        curId_ = id;
+        ord_ = 0;
+    }
     std::vector<Flare> flares_;
-    std::vector<SDL_Vertex> vPool_, vCone_, vFlare_;
+    std::vector<SDL_Vertex> vPool_, vCone_, vConeAdd_, vFlare_;
     // Per unit / building type: 0 none, else a kind (scene_lights.cpp).
     std::vector<std::uint8_t> unitKind_, buildingKind_;
     float view_[4] = {};

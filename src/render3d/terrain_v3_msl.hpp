@@ -169,7 +169,7 @@ float3 concreteSlab3(float2 p, float grainRel, thread float3& nrm, float3 sand, 
 }
 
 fragment float4 terrain3_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]],
-                            constant F3U& u3 [[buffer(2)]],
+                            constant F3U& u3 [[buffer(2)]], const device uint4* plg [[buffer(3)]],
                             texture2d_array<float> alb [[texture(0)]], texture2d_array<float> nor [[texture(1)]],
                             texture2d<float> splatA [[texture(2)]], texture2d<float> splatB [[texture(3)]],
                             texture2d<float> spiceMap [[texture(4)]], texture2d<float> shroud [[texture(5)]],
@@ -180,6 +180,20 @@ fragment float4 terrain3_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], 
                             sampler shadowSamp [[sampler(6)]], sampler guideSamp [[sampler(7)]]) {
     const float2 p = in.wpos.xz;
     const float2 mapSize = u.fog2.yz;
+    // Shroud / the map's edge (fog2.w: 0 no shroud, 1 shroud, 2 baked for the Enhanced 2D view: no
+    // shroud, no edge fade). Black under full shroud: a whole SIMD group of such pixels leaves here
+    // (the result is the same: the end multiplies by 1 - s; the others' derivatives stay intact).
+    float s = 0.0;
+    if (u.fog2.w > 0.5 && u.fog2.w < 1.5) s = shroud.sample(shroudSamp, p / mapSize).a;
+    if (u.fog2.w < 1.5) {
+        const float2 ed = min(p, mapSize - p);
+        s = max(s, 1.0 - smoothstep(0.0, 8.0, min(ed.x, ed.y)));
+    }
+    if (simd_all(s >= 1.0)) return float4(0.0, 0.0, 0.0, 1.0);
+    // Per cell (DesignedTerrain::buildSpiceTex): b > 0 = spice within reach of spiceField, a > 0 =
+    // relief (guide height) within reach of the slope / rim taps below. Without them those reads
+    // are all zeros: they are skipped (the same result, a fraction of the work on open sand).
+    const float4 near = spiceMap.sample(spiceSamp, p / mapSize);
     const float3 dpx = dfdx(in.wpos), dpy = dfdy(in.wpos);
     const float3 gn = normalize(in.nrm);
     const bool bake = u3.guide.z > 0.5;
@@ -203,10 +217,14 @@ fragment float4 terrain3_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], 
     const float4 g = guideAt(guide, guideSamp, pg, mapSize, tpp, lod);
     // Macro slope (central differences 1.5 px apart).
     const float e = 1.5;
-    const float hE = guideAt(guide, guideSamp, pg + float2(e, 0.0), mapSize, tpp, lod).g;
-    const float hW = guideAt(guide, guideSamp, pg - float2(e, 0.0), mapSize, tpp, lod).g;
-    const float hS = guideAt(guide, guideSamp, pg + float2(0.0, e), mapSize, tpp, lod).g;
-    const float hN = guideAt(guide, guideSamp, pg - float2(0.0, e), mapSize, tpp, lod).g;
+    const bool relief = near.a > 0.0 || lod >= 2.0;
+    float hE = g.g, hW = g.g, hS = g.g, hN = g.g;
+    if (relief) {
+        hE = guideAt(guide, guideSamp, pg + float2(e, 0.0), mapSize, tpp, lod).g;
+        hW = guideAt(guide, guideSamp, pg - float2(e, 0.0), mapSize, tpp, lod).g;
+        hS = guideAt(guide, guideSamp, pg + float2(0.0, e), mapSize, tpp, lod).g;
+        hN = guideAt(guide, guideSamp, pg - float2(0.0, e), mapSize, tpp, lod).g;
+    }
     const float2 mg = float2(hE - hW, hS - hN) * (u3.guide.x / (2.0 * e));  // px rise per px
     const float ml = length(mg);
     const float steep = smoothstep(0.45, 1.05, ml);
@@ -247,8 +265,11 @@ fragment float4 terrain3_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], 
     const float foot = 1.0 - smoothstep(0.03, 0.16, hF);
     // The rim: the height still climbs from below (2 px down the slope) but no longer above
     // (2 px up) - a thin broken pale line, on the sides that look towards the sun.
-    const float gUp = guideAt(guide, guideSamp, pg + dir * 2.0, mapSize, tpp, lod).g;
-    const float gDn = guideAt(guide, guideSamp, pg - dir * 2.0, mapSize, tpp, lod).g;
+    float gUp = g.g, gDn = g.g;
+    if (relief) {
+        gUp = guideAt(guide, guideSamp, pg + dir * 2.0, mapSize, tpp, lod).g;
+        gDn = guideAt(guide, guideSamp, pg - dir * 2.0, mapSize, tpp, lod).g;
+    }
     const float climbed = g.g - gDn, climbing = gUp - g.g;
     const float rim = smoothstep(0.35, 0.6, (climbed - climbing) / (climbed + abs(climbing) + 0.004)) *
                       smoothstep(0.012, 0.03, climbed) * smoothstep(0.3, 0.5, hF) *
@@ -304,15 +325,19 @@ fragment float4 terrain3_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], 
     w[6] = 0.0;
     // Spice: the organic field (spiceField), broken into grains; thick spice denser and darker.
     // amount = the equivalent amount (thin 2 / 7, thick 4 / 7), as the per-cell texture gave it.
-    const float2 sf = spiceField(spiceMap, spiceSamp, p, mapSize);
-    const float amount = (sf.x + sf.y) * (2.0 / 7.0);
-    const float grains = vnoise(p / 5.0) * 0.6 + vnoise(p / 15.0) * 0.4;
-    // The edge of a field dissolves: the presence against a noise threshold - lobes and specks
-    // thinning out into the sand, no line.
-    const float edgeN = vnoise(p / 11.0 + 4.0) * 0.5 + vnoise(p / 4.0 + 8.0) * 0.3 + vnoise(p / 1.7) * 0.2;
-    const float cover = smoothstep(-0.12, 0.2, sf.x - (0.15 + 0.6 * edgeN));
-    float spice = mix(cover * 0.78, 1.0, sf.y) * smoothstep(1.0, 0.55, grains - amount * 0.3) * 0.92;
-    spice *= saturate((1.0 - rockW) * 1.6);
+    float2 sf = float2(0.0);
+    float spice = 0.0;  // (no spice field within reach: presence and richness 0, so no spice)
+    if (near.b > 0.0) {
+        sf = spiceField(spiceMap, spiceSamp, p, mapSize);
+        const float amount = (sf.x + sf.y) * (2.0 / 7.0);
+        const float grains = vnoise(p / 5.0) * 0.6 + vnoise(p / 15.0) * 0.4;
+        // The edge of a field dissolves: the presence against a noise threshold - lobes and specks
+        // thinning out into the sand, no line.
+        const float edgeN = vnoise(p / 11.0 + 4.0) * 0.5 + vnoise(p / 4.0 + 8.0) * 0.3 + vnoise(p / 1.7) * 0.2;
+        const float cover = smoothstep(-0.12, 0.2, sf.x - (0.15 + 0.6 * edgeN));
+        spice = mix(cover * 0.78, 1.0, sf.y) * smoothstep(1.0, 0.55, grains - amount * 0.3) * 0.92;
+        spice *= saturate((1.0 - rockW) * 1.6);
+    }
     w[0] *= 1.0 - spice;
     w[1] *= 1.0 - spice;
     w[5] = spice;
@@ -399,9 +424,11 @@ fragment float4 terrain3_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], 
         n = normalize(mix(n, normalize(cn), t));
         reliefW *= 1.0 - t;
     }
-    const float mound = spots(p + (float2(vnoise(p / 23.0 + 1.3), vnoise(p / 23.0 + 9.1)) - 0.5) * 12.0, 13.0, 0.3 + 0.7 * sf.y);
-    albedo *= mix(float3(1.0, 1.0, 1.0), float3(0.85, 0.61, 0.45), spice * mound);
-    albedo *= mix(float3(1.0, 1.0, 1.0), float3(0.95, 0.84, 0.74), spice * smoothstep(0.1, 0.8, sf.y));  // richer, redder where thick
+    if (spice > 0.0) {
+        const float mound = spots(p + (float2(vnoise(p / 23.0 + 1.3), vnoise(p / 23.0 + 9.1)) - 0.5) * 12.0, 13.0, 0.3 + 0.7 * sf.y);
+        albedo *= mix(float3(1.0, 1.0, 1.0), float3(0.85, 0.61, 0.45), spice * mound);
+        albedo *= mix(float3(1.0, 1.0, 1.0), float3(0.95, 0.84, 0.74), spice * smoothstep(0.1, 0.8, sf.y));  // richer, redder where thick
+    }
 
     // Light. Level ground: the fine detail under detailSun (sand and plain rock exactly as the
     // Designed terrain shows them), darkened by the sun shadow map. Broken rock: its small relief
@@ -418,11 +445,7 @@ fragment float4 terrain3_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], 
     const float3 shadeFlat = sunAmb(pl, u.light.x, u.light.y * max(dot(n, u3.detailSun.xyz), 0.0) * vis) * u3.detailSun.w;
     const float3 shadeRelief = sunAmb(pl, u3.reliefLight.x, u3.reliefLight.y * max(dot(n, u.sunDir.xyz), 0.0) * vis) * u3.reliefLight.z;
     const float3 shade = mix(shadeFlat, shadeRelief, reliefW);
-    float3 rgb = satur(pl, albedo) * shade + albedo * pointLights(pl, in.wpos, n, 0.3);
-    float s = 0.0;
-    if (u.fog2.w > 0.5 && u.fog2.w < 1.5) s = shroud.sample(shroudSamp, p / mapSize).a;
-    const float2 ed = min(p, mapSize - p);
-    if (u.fog2.w < 1.5) s = max(s, 1.0 - smoothstep(0.0, 8.0, min(ed.x, ed.y)));
+    float3 rgb = satur(pl, albedo) * shade + albedo * pointLights(pl, plg, in.wpos, n, 0.3);
     const float dist = distance(in.wpos, u.fog.xyz);
     const float f = smoothstep(u.fog.w, u.fog2.x, dist);
     rgb = mix(rgb, u.fogColor.rgb, f) * (1.0 - s);

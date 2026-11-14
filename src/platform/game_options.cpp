@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -125,9 +127,22 @@ void effectsChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
         s.effects = fx == 1 ? Settings::Effects::Modern : Settings::Effects::Classic;
 }
 
+// Render-only hull motion of ground vehicles (render/vehicle_motion.hpp).
+void vehicleAnimationChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
+    int va = s.vehicleAnimation == Settings::VehicleAnimation::Modern ? 1 : 0;
+    if (ui.choice(r, tr("Vehicle animation"), va, trList({"Original", "Modern"})))
+        s.vehicleAnimation = va == 1 ? Settings::VehicleAnimation::Modern : Settings::VehicleAnimation::Original;
+}
+
 void healthChoice(Ui& ui, Settings& s, const SDL_FRect& r, const char* label) {
     int hb = static_cast<int>(s.healthBars);
     if (ui.choice(r, tr(label), hb, trList({"Selected", "Damaged", "Always"}))) s.healthBars = static_cast<Settings::HealthBars>(hb);
+}
+
+// Control-group number badges on own units (Enhanced / 3D; MapRenderer / Renderer3D group badges).
+void groupNumbersChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
+    int g = static_cast<int>(s.groupNumbers);
+    if (ui.choice(r, tr("Group numbers"), g, trList({"Off", "Selected", "Always"}))) s.groupNumbers = static_cast<Settings::GroupNumbers>(g);
 }
 
 void shroudChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
@@ -181,6 +196,14 @@ void anisoChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
     int a = s.aniso >= 16 ? 2 : s.aniso >= 4 ? 1 : 0;
     if (ui.choice(r, tr("Texture filtering (3D)"), a, trList({"Off", "4x", "16x"}))) s.aniso = a == 2 ? 16 : a == 1 ? 4 : 1;
 }
+// 3D resolution (Settings::resolution3d): Auto / 100 % / 75 % / 50 % of the view's pixels per axis.
+void resolution3dChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
+    static constexpr int kValues[4] = {0, 100, 75, 50};
+    int i = 0;
+    for (int k = 0; k < 4; ++k)
+        if (kValues[k] == s.resolution3d) i = k;
+    if (ui.choice(r, tr("3D resolution"), i, trList({"Auto", "100%", "75%", "50%"}))) s.resolution3d = kValues[i];
+}
 void hdrOutputChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
     int h = s.hdrOutput ? 1 : 0;
     const char* label = s.hdrOutput != gHdrRequested ? "Restart to apply" : "HDR display";
@@ -213,6 +236,16 @@ void fpsLimitChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
     if (ui.choice(r, tr("Frame limit"), f, trList({"Unlimited", "30", "60", "120"}))) s.fpsLimit = kValues[f];
 }
 
+// Display adjustments (Settings::brightness / contrast / gamma / saturation; render/hdr.hpp
+// DisplayAdjust): one full-width slider row each (half rows left the tracks too short), then
+// "Reset picture" and a test pattern
+// (grey steps from black to white, the near-black ones to set the black level, and colour patches).
+// The pattern is drawn like the rest of the frame, so it shows the adjustments live (in game the
+// battlefield behind the options shows them too). Enhanced / 3D only: Original draws the 1998
+// picture untouched.
+std::string signedText(int v) { return v > 0 ? "+" + std::to_string(v) : std::to_string(v); }
+constexpr int kDisplayAdjustRows = 5;
+void displayAdjustRows(Ui& ui, Settings& s, const std::function<SDL_FRect(int)>& row);
 void classicViewChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
     // Tab (touch: the "1998" button) shows the battlefield in the original 1998 graphics.
     int cv = static_cast<int>(s.classicView);
@@ -237,6 +270,47 @@ SDL_FRect rightHalf(const SDL_FRect& r) {
     return {r.x + half + 4, r.y, r.w - half - 4, r.h};
 }
 
+// Limits (not original when Unlimited; re/notes/limits.md): order limit (64 units per group
+// order, applies at once) and unit limit (1000 objects per side, used by the next new game).
+void limitChoices(Ui& ui, Settings& s, const SDL_FRect& orders, const SDL_FRect& units) {
+    int ol = s.unlimitedOrders ? 1 : 0;
+    if (ui.choice(orders, tr("Order limit"), ol, trList({"Original", "Unlimited"}))) s.unlimitedOrders = ol == 1;
+    int ul = s.unlimitedUnits ? 1 : 0;
+    if (ui.choice(units, tr("Unit limit (new games)"), ul, trList({"Original", "Unlimited"}))) s.unlimitedUnits = ul == 1;
+}
+
+void displayAdjustRows(Ui& ui, Settings& s, const std::function<SDL_FRect(int)>& row) {
+    ui.slider(row(0), tr("Brightness"), s.brightness, Settings::kMinDisplayAdjust, Settings::kMaxDisplayAdjust,
+              signedText(s.brightness));
+    ui.slider(row(1), tr("Contrast"), s.contrast, Settings::kMinDisplayAdjust, Settings::kMaxDisplayAdjust,
+              signedText(s.contrast));
+    char g[16];
+    std::snprintf(g, sizeof g, "%.2f", double(s.gamma) / 100.0);
+    ui.slider(row(2), tr("Gamma"), s.gamma, Settings::kMinGamma, Settings::kMaxGamma, g);
+    ui.slider(row(3), tr("Saturation"), s.saturation, Settings::kMinDisplayAdjust, Settings::kMaxDisplayAdjust,
+              signedText(s.saturation));
+    const SDL_FRect r3 = row(4);
+    const SDL_FRect lr = leftHalf(r3);
+    const float bw = std::min(lr.w, std::max(lr.w * 0.6f, ui.textWidth(tr("Reset picture"), ui.textScale) + 20 * ui.textScale));
+    if (ui.button(SDL_FRect{lr.x, r3.y, bw, r3.h}, tr("Reset picture"), ButtonStyle::Normal, s.displayAdjusted())) s.resetDisplayAdjust();
+    const SDL_FRect pr{lr.x + bw + 8, r3.y + 2, r3.x + r3.w - (lr.x + bw + 8), r3.h - 4};
+    if (!s.enhanced()) {
+        const float ts = ui.textScale;
+        ui.text(tr("Enhanced / 3D only"), pr.x + pr.w - 4, r3.y + (r3.h - ui.textHeight(ts)) / 2, theme::kDim, ts, Align::Right);
+        return;
+    }
+    // Test pattern: 12 grey steps (sRGB codes; 0 / 8 / 16 / 28 should stay distinguishable from black),
+    // then sand, red, green, blue.
+    static const Uint8 kGrey[] = {0, 8, 16, 28, 44, 64, 92, 124, 160, 196, 228, 255};
+    static const Colour kColours[] = {{214, 168, 104, 255}, {200, 40, 32, 255}, {48, 160, 60, 255}, {40, 72, 200, 255}};
+    const int n = int(std::size(kGrey)) + int(std::size(kColours));
+    const float cw = pr.w / float(n + 1);  // one step of gap before the colours
+    for (int i = 0; i < int(std::size(kGrey)); ++i)
+        ui.fill(SDL_FRect{std::floor(pr.x + i * cw), pr.y, std::ceil(cw), pr.h}, Colour{kGrey[i], kGrey[i], kGrey[i], 255});
+    for (int i = 0; i < int(std::size(kColours)); ++i)
+        ui.fill(SDL_FRect{std::floor(pr.x + (i + 1 + int(std::size(kGrey))) * cw), pr.y, std::ceil(cw) - 1, pr.h}, kColours[i]);
+}
+
 }  // namespace
 
 int gameplayOptionRows(Ui& ui, Settings& s, const std::function<SDL_FRect(int)>& row) {
@@ -258,6 +332,7 @@ int gameplayOptionRows(Ui& ui, Settings& s, const std::function<SDL_FRect(int)>&
     // Cheats | factory rally points (not original; game/rally.cpp).
     ui.toggle(leftHalf(row(5)), tr("Cheats"), s.cheats);
     ui.toggle(rightHalf(row(5)), tr("Factory rally points"), s.rallyPoints);
+    limitChoices(ui, s, row(6), row(7));
     return kGameplayOptionRows;
 }
 
@@ -289,20 +364,23 @@ int inGameOptionRows(Ui& ui, Settings& s, const std::function<SDL_FRect(int)>& r
     } else {
         ui.toggle(row(9), tr("Factory rally points"), s.rallyPoints);
     }
-    int n = kInGameOptionRows - 4;  // rows 0..9
+    limitChoices(ui, s, row(10), row(11));
+    int n = 12;  // rows 0..11
     // Enhanced / 3D (not original): panel transparency | terrain (2D: Original tiles / Upscaled /
     // Designed / Faithful; 3D: the original tiles on the heightfield or the designed materials,
     // "Designed" (terrain v2) or "Faithful" (v3, laid out after the original tiles; short names:
     // the in-game row is half as wide), then the classic view key.
     if (s.enhanced()) {
-        panelChoice(ui, s, leftHalf(row(10)));
-        if (s.threeD()) terrain3dChoice(ui, s, rightHalf(row(10)));
-        else terrain2dChoice(ui, s, rightHalf(row(10)));
-        timeOfDayChoice(ui, s, leftHalf(row(11)));
-        lightingChoice(ui, s, rightHalf(row(11)));
-        classicViewChoice(ui, s, row(12));
-        touchLayoutChoice(ui, s, leftHalf(row(13)));
-        phoneUiSizeChoice(ui, s, rightHalf(row(13)));
+        panelChoice(ui, s, leftHalf(row(12)));
+        if (s.threeD()) terrain3dChoice(ui, s, rightHalf(row(12)));
+        else terrain2dChoice(ui, s, rightHalf(row(12)));
+        timeOfDayChoice(ui, s, leftHalf(row(13)));
+        lightingChoice(ui, s, rightHalf(row(13)));
+        classicViewChoice(ui, s, row(14));
+        touchLayoutChoice(ui, s, leftHalf(row(15)));
+        phoneUiSizeChoice(ui, s, rightHalf(row(15)));
+        // Display adjustments: the battlefield behind the options shows them live.
+        displayAdjustRows(ui, s, [&](int i) { return row(16 + i); });
         n = kInGameOptionRows;
     }
     s.noteGraphicsEdit(before);
@@ -365,6 +443,9 @@ float displayOptionList(Ui& ui, Settings& s, const OptionListLayout& L, float y0
     ui.toggle(leftHalf(r4), tr("HDR rendering"), s.hdr);
     hdrOutputChoice(ui, s, rightHalf(r4));
     y += L.rowH + L.gap;
+    // Brightness, Contrast, Gamma, Saturation, Reset + test pattern (Enhanced / 3D).
+    displayAdjustRows(ui, s, [&](int i) { return L.rect(y + float(i) * (L.rowH + L.gap), L.rowH); });
+    y += kDisplayAdjustRows * (L.rowH + L.gap);
 #if defined(_WIN32)
     gpuDriverChoice(ui, s, L.rect(y, L.rowH));
     y += L.rowH + L.gap;
@@ -408,6 +489,7 @@ float graphicsOptionList(Ui& ui, Settings& s, const OptionListLayout& L, float y
     row([&](const SDL_FRect& r) { pic(PictureOption::Art, [&] { artChoice(ui, s, r); }); });
     y += header(ui, L, y, "Effects", enhancedOnly);
     row([&](const SDL_FRect& r) { pic(PictureOption::Effects, [&] { effectsChoice(ui, s, r); }); });
+    row([&](const SDL_FRect& r) { vehicleAnimationChoice(ui, s, r); });
     y += header(ui, L, y, "Lighting", enhancedOnly);
     row([&](const SDL_FRect& r) {
         pic(PictureOption::TimeOfDay, [&] { timeOfDayChoice(ui, s, leftHalf(r)); });
@@ -419,12 +501,16 @@ float graphicsOptionList(Ui& ui, Settings& s, const OptionListLayout& L, float y
         pic(PictureOption::Quality, [&] { qualityChoice(ui, s, leftHalf(r)); });
         pic(PictureOption::Msaa, [&] { msaaChoice(ui, s, rightHalf(r)); });
     });
-    row([&](const SDL_FRect& r) { pic(PictureOption::Aniso, [&] { anisoChoice(ui, s, leftHalf(r)); }); });
+    row([&](const SDL_FRect& r) {
+        pic(PictureOption::Aniso, [&] { anisoChoice(ui, s, leftHalf(r)); });
+        resolution3dChoice(ui, s, rightHalf(r));
+    });
     y += header(ui, L, y, "Shroud", enhancedOnly);
     row([&](const SDL_FRect& r) { pic(PictureOption::Shroud, [&] { shroudChoice(ui, s, r); }); });
     y += header(ui, L, y, "Interface", enhancedOnly);
     row([&](const SDL_FRect& r) { pic(PictureOption::Panel, [&] { panelChoice(ui, s, r); }); });
     row([&](const SDL_FRect& r) { pic(PictureOption::HealthBars, [&] { healthChoice(ui, s, r, "Health bars"); }); });
+    row([&](const SDL_FRect& r) { groupNumbersChoice(ui, s, r); });
     y += header(ui, L, y, "3D", !Settings::modelPackInstalled() ? Settings::kNeeds3dPackNote : s.threeD() ? nullptr : "3D only");
     row([&](const SDL_FRect& r) { pic(PictureOption::Terrain3D, [&] { terrain3dChoice(ui, s, r); }); });
     row([&](const SDL_FRect& r) {
@@ -486,6 +572,33 @@ bool stepPictureOption(Settings& s, PictureOption o, int dir) {
     case P::None: break;
     }
     return false;
+}
+
+void setPictureOption(Settings& dst, const Settings& src, PictureOption o) {
+    using P = PictureOption;
+    switch (o) {
+    case P::Mode: dst.graphics = src.graphics; break;
+    case P::Terrain2D: dst.terrain2d = src.terrain2d; break;
+    case P::Art: dst.artPack = src.artPack; break;
+    case P::Effects: dst.effects = src.effects; break;
+    case P::TimeOfDay: dst.timeOfDay = src.timeOfDay; break;
+    case P::Lighting: dst.lighting = src.lighting; break;
+    case P::Quality:
+        dst.hdr = src.hdr;
+        dst.msaa = src.msaa;
+        dst.aniso = src.aniso;
+        break;
+    case P::Hdr: dst.hdr = src.hdr; break;
+    case P::Msaa: dst.msaa = src.msaa; break;
+    case P::Aniso: dst.aniso = src.aniso; break;
+    case P::Shroud: dst.shroud = src.shroud; break;
+    case P::Panel: dst.panelTransparency = src.panelTransparency; break;
+    case P::HealthBars: dst.healthBars = src.healthBars; break;
+    case P::Terrain3D: dst.terrain3d = src.terrain3d; break;
+    case P::Shadows: dst.shadows3d = src.shadows3d; break;
+    case P::Models3D: dst.models3d = src.models3d; break;
+    case P::None: break;
+    }
 }
 
 const char* pictureOptionLabel(PictureOption o) {

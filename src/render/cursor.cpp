@@ -1,11 +1,13 @@
 #include "render/cursor.hpp"
 
 #include "render/sprites.hpp"
+#include "render/upscale.hpp"
 
 #include <SDL3/SDL.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace d2k::render {
@@ -229,7 +231,88 @@ CursorRenderer::CursorRenderer(SDL_Renderer* r, const std::string& mouseR16Path)
     start_ = SDL_GetTicks();
 }
 
-CursorRenderer::~CursorRenderer() = default;
+CursorRenderer::~CursorRenderer() {
+    if (current_) SDL_SetCursor(SDL_GetDefaultCursor());
+    for (auto& [k, c] : system_) SDL_DestroyCursor(c);
+}
+
+SDL_Cursor* CursorRenderer::makeSystem(Cursor c, float scale, bool hq, float density) {
+    const int id = std::clamp(static_cast<int>(c), 0, kCursorCount - 1);
+    constexpr int kCell = 2 * kCursorHotspot;  // 48
+    const int k = hq ? 4 : 1;
+    density = std::max(1.0f, density);
+    // Sizes: the 100 % image (points: `scale` points per cursor pixel) and the display's pixels.
+    const int basePx = std::max(kCell / 2, int(std::lround(kCell * scale)));
+    const int fullPx = std::max(basePx, int(std::lround(basePx * density)));
+    std::vector<SDL_Surface*> owned;
+    SDL_CursorFrameInfo frames[kCursorFrames]{};
+    bool ok = true;
+    for (int step = 0; step < kCursorFrames && ok; ++step) {
+        const formats::R16Frame& f = file_.frames[std::size_t(id * kCursorFrames + step)];
+        SDL_Surface* cell = SDL_CreateSurface(kCell * k, kCell * k, SDL_PIXELFORMAT_ABGR8888);
+        if (!cell) { ok = false; break; }
+        owned.push_back(cell);
+        SDL_ClearSurface(cell, 0, 0, 0, 0);
+        if (!f.empty()) {
+            std::vector<formats::Rgba> px(std::size_t(f.width) * f.height, 0);
+            if (f.bpp == 16) {
+                px = formats::decodeFrame(file_, f, /*zeroIsTransparent=*/true);
+            } else {
+                const formats::Palette* pal = f.palette >= 0 ? &file_.palettes[std::size_t(f.palette)] : nullptr;
+                for (std::size_t i = 0; i < px.size(); ++i) {
+                    const std::uint8_t p = f.pixels[i];
+                    px[i] = p == 0 ? 0u : p == 1 ? 0x80000000u : pal ? (*pal)[p] : (0xFF000000u | p * 0x010101u);
+                }
+            }
+            if (hq) px = scale4x(px, f.width, f.height);
+            // The frame's top-left in the 48 x 48 cell: the hotspot (24, 24) is at (24 + x, 24 + y) in the frame.
+            const int ox = -f.x * k, oy = -f.y * k, fw = f.width * k, fh = f.height * k;
+            auto* dst = static_cast<std::uint8_t*>(cell->pixels);
+            for (int y = 0; y < fh; ++y) {
+                const int cy = oy + y;
+                if (cy < 0 || cy >= cell->h) continue;
+                for (int x = 0; x < fw; ++x) {
+                    const int cx = ox + x;
+                    if (cx < 0 || cx >= cell->w) continue;
+                    std::memcpy(dst + std::size_t(cy) * cell->pitch + std::size_t(cx) * 4, &px[std::size_t(y) * fw + x], 4);
+                }
+            }
+        }
+        const SDL_ScaleMode mode = hq ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST;
+        SDL_Surface* base = SDL_ScaleSurface(cell, basePx, basePx, mode);
+        SDL_Surface* full = basePx == fullPx ? nullptr : SDL_ScaleSurface(cell, fullPx, fullPx, mode);
+        if (!base || (basePx != fullPx && !full)) { ok = false; break; }
+        owned.push_back(base);
+        if (full) {
+            SDL_AddSurfaceAlternateImage(base, full);
+            SDL_DestroySurface(full);  // (the base keeps a reference)
+        }
+        frames[step].surface = base;
+        frames[step].duration = 50;  // FUN_00423a20: one step per 3 frames at 60 fps
+    }
+    SDL_Cursor* cur = nullptr;
+    if (ok) {
+        const int hot = basePx / 2;
+        cur = SDL_CreateAnimatedCursor(frames, kCursorFrames, hot, hot);
+        if (!cur) SDL_Log("Cursor %s: system cursor failed (%s) - drawn by the game", cursorName(c), SDL_GetError());
+    }
+    for (SDL_Surface* sf : owned) SDL_DestroySurface(sf);
+    return cur;
+}
+
+bool CursorRenderer::showSystem(Cursor c, float scale, bool hq, float density) {
+    const std::uint64_t key = std::uint64_t(std::clamp(static_cast<int>(c), 0, kCursorCount - 1)) |
+                              std::uint64_t(std::lround(scale * 64)) << 8 | std::uint64_t(hq) << 30 |
+                              std::uint64_t(std::lround(density * 64)) << 32;
+    auto it = system_.find(key);
+    if (it == system_.end()) it = system_.emplace(key, makeSystem(c, scale, hq, density)).first;
+    if (!it->second) return false;
+    if (it->second != current_) {
+        SDL_SetCursor(it->second);
+        current_ = it->second;
+    }
+    return true;
+}
 
 void CursorRenderer::draw(Cursor c, float x, float y, float scale, bool hq) {
     const int id = std::clamp(static_cast<int>(c), 0, kCursorCount - 1);

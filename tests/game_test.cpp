@@ -12,6 +12,8 @@
 #include "formats/vars.hpp"
 #include "game/geometry.hpp"
 #include "render/lighting.hpp"
+#include "platform/resolution3d.hpp"
+#include "render3d/lights.hpp"
 #include "game/pathfind.hpp"
 #include "game/random.hpp"
 #include "game/save_check.hpp"
@@ -168,6 +170,135 @@ void testObjectPool() {
     CHECK(w->addUnit(0, kTank, 1, 1, 1, 1) == 999);
     CHECK(w->addUnit(0, kTank, 2, 1, 2, 1) == 998);
     CHECK(w->addUnit(1, kTank, 3, 1, 3, 1) == 999);  // per side
+}
+
+// "Order limit" (re/notes/limits.md): GenerateUnitMoveOrder 0x459450 and the other group-order
+// generators collect at most 0x40 selected units in the side's list order; Unlimited = all.
+void testOrderLimit() {
+    Fixture f;
+    auto place = [&](World& w, int n) {
+        for (int k = 0; k < n; ++k) w.addUnit(0, kTank, 1 + k % 12, 1 + k / 12, 1 + k % 12, 1 + k / 12);
+        auto& me = w.sides()[0];
+        for (int i = me.firstUnit; i != -1; i = me.nextObject(i)) me.units[i].selected = true;
+    };
+    {  // 60 selected: all obey (the cap is 64, not ~50)
+        auto w = f.world(16, 16);
+        place(*w, 60);
+        CHECK(w->orderUnitLimit() == kOrderUnitsOriginal);
+        CHECK(w->smartOrder(0, 14 * 32 + 5, 14 * 32 + 5) == SmartOrder::Move);
+        CHECK(w->pendingOrders() == 60);
+    }
+    {  // 80 selected, Original: the first 64 in list order get the order, the last 16 nothing
+        auto w = f.world(16, 16);
+        place(*w, 80);
+        CHECK(w->orderGroup(0).size() == 64);
+        CHECK(w->smartOrder(0, 14 * 32 + 5, 14 * 32 + 5) == SmartOrder::Move);
+        CHECK(w->pendingOrders() == 64);
+        w->tick();
+        const auto& me = w->sides()[0];
+        int n = 0, moving = 0;
+        for (int i = me.firstUnit; i != -1; i = me.nextObject(i), ++n) {
+            const bool ordered = me.units[i].state == UnitState::Moving;
+            moving += ordered ? 1 : 0;
+            CHECK(ordered == (n < 64));  // list order = allocation order: slots 999..936
+        }
+        CHECK(moving == 64 && w->unit(0, 936)->state == UnitState::Moving && w->unit(0, 935)->state != UnitState::Moving);
+        // A dead selected unit is skipped and does not count (state 0x11).
+        auto w2 = f.world(16, 16);
+        place(*w2, 80);
+        w2->sides()[0].units[999].state = UnitState::Dead;
+        const auto g = w2->orderGroup(0);
+        CHECK(g.size() == 64 && g.front() == 998 && g.back() == 935);
+        CHECK(w2->orderGuardSelected(0) && w2->pendingOrders() == 64);  // GenerateUnitGuardOrder 0x459980
+    }
+    {  // 80 selected, Unlimited: all 80
+        auto w = f.world(16, 16);
+        place(*w, 80);
+        w->setOrderUnitLimit(0);
+        CHECK(w->smartOrder(0, 14 * 32 + 5, 14 * 32 + 5) == SmartOrder::Move);
+        CHECK(w->pendingOrders() == 80);
+        w->tick();
+        const auto& me = w->sides()[0];
+        int moving = 0;
+        for (int i = me.firstUnit; i != -1; i = me.nextObject(i)) moving += me.units[i].state == UnitState::Moving ? 1 : 0;
+        CHECK(moving == 80);
+        CHECK(w->orderGuardSelected(0) && w->pendingOrders() == 80);
+    }
+}
+
+// "Unit limit" (re/notes/limits.md): Original = 1000 shared slots per side; a full pool refuses
+// units / buildings with the "ReachedUnitLimit" message (ModelAddUnit 0x455870 / ModelAddBuilding
+// 0x4563b0) and bullets / explosions silently. Unlimited = the pool grows (saved with the game).
+void testUnitLimit() {
+    Fixture f;
+    {  // Original
+        auto w = f.world(8, 8);
+        CHECK(!w->unlimitedObjects());
+        int added = 0;
+        while (w->addUnit(0, kTank, 1 + added % 6, 1 + (added / 6) % 6, 1, 1) >= 0) ++added;
+        CHECK(added == kObjectsPerSide && w->sides()[0].poolSize() == kObjectsPerSide);
+        CHECK(w->messages().size() == 1 && w->messages()[0].textId == kTextReachedUnitLimit);
+        CHECK(w->addBullet(0, 0, 0, 999, 32, 32, 64, 64) == -1);  // no slot, no message
+        CHECK(w->messages().size() == 1);
+        CHECK(w->addUnit(1, kTank, 2, 2, 2, 2) == 999);  // other sides are unaffected
+    }
+    {  // Unlimited: slots below 1000 in the original LIFO order, then 1000, 1001, ...
+        Rules r = f.rules();
+        r.unlimitedObjects = true;
+        auto w = std::make_unique<World>(16, 16, r, 0);
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x) w->cell(x, y).flags = kRock;
+        CHECK(w->unlimitedObjects());
+        Side& s = w->sides()[0];
+        const Unit* base = s.units.data();
+        int last = -1;
+        for (int k = 0; k < 1500; ++k) {
+            last = w->addUnit(0, kTank, 1 + k % 14, 1 + (k / 14) % 14, 1, 1);
+            if (k == 0) CHECK(last == 999);
+            if (k == 999) CHECK(last == 0);
+            if (k == 1000) CHECK(last == 1000);
+        }
+        CHECK(last == 1499 && s.poolSize() == 2000 && w->messages().empty());
+        CHECK(s.units.data() == base);  // capacity reserved at the start: nothing moved
+        CHECK(w->unit(0, 1499) && w->unit(0, 1499)->index == 1499);
+        // Freed slots come back LIFO, before the untouched new ones.
+        s.freeObject(500);
+        CHECK(w->addUnit(0, kTank, 3, 3, 3, 3) == 500);
+        CHECK(w->addUnit(0, kTank, 3, 3, 3, 3) == 1500);
+        for (int t = 0; t < 3; ++t) w->tick();
+        // Save / load with the grown pool, into a world constructed with the Original limit.
+        const auto state = saveWorldState(*w);
+        auto b = f.world(16, 16);
+        loadWorldState(*b, state);
+        CHECK(b->unlimitedObjects() && b->sides()[0].poolSize() == 2000);
+        CHECK(worldStateHash(*b) == worldStateHash(*w));
+        CHECK(b->addUnit(0, kTank, 4, 4, 4, 4) == 1501);
+        CHECK(w->addUnit(0, kTank, 4, 4, 4, 4) == 1501);
+        for (int t = 0; t < 5; ++t) {
+            w->tick();
+            b->tick();
+        }
+        CHECK(worldStateHash(*b) == worldStateHash(*w));
+        // The ceiling.
+        auto c = std::make_unique<World>(8, 8, r, 0);
+        int added = 0;
+        while (c->addUnit(0, kTank, 1 + added % 6, 1 + (added / 6) % 6, 1, 1) >= 0) ++added;
+        CHECK(added == kMaxObjectsUnlimited && c->messages().size() == 1);
+    }
+    {  // A version 7 world section (no limit tail) loads as an Original 1000-slot game.
+        auto w = f.world(8, 8);
+        w->addUnit(0, kTank, 2, 2, 2, 2);
+        auto state = saveWorldState(*w);
+        state.resize(state.size() - (1 + 4 * kMaxSides));
+        Rules r = f.rules();
+        r.unlimitedObjects = true;
+        auto b = std::make_unique<World>(8, 8, r, 0);
+        loadWorldState(*b, state, 7);
+        CHECK(!b->unlimitedObjects() && b->sides()[0].poolSize() == kObjectsPerSide && b->unit(0, 999));
+        bool threw = false;
+        try { loadWorldState(*b, state); } catch (const SaveError&) { threw = true; }  // as v8: truncated
+        CHECK(threw);
+    }
 }
 
 void testSpawnFields() {
@@ -810,6 +941,32 @@ void testSmartOrder() {
     CHECK(w->sides()[0].units[a].state == UnitState::Moving);
     w->decayFlicker();
     CHECK(w->sides()[1].units[t].flicker == 6);
+}
+
+// Ctrl on an empty cell (GenerateUnitAttackTileOrder 0x4598d0): state AttackingTile, the tank
+// drives into range (AttackTile 0x496ff0) and then fires at the cell's centre (3D picking report:
+// "red circle but nothing happens" - the order itself works; the click had missed the building).
+void testForceAttackGround() {
+    CombatFixture f;
+    auto w = f.world(16, 16);
+    const int a = w->addUnit(0, kTank, 1, 1, 1, 1);
+    w->sides()[0].units[a].selected = true;
+    CHECK(w->smartOrder(0, 12 * 32 + 5, 1 * 32 + 5, true) == SmartOrder::AttackTile);
+    w->tick();
+    const Unit& u = w->sides()[0].units[a];
+    CHECK(u.state == UnitState::AttackingTile);
+    CHECK(u.targetX == 12 && u.targetY == 1);
+    int shots = 0, firstShotX = -1;
+    for (int k = 0; k < 600; ++k) {
+        w->tick();
+        if (u.reloadDelay == 10) {
+            if (!shots) firstShotX = u.blockFromX;
+            ++shots;
+        }
+    }
+    CHECK(shots >= 3);
+    CHECK(firstShotX >= 8 && firstShotX < 12);  // moved into range (4 tiles) first, not onto the cell
+    CHECK(u.state == UnitState::AttackingTile);  // keeps firing at the ground
 }
 
 // Alt (force move) on enemy infantry, 0x4433a0: with a crusher selected and a drivable cell it is a
@@ -3622,6 +3779,116 @@ void testAutoQueueSaveRoundTrip() {
 // "Play as any side" (not original; docs/play-as.md): Atreides mission 9a played as the
 // Emperor's Sardaukar (side 3). The chosen side has no AI, the Atreides (side 0) get one from
 // their .MIS block and play; outcome rules; save/load round trip.
+// "3D resolution: Auto" (platform/resolution3d.hpp): the cap by pixel count, fixed shares, and the
+// dynamic steps (down while GPU-bound and slow, back up after steady frames, never above the cap).
+void testResolution3D() {
+    using d2k::platform::Resolution3D;
+    CHECK(Resolution3D::cap(1728 * 2, 1050 * 2, 4) <= 1.0f);
+    CHECK(Resolution3D::cap(1280, 800, 4) == 1.0f);
+    const float big = Resolution3D::cap(5120, 1924, 4);
+    CHECK(big < 1.0f && big >= Resolution3D::kMin);
+    CHECK(Resolution3D::cap(5120, 1924, 1) >= big);
+    Resolution3D r;
+    CHECK(r.update(75, 5120, 1924, 4, 30, 2, 10, true) == 0.75f);
+    Resolution3D a;
+    float s = a.update(0, 5120, 1924, 4, 10, 2, 10, false);
+    CHECK(s == big);
+    for (int i = 0; i < 200; ++i) s = a.update(0, 5120, 1924, 4, 20, 2, 10, true);  // GPU-bound, 50 fps
+    CHECK(s < big && s >= Resolution3D::kMin);
+    const float low = s;
+    for (int i = 0; i < 200; ++i) s = a.update(0, 5120, 1924, 4, 20, 19, 10, true);  // CPU-bound: no change
+    CHECK(s == low);
+    for (int i = 0; i < 3000; ++i) s = a.update(0, 5120, 1924, 4, 10, 2, 10, true);  // at the rate: back up
+    CHECK(s > low && s <= big);
+}
+
+// The 3D light grid (render3d/lights.hpp): every light that reaches a ground / model point is listed in that
+// point's cell (the shaders visit only those), spot footprints included, and the per-cell cap keeps the first.
+void testLightGrid() {
+    using namespace d2k::render3d;
+    std::uint32_t seed = 12345;
+    auto rnd = [&] {
+        seed = seed * 1664525u + 1013904223u;
+        return float(seed >> 8) / float(1u << 24);
+    };
+    std::vector<GridLight> lights;
+    for (int i = 0; i < 300; ++i) {
+        GridLight g;
+        g.posRadius[0] = 200 + rnd() * 3000;
+        g.posRadius[2] = 100 + rnd() * 1500;
+        g.posRadius[1] = 4 + rnd() * 20;
+        g.posRadius[3] = 20 + rnd() * 100;
+        g.color[0] = g.color[1] = g.color[2] = 1;
+        if (i % 2) {  // a headlight: mostly level, tilted down
+            const float a = rnd() * 6.2832f, ahead = g.posRadius[3] * 0.45f, drop = g.posRadius[1];
+            const float l = std::sqrt(ahead * ahead + drop * drop);
+            g.spot[0] = std::sin(a) * ahead / l;
+            g.spot[1] = -drop / l;
+            g.spot[2] = -std::cos(a) * ahead / l;
+            g.spot[3] = std::cos(0.42f * 1.15f + rnd() * 0.2f);
+            g.boundSpot();
+        } else {
+            g.boundSphere();
+        }
+        lights.push_back(g);
+    }
+    LightGrid grid;
+    grid.build(lights, 255);
+    CHECK(grid.lights == 300);
+    CHECK(grid.droppedEntries == 0);
+    CHECK(grid.words.size() % 4 == 0);
+    PointLightsU u;
+    grid.place(u);
+    CHECK(u.info[0] == 300.0f);
+    int missing = 0, reached = 0;
+    std::vector<int> listed;
+    for (int k = 0; k < 20000; ++k) {
+        const float x = 100 + rnd() * 3300, z = rnd() * 1800, y = rnd() * 24;
+        listed.clear();
+        grid.forPoint(x, z, [&](int i) { listed.push_back(i); });
+        for (int i = 0; i < int(lights.size()); ++i) {
+            const GridLight& g = lights[std::size_t(i)];
+            const float dx = g.posRadius[0] - x, dy = g.posRadius[1] - y, dz = g.posRadius[2] - z;
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 >= g.posRadius[3] * g.posRadius[3]) continue;
+            if (g.spot[3] > -1.5f) {
+                const float d = std::sqrt(std::max(d2, 1e-4f));
+                if (-(dx * g.spot[0] + dy * g.spot[1] + dz * g.spot[2]) / d <= g.spot[3]) continue;
+            }
+            ++reached;
+            if (std::find(listed.begin(), listed.end(), i) == listed.end()) ++missing;
+        }
+    }
+    CHECK(reached > 1000);
+    CHECK(missing == 0);
+    // Spot footprints are smaller than their spheres (fewer cells to visit).
+    {  // a tank's headlight as Renderer3D makes it: 80 px beam, lamp 6 px up, aimed 40 px ahead
+        GridLight h;
+        h.posRadius[3] = 88;
+        const float l = std::sqrt(40.0f * 40.0f + 8.0f * 8.0f);
+        h.spot[0] = 40.0f / l;
+        h.spot[1] = -8.0f / l;
+        h.spot[3] = std::cos(0.42f * 1.15f);
+        h.boundSpot();
+        CHECK(h.br < 0.8f * h.posRadius[3] && h.bx > 0);
+    }
+    // A full cell keeps the first lights (priority order).
+    std::vector<GridLight> same(10);
+    for (auto& g : same) {
+        g.posRadius[0] = 500;
+        g.posRadius[2] = 500;
+        g.posRadius[3] = 10;
+        g.boundSphere();
+    }
+    grid.build(same, 4);
+    listed.clear();
+    grid.forPoint(500, 500, [&](int i) { listed.push_back(i); });
+    CHECK(listed.size() == 4 && listed[0] == 0 && listed[3] == 3);
+    CHECK(grid.droppedEntries > 0);
+    grid.build({});
+    CHECK(grid.lights == 0 && grid.words.empty());
+}
+
 void testPlayAs() {
 #ifdef D2K_GAME_DATA_DIR
     const std::string data = D2K_GAME_DATA_DIR, bin = data + "/bin";
@@ -3752,6 +4019,8 @@ int main() {
     testLighting();
     testGeometry();
     testObjectPool();
+    testOrderLimit();
+    testUnitLimit();
     testSpawnFields();
     testSpeed();
     testInfantrySubcells();
@@ -3769,6 +4038,7 @@ int main() {
     testCrushInfantry();
     testLeavingBuildingInfantryDamage();
     testSmartOrder();
+    testForceAttackGround();
     testForceMoveCrush();
     testTurretForceAttack();
     testGuardRetreat();
@@ -3826,6 +4096,8 @@ int main() {
     testExtendedEvents();
     testExtendedRealMissions();
     testPlayAs();
+    testResolution3D();
+    testLightGrid();
     std::printf("%s\n", failures ? "FAILED" : "all game tests passed");
     return failures ? 1 : 0;
 }

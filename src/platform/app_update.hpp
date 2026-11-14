@@ -10,6 +10,7 @@
 #include "formats/release_info.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -25,6 +26,10 @@ inline constexpr const char* kAppReleasesPage = "https://github.com/OpenD2K/open
 // The compiled version (D2K_VERSION = CMake PROJECT_VERSION).
 const char* appVersion();
 
+// Screenshots of a finished check (--menu-page updates-*, artpack-*): "checked at 14:32" local time today,
+// so the label does not change from run to run.
+std::int64_t previewCheckedAt();
+
 class AppUpdateChecker {
 public:
     enum class State { Idle, Checking, Checked, Failed };
@@ -35,6 +40,8 @@ public:
         int asset = -1;              // index into release.assets for this platform, -1 = none
         bool newer = false;          // release.version > appVersion()
         std::string error;
+        std::uint64_t startedMs = 0;  // SDL_GetTicks() when the last check started (0 = none this run)
+        std::int64_t checkedAt = 0;   // time(nullptr) when the last check ended (answer or error; 0 = never)
     };
 
     static AppUpdateChecker& instance();

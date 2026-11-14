@@ -38,15 +38,17 @@
     }
 
 // ================================================================================== point lights
-// Dynamic point lights (render3d/lights.hpp): fragment uniform buffer 1 of every lit shader.
+// Dynamic lights (render3d/lights.hpp): fragment uniform buffer 1 of every lit shader (the frame's
+// sun / sky colours + the light grid's placement) and the clustered light grid, fragment storage
+// buffer 0 (SDL: t<sampler count>, space2 - so one declaration per sampler count; the lookup is
+// a macro instantiated per buffer, as glslang does not take resources as function arguments).
 cbuffer PointLightsFU : register(b1, space3) {
-    float4 plInfo;            // x = count, y = specular multiplier, z = saturation of the sun / sky lit colour
+    float4 plInfo;            // x = light count, y = specular multiplier, z = saturation of the sun / sky lit colour
     float4 plSunColor;        // rgb: the sun's colour multiplier (time of day / Modern lighting)
     float4 plAmbColor;        // rgb: the ambient colour multiplier
     float4 plSpriteTint;      // rgb: billboards' light
-    float4 plPosRadius[48];   // world xyz, radius
-    float4 plColor[48];       // rgb * intensity
-    float4 plSpot[48];        // xyz beam direction, w = cos half angle (< -1: point light)
+    float4 plGrid;            // xy = grid origin (world x, z), z = 1 / cell size, w = cells across
+    float4 plGrid2;           // x = cells down, y = cell table start, z = index list start (uint4 units)
 };
 // The frame's sun + sky light: ambient and diffuse terms (scalars of the old light) tinted.
 float3 sunAmb(float amb, float dif) { return amb * plAmbColor.rgb + dif * plSunColor.rgb; }
@@ -56,29 +58,50 @@ float3 satur(float3 c) {
     const float l = dot(c, float3(0.299, 0.587, 0.114));
     return max(lerp(float3(l, l, l), c, plInfo.z), 0.0);
 }
-// Sum of the point lights at world point p with normal n; wrap 0 = Lambert, 1 = no normal
-// dependence (billboards). Spot lights fade out over the outer third of their cone.
-float3 pointLights(float3 p, float3 n, float wrap) {
-    float3 sum = float3(0.0, 0.0, 0.0);
-    const int cnt = int(plInfo.x);
-    [loop] for (int i = 0; i < cnt; ++i) {
-        const float3 d = plPosRadius[i].xyz - p;
-        const float r = plPosRadius[i].w;
-        const float d2 = dot(d, d);
-        if (d2 >= r * r) continue;
-        float att = 1.0 - d2 / (r * r);
-        att *= att;
-        const float3 dir = d * rsqrt(max(d2, 1e-4));
-        const float4 sp = plSpot[i];
-        if (sp.w > -1.5) {
-            const float c = dot(-dir, sp.xyz);
-            att *= smoothstep(sp.w, sp.w + (1.0 - sp.w) * 0.45, c);
-        }
-        const float ndl = saturate(dot(n, dir) * (1.0 - wrap) + wrap);
-        sum += plColor[i].rgb * (att * ndl);
-    }
-    return sum;
+// Sum of the lights at world point p with normal n; wrap 0 = Lambert, 1 = no normal dependence
+// (billboards). Only the lights of p's grid cell are visited. Spot lights fade out over the outer
+// 45 % of their cone.
+#define D2K_POINT_LIGHTS_FN(NAME, G)                                                            \
+float3 NAME(float3 p, float3 n, float wrap) {                                                   \
+    float3 sum = float3(0.0, 0.0, 0.0);                                                         \
+    if (plInfo.x < 0.5) return sum;                                                             \
+    const float2 g = (p.xz - plGrid.xy) * plGrid.z;                                             \
+    if (g.x < 0.0 || g.y < 0.0 || g.x >= plGrid.w || g.y >= plGrid2.x) return sum;              \
+    const uint c = uint(g.y) * uint(plGrid.w) + uint(g.x);                                      \
+    const uint e = G[uint(plGrid2.y) + (c >> 2)][c & 3u];                                       \
+    const uint cnt = e & 0xFFu;                                                                 \
+    const uint first = uint(plGrid2.z) * 4u + (e >> 8);                                         \
+    [loop] for (uint k = 0; k < cnt; ++k) {                                                     \
+        const uint w = first + k;                                                               \
+        const uint li = G[w >> 2][w & 3u] * 3u;                                                 \
+        const float4 pr = asfloat(G[li]);                                                       \
+        const float3 d = pr.xyz - p;                                                            \
+        const float r2 = pr.w * pr.w;                                                           \
+        const float d2 = dot(d, d);                                                             \
+        if (d2 >= r2) continue;                                                                 \
+        float att = 1.0 - d2 / r2;                                                              \
+        att *= att;                                                                             \
+        const float3 dir = d * rsqrt(max(d2, 1e-4));                                            \
+        const float4 sp = asfloat(G[li + 2u]);                                                  \
+        if (sp.w > -1.5) {                                                                      \
+            const float cs = dot(-dir, sp.xyz);                                                 \
+            att *= smoothstep(sp.w, sp.w + (1.0 - sp.w) * 0.45, cs);                            \
+        }                                                                                       \
+        const float ndl = saturate(dot(n, dir) * (1.0 - wrap) + wrap);                          \
+        sum += asfloat(G[li + 1u]).rgb * (att * ndl);                                           \
+    }                                                                                           \
+    return sum;                                                                                 \
 }
+// The grid at t<n>, space2 for the lit shaders' sampler counts: 3 (sprite_fs, model_fs, rock_fs),
+// 4 (terrain_fs), 7 (terrain2_fs), 8 (terrain3_fs).
+StructuredBuffer<uint4> PlGrid3 : register(t3, space2);
+StructuredBuffer<uint4> PlGrid4 : register(t4, space2);
+StructuredBuffer<uint4> PlGrid7 : register(t7, space2);
+StructuredBuffer<uint4> PlGrid8 : register(t8, space2);
+D2K_POINT_LIGHTS_FN(pointLights3, PlGrid3)
+D2K_POINT_LIGHTS_FN(pointLights4, PlGrid4)
+D2K_POINT_LIGHTS_FN(pointLights7, PlGrid7)
+D2K_POINT_LIGHTS_FN(pointLights8, PlGrid8)
 
 // ================================================================================== terrain
 struct TVIn {
@@ -138,7 +161,7 @@ float4 terrain_fs(TVOut i) : SV_Target0 {
     if (tShadow.x > 0.5) SHADOW_PCF(TerrainShadowMap, TerrainShadowSamp, mul(tLightVP, float4(i.wpos, 1.0)).xyz, tShadow, sm);
     const float vis = lerp(tLight.w, 1.0, sm);
     const float3 shade = sunAmb(tLight.x, tLight.y * ndl * vis) * tLight.z;
-    float3 rgb = satur(c.rgb) * shade + c.rgb * pointLights(i.wpos, n, 0.3);
+    float3 rgb = satur(c.rgb) * shade + c.rgb * pointLights4(i.wpos, n, 0.3);
     // Darkness: the shroud mask, and a thin fade into the black beyond the map edge. The haze
     // is darkened too, so shrouded ground stays black at any distance.
     float s = 0.0;
@@ -226,7 +249,7 @@ float4 sprite_fs(SVOut i) : SV_Target0 {
         }
         c.rgb = satur(c.rgb) * plSpriteTint.rgb;  // the light of the time of day
         // Dynamic lights (explosions, muzzle flashes, fires, lamps) on units, buildings and smoke.
-        c.rgb += alb * pointLights(i.wpos, float3(0.0, 1.0, 0.0), 0.8);
+        c.rgb += alb * pointLights3(i.wpos, float3(0.0, 1.0, 0.0), 0.8);
         c.rgb = lerp(c.rgb, sFogColor.rgb, i.fogF) * (1.0 - dark);
     } else if (sMode.x < 1.5) {
         c.rgb *= (1.0 - dark) * (1.0 - i.fogF);
@@ -392,9 +415,9 @@ float4 model_fs(MVOut i, bool front : SV_IsFrontFace) : SV_Target0 {
             const float sp = pow(max(dot(n, h), 0.0), 6.0 + 90.0 * i.pbr.x * i.pbr.x) * i.pbr.x * step(0.0, ndl);
             c.rgb += sp * (0.25 + 0.45 * i.pbr.y) * lerp(float3(1.0, 1.0, 1.0), base, i.pbr.y) * plInfo.y * plSunColor.rgb;
         }
-        c.rgb += base * pointLights(i.wpos, n, 0.25);  // dynamic lights
+        c.rgb += base * pointLights3(i.wpos, n, 0.25);  // dynamic lights
     } else if (i.params.y > 0.2) {  // flat-shaded parts: the time of day's light, like the billboards
-        c.rgb = satur(c.rgb) * plSpriteTint.rgb + c.rgb * pointLights(i.wpos, float3(0.0, 1.0, 0.0), 0.8);
+        c.rgb = satur(c.rgb) * plSpriteTint.rgb + c.rgb * pointLights3(i.wpos, float3(0.0, 1.0, 0.0), 0.8);
     }
     c.rgb = min(c.rgb + mHouse.a, 1.0);
     c.rgb += glow * emit;  // may exceed 1 (HDR: blooms)
@@ -667,7 +690,7 @@ float4 terrain2_fs(TVOut i) : SV_Target0 {
     if (t2Shadow.x > 0.5) SHADOW_PCF(T2ShadowMap, T2ShadowSamp, mul(t2LightVP, float4(i.wpos, 1.0)).xyz, t2Shadow, sm);
     const float vis = lerp(t2Light.w, 1.0, sm);
     const float3 shade = sunAmb(t2Light.x, t2Light.y * ndl * vis) * t2Light.z;
-    float3 rgb = satur(albedo) * shade + albedo * pointLights(i.wpos, n, 0.3);
+    float3 rgb = satur(albedo) * shade + albedo * pointLights7(i.wpos, n, 0.3);
     float s2 = 0.0;
     // fog2.w: 0 no shroud, 1 shroud, 2 baked for the Enhanced 2D view (no shroud, no edge fade).
     if (t2Fog2.w > 0.5 && t2Fog2.w < 1.5) s2 = T2Shroud.Sample(T2ShroudSamp, p / mapSize).a;
@@ -824,6 +847,16 @@ float3 concreteSlab3(float2 p, float grainRel, inout float3 nrm, float3 sand, fl
 float4 terrain3_fs(TVOut i) : SV_Target0 {
     const float2 p = i.wpos.xz;
     const float2 mapSize = t2Fog2.yz;
+    // Shroud / the map's edge (fog2.w: 0 no shroud, 1 shroud, 2 baked: no shroud, no edge fade).
+    // (The MSL twin leaves early where a whole SIMD group is black; Vulkan 1.0 / SM 6.0 here keep
+    // the full path - the same picture.)
+    float s2 = 0.0;
+    if (t2Fog2.w > 0.5 && t2Fog2.w < 1.5) s2 = T2Shroud.Sample(T2ShroudSamp, p / mapSize).a;
+    const float2 ed = min(p, mapSize - p);
+    if (t2Fog2.w < 1.5) s2 = max(s2, 1.0 - smoothstep(0.0, 8.0, min(ed.x, ed.y)));
+    // Per cell (DesignedTerrain::buildSpiceTex): b > 0 = spice within reach of spiceField, a > 0 =
+    // relief within reach of the slope / rim taps. Without them those reads are all zeros: skipped.
+    const float4 near = T2Spice.Sample(T2SpiceSamp, p / mapSize);
     const float3 dpx = ddx(i.wpos), dpy = ddy(i.wpos);
     const float3 gn = normalize(i.nrm);
     const bool bake = t3Guide.z > 0.5;
@@ -846,10 +879,14 @@ float4 terrain3_fs(TVOut i) : SV_Target0 {
     const float2 guv = pg / mapSize;
     const float4 g = guideAt(pg, mapSize, tpp, lod);
     const float e = 1.5;
-    const float hE = guideAt(pg + float2(e, 0.0), mapSize, tpp, lod).g;
-    const float hW = guideAt(pg - float2(e, 0.0), mapSize, tpp, lod).g;
-    const float hS = guideAt(pg + float2(0.0, e), mapSize, tpp, lod).g;
-    const float hN = guideAt(pg - float2(0.0, e), mapSize, tpp, lod).g;
+    const bool relief = near.a > 0.0 || lod >= 2.0;
+    float hE = g.g, hW = g.g, hS = g.g, hN = g.g;
+    if (relief) {
+        hE = guideAt(pg + float2(e, 0.0), mapSize, tpp, lod).g;
+        hW = guideAt(pg - float2(e, 0.0), mapSize, tpp, lod).g;
+        hS = guideAt(pg + float2(0.0, e), mapSize, tpp, lod).g;
+        hN = guideAt(pg - float2(0.0, e), mapSize, tpp, lod).g;
+    }
     const float2 mg = float2(hE - hW, hS - hN) * (t3Guide.x / (2.0 * e));
     const float ml = length(mg);
     const float steep = smoothstep(0.45, 1.05, ml);
@@ -880,8 +917,11 @@ float4 terrain3_fs(TVOut i) : SV_Target0 {
     const float tierLight = 0.05 * (tier - 1.0) + 0.07 * smoothstep(0.75, 1.0, tf);
     const float foot = 1.0 - smoothstep(0.03, 0.16, hF);
     // The rim: the height still climbs from below (2 px down the slope) but no longer above.
-    const float gUp = guideAt(pg + dir * 2.0, mapSize, tpp, lod).g;
-    const float gDn = guideAt(pg - dir * 2.0, mapSize, tpp, lod).g;
+    float gUp = g.g, gDn = g.g;
+    if (relief) {
+        gUp = guideAt(pg + dir * 2.0, mapSize, tpp, lod).g;
+        gDn = guideAt(pg - dir * 2.0, mapSize, tpp, lod).g;
+    }
     const float climbed = g.g - gDn, climbing = gUp - g.g;
     const float rim = smoothstep(0.35, 0.6, (climbed - climbing) / (climbed + abs(climbing) + 0.004)) *
                       smoothstep(0.012, 0.03, climbed) * smoothstep(0.3, 0.5, hF) *
@@ -926,14 +966,18 @@ float4 terrain3_fs(TVOut i) : SV_Target0 {
     w[2] = max(rockW - w[3] - w[4], 0.0);
     w[5] = 0.0;
     w[6] = 0.0;
-    const float2 sf = spiceField(p, mapSize);
-    const float amount = (sf.x + sf.y) * (2.0 / 7.0);
-    const float grains = vnoise(p / 5.0) * 0.6 + vnoise(p / 15.0) * 0.4;
-    // The edge of a field dissolves: the presence against a noise threshold (lobes and specks).
-    const float edgeN = vnoise(p / 11.0 + 4.0) * 0.5 + vnoise(p / 4.0 + 8.0) * 0.3 + vnoise(p / 1.7) * 0.2;
-    const float cover = smoothstep(-0.12, 0.2, sf.x - (0.15 + 0.6 * edgeN));
-    float spice = lerp(cover * 0.78, 1.0, sf.y) * smoothstep(1.0, 0.55, grains - amount * 0.3) * 0.92;
-    spice *= saturate((1.0 - rockW) * 1.6);
+    float2 sf = float2(0.0, 0.0);
+    float spice = 0.0;  // (no spice field within reach: no spice)
+    if (near.b > 0.0) {
+        sf = spiceField(p, mapSize);
+        const float amount = (sf.x + sf.y) * (2.0 / 7.0);
+        const float grains = vnoise(p / 5.0) * 0.6 + vnoise(p / 15.0) * 0.4;
+        // The edge of a field dissolves: the presence against a noise threshold (lobes and specks).
+        const float edgeN = vnoise(p / 11.0 + 4.0) * 0.5 + vnoise(p / 4.0 + 8.0) * 0.3 + vnoise(p / 1.7) * 0.2;
+        const float cover = smoothstep(-0.12, 0.2, sf.x - (0.15 + 0.6 * edgeN));
+        spice = lerp(cover * 0.78, 1.0, sf.y) * smoothstep(1.0, 0.55, grains - amount * 0.3) * 0.92;
+        spice *= saturate((1.0 - rockW) * 1.6);
+    }
     w[0] *= 1.0 - spice;
     w[1] *= 1.0 - spice;
     w[5] = spice;
@@ -1015,9 +1059,11 @@ float4 terrain3_fs(TVOut i) : SV_Target0 {
         n = normalize(lerp(n, normalize(cn), t));
         reliefW *= 1.0 - t;
     }
-    const float mound = spots(p + (float2(vnoise(p / 23.0 + 1.3), vnoise(p / 23.0 + 9.1)) - 0.5) * 12.0, 13.0, 0.3 + 0.7 * sf.y);
-    albedo *= lerp(float3(1.0, 1.0, 1.0), float3(0.85, 0.61, 0.45), spice * mound);
-    albedo *= lerp(float3(1.0, 1.0, 1.0), float3(0.95, 0.84, 0.74), spice * smoothstep(0.1, 0.8, sf.y));  // richer, redder where thick
+    if (spice > 0.0) {
+        const float mound = spots(p + (float2(vnoise(p / 23.0 + 1.3), vnoise(p / 23.0 + 9.1)) - 0.5) * 12.0, 13.0, 0.3 + 0.7 * sf.y);
+        albedo *= lerp(float3(1.0, 1.0, 1.0), float3(0.85, 0.61, 0.45), spice * mound);
+        albedo *= lerp(float3(1.0, 1.0, 1.0), float3(0.95, 0.84, 0.74), spice * smoothstep(0.1, 0.8, sf.y));  // richer, redder where thick
+    }
 
     // Light: level ground under detailSun + the sun shadow map; broken rock under sunDir (baked
     // from above without cast shadow: the original's shading of the rock is in its tone levels).
@@ -1031,11 +1077,7 @@ float4 terrain3_fs(TVOut i) : SV_Target0 {
     const float3 shadeFlat = sunAmb(t2Light.x, t2Light.y * max(dot(n, t3DetailSun.xyz), 0.0) * vis) * t3DetailSun.w;
     const float3 shadeRelief = sunAmb(t3ReliefLight.x, t3ReliefLight.y * max(dot(n, t2SunDir.xyz), 0.0) * vis) * t3ReliefLight.z;
     const float3 shade = lerp(shadeFlat, shadeRelief, reliefW);
-    float3 rgb = satur(albedo) * shade + albedo * pointLights(i.wpos, n, 0.3);
-    float s2 = 0.0;
-    if (t2Fog2.w > 0.5 && t2Fog2.w < 1.5) s2 = T2Shroud.Sample(T2ShroudSamp, p / mapSize).a;
-    const float2 ed = min(p, mapSize - p);
-    if (t2Fog2.w < 1.5) s2 = max(s2, 1.0 - smoothstep(0.0, 8.0, min(ed.x, ed.y)));
+    float3 rgb = satur(albedo) * shade + albedo * pointLights8(i.wpos, n, 0.3);
     const float dist = distance(i.wpos, t2Fog.xyz);
     const float f = smoothstep(t2Fog.w, t2Fog2.x, dist);
     rgb = lerp(rgb, t2FogColor.rgb, f) * (1.0 - s2);
@@ -1108,7 +1150,7 @@ float4 rock_fs(RVOut i) : SV_Target0 {
     if (rShadow.x > 0.5) SHADOW_PCF(RockShadowMap, RockShadowSamp, mul(rLightVP, float4(i.wpos, 1.0)).xyz, rShadow, sm);
     const float vis = lerp(rLight.w, 1.0, sm);
     const float amb = rLight.x * (0.78 + 0.22 * n.y) * lerp(0.62, 1.0, smoothstep(0.0, 0.55, i.ao));
-    float3 rgb = satur(albedo) * sunAmb(amb, rLight.y * ndl * vis) * rLight.z + albedo * pointLights(i.wpos, n, 0.25);
+    float3 rgb = satur(albedo) * sunAmb(amb, rLight.y * ndl * vis) * rLight.z + albedo * pointLights3(i.wpos, n, 0.25);
     const float2 p = i.wpos.xz, mapSize = rFog2.yz;
     float s = 0.0;
     if (rFog2.w > 0.5 && rFog2.w < 1.5) s = RockShroud.Sample(RockShroudSamp, p / mapSize).a;
@@ -1135,7 +1177,8 @@ SamplerState tmBloomSamp : register(s1, space2);
 cbuffer TmU : register(b0, space3) {
     float4 tmA;  // exposure, peak, knee, bloom strength
     float4 tmB;  // bloom uv scale x, y, input linear, output linear
-    float4 tmC;  // highlight desaturation
+    float4 tmC;  // highlight desaturation, display adjustments on
+    float4 tmD;  // display adjustments: brightness, contrast, gamma, saturation (render/hdr.hpp DisplayAdjust)
 };
 struct TmIn {  // the semantics of SDL's own GPU-renderer shaders (D3D12 matches by name)
     float4 color : COLOR0;
@@ -1148,6 +1191,20 @@ float3 tmToLin(float3 c) {
 float3 tmToSrgb(float3 c) {
     c = max(c, 0.0);
     return lerp(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, step(c, 0.0031308));
+}
+// Display adjustments (twin of displayAdjust in shaders_msl.hpp): saturation on linear light, then
+// gamma / contrast / brightness on the sRGB-coded value; 0 and 1 stay fixed, EDR values above 1 kept.
+float3 tmDisplayAdjust(float3 c, float4 d) {
+    const float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    c = max(y + (c - y) * (1.0 + d.w), 0.0);
+    const float3 over = max(c - 1.0, 0.0);
+    float3 e = tmToSrgb(min(c, 1.0));
+    e = pow(e, 1.0 / d.z);
+    const float p = d.y >= 0.0 ? 1.0 + 2.0 * d.y : 1.0 / (1.0 - 2.0 * d.y);
+    const float3 lo = 0.5 * pow(2.0 * e, p), hi = 1.0 - 0.5 * pow(max(2.0 * (1.0 - e), 0.0), p);
+    e = lerp(hi, lo, step(e, 0.4999999));
+    e = d.x >= 0.0 ? e + d.x * (1.0 - e) : e * (1.0 + d.x);
+    return tmToLin(e) + over;
 }
 float4 tonemap_fs(TmIn i) : SV_Target {
     const float3 s = tmScene.Sample(tmSceneSamp, i.uv).rgb * i.color.rgb;
@@ -1163,8 +1220,11 @@ float4 tonemap_fs(TmIn i) : SV_Target {
             const float mm = knee + room * (1.0 - exp(-(m - knee) / room));
             const float3 t = c * (mm / m);
             const float w = saturate((m - peak) / (3.0 * peak)) * tmC.x;
-            c = lerp(t, float3(mm, mm, mm), w);
+            // towards the per-channel shoulder (orange -> yellow -> white, not through pink; see the MSL twin)
+            const float3 pc = min(c, knee) + room * (1.0 - exp(-max(c - knee, 0.0) / room));
+            c = lerp(t, pc, w);
         }
     }
+    if (tmC.y > 0.5) c = tmDisplayAdjust(c, tmD);
     return float4(tmB.w > 0.5 ? c : tmToSrgb(c), 1.0);
 }

@@ -268,7 +268,7 @@ bool loadGltfModel(const std::string& path, const GltfAdjust& adj, formats::Mode
         for (char& c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
         addAnchor(name, p, size > 1e-4f ? size : 1.0f, isUnderTurret(node));
     }
-    for (const auto& a : adj.anchors) addAnchor(a.name, a.pos, a.size, false);
+    for (const auto& a : adj.anchors) addAnchor(a.name, a.pos, a.size, a.onTurret);
     std::sort(out.anchors.begin(), out.anchors.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
     // Skeleton (docs/3d-models.md "Animation"): every node (palette index = node index), the
     // place matrix (glTF tiles -> model px, as `place` above), the animations.

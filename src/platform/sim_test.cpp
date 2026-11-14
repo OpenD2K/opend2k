@@ -456,6 +456,15 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
         return -1;
     };
     const std::uint32_t t = world.gameTicks();
+    // D2K_VFX_DEMO_SITE=x,y: the demo's tile instead of --at (which also places the camera, from
+    // the output size in pixels: on a HiDPI Original view the two do not coincide).
+    if (const char* site = std::getenv("D2K_VFX_DEMO_SITE")) {
+        int sx = 0, sy = 0;
+        if (std::sscanf(site, "%d,%d", &sx, &sy) == 2) {
+            cx = sx * 32;
+            cy = sy * 32;
+        }
+    }
     // D2K_VFX_DEMO=units: a column of real units (side 0) shooting at the ground 2 tiles east
     // (attack-tile orders: the real FireAt path with its reload delays, muzzle points and
     // instant-hit machine-gun bullets) instead of the synthetic bullet rows.
@@ -646,13 +655,28 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
             if (const int mcv = unitType("MCV"); mcv >= 0) world.addUnit(me, mcv, bx - 1, by + 2, bx - 1, by + 2);
         }
         if (port >= 0 && t % 200 == 100) world.sides()[me].buildings[port].flags |= 0x20;  // landing lights (as a frigate)
+        // The bought deliveries come 40 ticks after the purchase instead of starportFrigateDelay (1500): the frigate
+        // and the star port's landing lights (render::starportLanding) within a short demo.
+        for (auto& d : world.sides()[me].deliveries)
+            if (d.active && !d.started && d.type == 2 && d.time > world.gameTicks() + 40) d.time = world.gameTicks() + 40;
         if (t == 40)
             for (int i = world.sides()[me].firstUnit; i >= 0; i = world.sides()[me].nextObject(i))
                 if (world.sides()[me].units[i].type == unitType("MCV")) world.orderDeploy(me, i);
+        if (t >= 21 && t % 120 == 21) world.orderStarportPurchase(me);  // the pick (queued last tick) is in now
         if (t >= 20 && t % 120 == 20) {
             for (const char* u : {"LIGHT INF", "TRIKE", "ATREIDES COMBAT TANK", "HARKONNEN COMBAT TANK", "ORDOS COMBAT TANK"})
                 if (const int ty = unitType(u); ty >= 0) world.orderBuildUnit(me, ty);  // (the side's own tank only)
-            if (const int q = unitType("QUAD"); q >= 0 && world.orderStarportPick(me, q)) world.orderStarportPurchase(me);
+            {  // a unit the star port has in stock (a quad when it can), purchased next tick (below)
+                const Side& sd = world.sides()[me];
+                int q = unitType("QUAD");
+                if (q < 0 || sd.starportStock[std::size_t(q)] == 0)
+                    for (const int ty : sd.starportTypes)
+                        if (ty >= 0 && ty < formats::kMaxUnitTypes && sd.starportStock[std::size_t(ty)] > 0) {
+                            q = ty;
+                            break;
+                        }
+                if (q >= 0) world.orderStarportPick(me, q);
+            }
             if (pad >= 0)
                 if (const int q = unitType("QUAD"); q >= 0) {
                     const int u = world.addUnit(me, q, bx + 4, by + 3, bx + 4, by + 3);
@@ -687,7 +711,10 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
         return;
     }
     if (demo == "allbuildings") {
-        const int me = world.mySide(), bx = cx / 32, by = cy / 32;
+        // D2K_VFX_DEMO_DX / _DY=N: the layout N tiles east / south of the camera tile (close-ups).
+        const char* dxe = std::getenv("D2K_VFX_DEMO_DX");
+        const char* dye = std::getenv("D2K_VFX_DEMO_DY");
+        const int me = world.mySide(), bx = cx / 32 + (dxe ? std::atoi(dxe) : 0), by = cy / 32 + (dye ? std::atoi(dye) : 0);
         if (t == 1) {
             const char* he = std::getenv("D2K_VFX_DEMO_HOUSE");
             const std::string house = he && *he ? he : "ATREIDES";
@@ -737,6 +764,24 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
                 for (int k = 0; wt >= 0 && k < std::atoi(pw); ++k) world.addBuilding(me, wt, x0 + 2 * k, y, false, true, true);
             }
         }
+        // D2K_VFX_DEMO_WORK=1: every building working as the simulation marks it (the working animations check,
+        // docs/3d-models.md "Working lamps"): the factories, barracks and palaces hold the producing flag
+        // (kAnimPermanent), the construction yard / star port / repair pad / Harkonnen palace play their once-animation
+        // (kAnimOnce: a placement, a frigate, a repair step, a Death Hand launch) every 90 ticks; the silos' fill steps.
+        if (const char* wk = std::getenv("D2K_VFX_DEMO_WORK"); wk && wk[0] == '1') {
+            Side& sd = world.sides()[me];
+            for (int i = sd.firstBuilding; i >= 0; i = sd.nextObject(i)) {
+                Building& b = sd.buildings[std::size_t(i)];
+                const int sb = T.bin.buildings[b.type].specialBehavior;
+                const bool once = sb == 2 || sb == 6 || sb == 13 || sb == 17;  // yard, repair pad, star port, H palace
+                if (once) {
+                    if (t % 90 == 10) b.flags |= game::building_flags::kAnimOnce;
+                } else if (sb >= 7 || sb == 11) {
+                    b.flags |= game::building_flags::kAnimPermanent;  // factories, barracks, palaces
+                }
+            }
+            if (t % 100 == 0) sd.spice = sd.maxStorage * int((t / 100) % 4) / 3;
+        }
         const char* park = std::getenv("D2K_VFX_DEMO_PARK");
         if (t % 30 == 2 && t < 400 && !(park && park[0] == '1')) {  // along the walkable front rows of the first two building rows
             const int inf = unitType("LIGHT INF"), trike = unitType("TRIKE");
@@ -778,6 +823,11 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
                 if (idx >= 0) made.push_back(idx);
                 x += w;
             }
+            // D2K_VFX_DEMO_POWER=N: N Harkonnen wind traps in a row further south (full power: the glow's
+            // powered look, e.g. the Harkonnen research centre's blinking dome lights).
+            if (const char* pw = std::getenv("D2K_VFX_DEMO_POWER"); pw && std::atoi(pw) > 0)
+                if (const int wt = buildingType("HARKONNEN WIND TRAP"); wt >= 0)
+                    for (int k = 0; k < std::atoi(pw); ++k) world.addBuilding(me, wt, bx - 12 + 2 * k, by + 5, false, true, true);
         }
         for (const int i : made) world.sides()[me].buildings[i].flags |= game::building_flags::kAnimPermanent;
         return;
@@ -786,7 +836,67 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
     // Ornithopter_LaunchStrike 0x49e770 does (12 bombs, flags 0x10800, Moving), but starting 9 / 11 / 13
     // tiles west of the tile, every 300 ticks: their wing beat (unit art rows 0-1-2,
     // FlyUnit) is the 3D row-pose check (docs/3d-models.md "Animation").
-    if (demo == "ornithopter") {
+    // D2K_VFX_DEMO=airdefence: the same strike flying into an enemy position under the shroud -
+    // at tick 1 an enemy side (the first one at war with the player) gets three rocket turrets
+    // (LARGE GUN TURRET, powered by two wind traps) and four troopers around the tile. The
+    // shooters' cells are revealed by FireAt (shooter's cell cleared when the target is the
+    // player's), the shroud check of re/notes/shroud.md §7 (radar vs battlefield).
+    if (demo == "airdefence" && t == 1) {
+        const int me = world.mySide(), bx = cx / 32, by = cy / 32;
+        int enemy = -1;
+        for (int s = 0; s < kMaxSides && enemy < 0; ++s)
+            if (s != me && world.diplomacy(me, s) == 1 && world.sides()[s].participates && world.sides()[s].firstBuilding != -1)
+                enemy = s;
+        SDL_Log("airdefence: enemy side %d", enemy);
+        auto building = [&](const char* name) {
+            for (int i = 0; i < int(T.bin.buildingCount); ++i)
+                if (std::string(T.bin.buildingNames[i]) == name) return i;
+            return -1;
+        };
+        if (enemy >= 0) {
+            const int trap = building("HARKONNEN WIND TRAP"), tur = building("HARKONNEN LARGE GUN TURRET");
+            if (trap >= 0) {
+                world.addBuilding(enemy, trap, bx + 3, by - 4, false, true);
+                world.addBuilding(enemy, trap, bx + 5, by - 4, false, true);
+            }
+            static const int kTur[][2] = {{-2, -1}, {2, 1}, {0, 3}};
+            if (tur >= 0)
+                for (const auto& p : kTur) world.addBuilding(enemy, tur, bx + p[0], by + p[1], false, true);
+            if (const int tr = unitType("TROOPER"); tr >= 0)
+                for (int k = 0; k < 4; ++k) world.addUnit(enemy, tr, bx - 3 + 2 * k, by + 5, bx - 3 + 2 * k, by + 5);
+        }
+        // The radar on: D2K_VFX_DEMO_RADAR=x,y puts a player outpost + two wind traps there.
+        if (const char* rp = std::getenv("D2K_VFX_DEMO_RADAR")) {
+            int rx = 0, ry = 0;
+            if (std::sscanf(rp, "%d,%d", &rx, &ry) == 2) {
+                if (const int op = building("HARKONNEN OUTPOST"); op >= 0) world.addBuilding(me, op, rx, ry, false, true);
+                if (const int trap = building("HARKONNEN WIND TRAP"); trap >= 0) {
+                    world.addBuilding(me, trap, rx + 3, ry, false, true);
+                    world.addBuilding(me, trap, rx + 5, ry, false, true);
+                }
+            }
+        }
+        for (int i = world.sides()[me].firstBuilding; i != -1; i = world.sides()[me].nextObject(i)) {
+            const Building& b = world.sides()[me].buildings[i];
+            SDL_Log("airdefence: player building %d at tile %d,%d", int(b.type), (b.posX >> 16) / 32, (b.posY >> 16) / 32);
+        }
+    }
+    if (demo == "airdefence" && std::getenv("D2K_VFX_DEMO_LOG") && t % 10 == 0) {
+        // The shroud bytes of the 9 x 9 cells around the tile (".." = 0, else hex).
+        const int bx = cx / 32, by = cy / 32;
+        std::string rows;
+        for (int y = by - 4; y <= by + 5; ++y) {
+            rows += "\n  ";
+            for (int x = bx - 4; x <= bx + 4; ++x) {
+                char b[4];
+                const int v = world.inBounds(x, y) ? world.cell(x, y).shroud : 0x11;
+                std::snprintf(b, sizeof b, v ? "%02x " : ".. ", v);
+                rows += b;
+            }
+        }
+        SDL_Log("airdefence t=%u shroud around %d,%d:%s", t, bx, by, rows.c_str());
+    }
+    if (demo == "ornithopter" || demo == "airdefence") {
         const int me = world.mySide(), bx = cx / 32, by = cy / 32;
         const int type = unitType("ORNITHOPTER");
         if (type >= 0 && t % 300 == 1)
@@ -964,6 +1074,40 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
         }
         return;
     }
+    // D2K_VFX_DEMO=fire: burning buildings of several houses (refinery, heavy factory, light factory,
+    // barracks of Atreides / Harkonnen / Ordos) in two rows, the north row held at 40% health, the south
+    // row at 15%, hit by a machine-gun bullet every 200 ticks (the original's smoke timers keep running:
+    // the BUILEXP.BIN smoke / flame events go on) - the building fire look check (render/effects_fire.cpp).
+    if (demo == "fire") {
+        const int me = world.mySide();
+        const int ax = cx / 32 - 7, ay = cy / 32 - 4;
+        static std::vector<std::pair<int, int>> blds;  // (index, health percent)
+        if (t == 1) {
+            struct B { const char* name; int dx; };
+            static const B kRow[] = {{"HARKONNEN REFINERY", 0}, {"ATREIDES HEAVY FACTORY", 4}, {"ORDOS LIGHT FACTORY", 8},
+                                     {"HARKONNEN BARRACKS", 12}};
+            for (int row = 0; row < 2; ++row)
+                for (const B& b : kRow)
+                    if (const int type = buildingType(b.name); type >= 0) {
+                        const int i = world.addBuilding(me, type, ax + b.dx, ay + row * 4, true, true);
+                        if (i >= 0) blds.push_back({i, row == 0 ? 40 : 15});
+                    }
+        }
+        const int lmg = weapon("LMG");
+        if (lmg >= 0 && (t == 2 || (t > 2 && t % 200 == 0))) {
+            Side& S = world.sides()[me];
+            for (const auto& [i, hp] : blds) {
+                Building& b = S.buildings[i];
+                if (!b.alive) continue;
+                const auto& bt = world.buildingTemplate(b);
+                b.health = std::int32_t(bt.hitPoints) * hp / 100;
+                world.damageTiles(b.tileX * 32 + 16, b.tileY * 32 + 16 + (bt.artHeight > 32 ? 32 : 0), 0, lmg, (me + 1) & 7, -1,
+                                  false);
+                b.health = std::int32_t(bt.hitPoints) * hp / 100;
+            }
+        }
+        return;
+    }
     // D2K_VFX_DEMO=capture: a wind trap and a barracks of another side, two engineers of the
     // player next to them; at tick 100 (after the build-up) the engineers are sent in
     // (orderAttackBuilding: the real infiltrate + CaptureBuilding path). At tick 150 a third
@@ -994,6 +1138,31 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
         }
         if (t == 150 && b2 >= 0) {
             if (Building* b = world.building(other, b2)) world.destroyBuilding(*b, false);
+        }
+        return;
+    }
+    // D2K_VFX_DEMO=column: a vehicle column (side 0, one per row) that sets off east, stops, fires
+    // at the ground ahead, drives a diagonal, turns about and back west - Vehicle animation / barrel tips check (period 400).
+    if (demo == "column") {
+        static const char* kUnits[] = {"ATREIDES COMBAT TANK", "HARKONNEN COMBAT TANK", "ORDOS COMBAT TANK", "SIEGE TANK",
+                                       "DEVASTATOR TANK", "MISSILE TANK", "QUAD", "TRIKE"};
+        static std::vector<int> ids;
+        const int ax = cx / 32 - 5, ay = cy / 32 - 4;
+        if (ids.empty()) {
+            for (int k = 0; k < int(std::size(kUnits)); ++k) {
+                int type = -1;
+                for (int i = 0; i < int(T.bin.unitCount); ++i)
+                    if (std::string(T.bin.unitNames[i]) == kUnits[k]) type = i;
+                ids.push_back(type >= 0 ? world.addUnit(0, type, ax, ay + k, ax, ay + k) : -1);
+            }
+        }
+        const std::uint32_t p = t % 400;
+        for (int k = 0; k < int(ids.size()); ++k) {
+            if (ids[k] < 0) continue;
+            if (p == 10) world.orderMove(0, ids[k], ax + 4, ay + k);
+            if (p == 110) world.orderAttackTile(0, ids[k], ax + 7, ay + k);
+            if (p == 200) world.orderMove(0, ids[k], ax + 7, ay + k + 3);  // a diagonal: turning while driving
+            if (p == 290) world.orderMove(0, ids[k], ax + 1, ay + k);      // turn about, back west
         }
         return;
     }

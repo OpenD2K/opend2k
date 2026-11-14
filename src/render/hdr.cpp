@@ -17,9 +17,19 @@ SDL_Texture* gScreen = nullptr;
 struct TmUniforms {
     float exposure, peak, knee, bloomStrength;
     float bloomU, bloomV, inLinear, outLinear;
-    float desaturate, pad0, pad1, pad2;
+    float desaturate, adjustOn, pad1, pad2;
+    float brightness, contrast, gamma, saturation;  // DisplayAdjust
 };
 }  // namespace
+
+DisplayAdjust DisplayAdjust::fromSettings(int brightness, int contrast, int gamma, int saturation) {
+    DisplayAdjust a;
+    a.brightness = float(std::clamp(brightness, -50, 50)) / 200.0f;
+    a.contrast = float(std::clamp(contrast, -50, 50)) * 0.006f;
+    a.gamma = float(std::clamp(gamma, 80, 140)) / 100.0f;
+    a.saturation = float(std::clamp(saturation, -50, 50)) / 100.0f;
+    return a;
+}
 
 void setHdrOutput(bool extended, float headroom) {
     gExtended = extended;
@@ -32,6 +42,7 @@ SDL_Texture* screenTarget() { return gScreen; }
 
 Hdr::Hdr(SDL_Renderer* r) : r_(r) {
     if (const char* e = std::getenv("D2K_EXPOSURE")) exposure_ = std::clamp(float(std::atof(e)), 0.1f, 8.0f);
+    if (const char* e = std::getenv("D2K_SDR_KNEE")) sdrKnee_ = std::clamp(float(std::atof(e)), 0.3f, 0.95f);  // (tests)
 }
 
 Hdr::~Hdr() {
@@ -107,10 +118,14 @@ bool Hdr::compose(SDL_Texture* scene, int srcW, int srcH, SDL_Texture* bloom, fl
     SDL_GetTextureSize(scene, &tw, &th);
     TmUniforms u{};
     u.exposure = tonemap ? exposure_ : 1.0f;
-    // SDR: the shoulder starts at 80 % linear (sRGB ~0.91: sunlit sand stays as it was) and ends at
-    // white. EDR: it ends at the headroom (at most 4x SDR white: brighter is uncomfortable).
+    // EDR: the shoulder starts at 80 % linear (sRGB ~0.91: sunlit sand stays as it was) and ends at
+    // the headroom (at most 4x SDR white: brighter is uncomfortable). SDR (peak = SDR white): from
+    // sdrKnee_ (default 0.6 linear, sRGB ~0.80) - a 0.8 knee left only 0.2 of room, so everything hotter
+    // (headlight cones, lamps, flashes, fire) piled up near white: hard, blown highlights on an SDR
+    // monitor (owner 2026-11-14). The wider roll-off keeps their gradation; the brightest sunlit sand
+    // loses ~2 % (sRGB 0.906 -> 0.89 at 0.8 linear).
     u.peak = gExtended && tonemap ? std::clamp(gHeadroom, 1.0f, 4.0f) : 1.0f;
-    u.knee = tonemap ? 0.8f : u.peak;
+    u.knee = !tonemap ? u.peak : u.peak > 1.0f ? 0.8f : sdrKnee_;
     u.bloomStrength = bloom ? std::max(0.0f, bloomStrength) : 0.0f;
     u.bloomU = tw / float(srcW);
     u.bloomV = th / float(srcH);
@@ -129,7 +144,7 @@ bool Hdr::compose(SDL_Texture* scene, int srcW, int srcH, SDL_Texture* bloom, fl
     return true;
 }
 
-bool Hdr::presentCanvas(SDL_Texture* canvas, const SDL_FRect& dst) {
+bool Hdr::presentCanvas(SDL_Texture* canvas, const SDL_FRect& dst, bool linearOut, const DisplayAdjust& adjust) {
     if (!canvas || !available()) return false;
     if (!presentState_) {
         SDL_GPUTextureSamplerBinding b{render3d::gpuTextureOf(black_), sampler_};
@@ -139,13 +154,18 @@ bool Hdr::presentCanvas(SDL_Texture* canvas, const SDL_FRect& dst) {
         ci.sampler_bindings = &b;
         presentState_ = SDL_CreateGPURenderState(r_, &ci);
         if (!presentState_) return false;
-        TmUniforms u{};
-        u.exposure = 1;
-        u.peak = u.knee = 1e4f;  // no shoulder, no clamp: a plain sRGB -> linear decode
-        u.bloomU = u.bloomV = 1;
-        u.outLinear = 1;
-        SDL_SetGPURenderStateFragmentUniforms(presentState_, 0, &u, sizeof u);
     }
+    TmUniforms u{};
+    u.exposure = 1;
+    u.peak = u.knee = 1e4f;  // no shoulder, no clamp: a plain sRGB -> linear decode (+ the adjustments)
+    u.bloomU = u.bloomV = 1;
+    u.outLinear = linearOut ? 1.0f : 0.0f;
+    u.adjustOn = adjust.identity() ? 0.0f : 1.0f;
+    u.brightness = adjust.brightness;
+    u.contrast = adjust.contrast;
+    u.gamma = std::max(0.1f, adjust.gamma);
+    u.saturation = adjust.saturation;
+    SDL_SetGPURenderStateFragmentUniforms(presentState_, 0, &u, sizeof u);
     SDL_SetTextureBlendMode(canvas, SDL_BLENDMODE_NONE);
     SDL_SetTextureScaleMode(canvas, SDL_SCALEMODE_NEAREST);
     SDL_SetGPURenderState(r_, presentState_);

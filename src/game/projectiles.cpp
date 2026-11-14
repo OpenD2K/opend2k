@@ -74,7 +74,7 @@ int World::addExplosion(int side, int type, int x, int y, std::int32_t z, std::u
     type &= 0xff;
     if (type > 0x3f || static_cast<std::size_t>(type) >= explosionCount()) return -1;  // "explosionType > kMax"
     Side& s = sides_[side & 7];
-    const int idx = s.allocObject();
+    const int idx = s.allocObject(unlimitedObjects_);
     if (idx < 0) return -1;
     Explosion& e = s.explosions[idx];
     e = Explosion{};
@@ -150,7 +150,7 @@ int World::addBullet(int side, int w, int delay, int firer, int srcX, int srcY, 
                      int homingSide) {
     if (w < 0 || w > 0x3f) return -1;  // DebugFatal "bulletType > kMaxAllowableBullet"
     Side& s = sides_[side & 7];
-    const int idx = s.allocObject();
+    const int idx = s.allocObject(unlimitedObjects_);
     if (idx < 0) return -1;
     const auto& wt = weapon(w);
     Bullet& b = s.bullets[idx];
@@ -193,7 +193,7 @@ int World::addBullet(int side, int w, int delay, int firer, int srcX, int srcY, 
         // The firer's PosZ (the slot read as a unit; debris passes a building index).
         const int fi = firer & 0xffff;
         b.fallSpeed = 0;
-        b.posZ = (fi < kObjectsPerSide && s.links[fi].kind == SlotKind::Unit) ? s.units[fi].posZ : 0;
+        b.posZ = (fi < s.poolSize() && s.links[fi].kind == SlotKind::Unit) ? s.units[fi].posZ : 0;
     }
     if (b.flags & kHoming) b.moveSteps = steps * 2;
     const int dirs = projectileDirections(w);

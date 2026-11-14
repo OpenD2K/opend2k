@@ -143,7 +143,7 @@ struct AiController {
 
     // Object kind of a side slot, the original's ObjectType (+0x90): 1 unit, 2 building.
     int kindOf(int sd, int idx) const {
-        if (sd < 0 || sd >= kMaxSides || idx < 0 || idx >= kObjectsPerSide) return 0;
+        if (sd < 0 || sd >= kMaxSides || idx < 0 || idx >= w.sides_[sd].poolSize()) return 0;
         return static_cast<int>(w.sides_[sd].links[idx].kind);
     }
 
@@ -161,7 +161,7 @@ struct AiController {
     // ResetSelected 0x41cc90.
     void resetSelected() {
         if (D(0x1d40) != 0xffffffff) {
-            Unit& u = S.units[D(0x1d40) % kObjectsPerSide];
+            Unit& u = S.units[D(0x1d40) % S.units.size()];
             if (u.state != UnitState::Dead) u.selected = true;
             SD(0x1d40, 0xffffffff);
         }
@@ -181,7 +181,7 @@ struct AiController {
     // SelectUnit 0x41cd50.
     bool selectUnit(int idx) {
         if ((idx & 0xffff) == 0xffff) return false;
-        Unit& u = S.units[idx % kObjectsPerSide];
+        Unit& u = S.units[idx % S.units.size()];
         if (u.state != UnitState::Dead) u.selected = true;
         return true;
     }
@@ -405,7 +405,7 @@ struct AiController {
         }
         int ci = S.primaryBuilding[0];
         if ((ci & 0xffff) == 0xffff) ci = S.firstBuilding;
-        const Building& c = S.buildings[ci % kObjectsPerSide];
+        const Building& c = S.buildings[ci % S.buildings.size()];
         const int cx = ((c.posX >> 16) / 32) & 0xff, cy = ((c.posY >> 16) / 32) & 0xff;
         int sx = 0, sy = 0, n = 0;
         forBuildings([&](Building& b) {
@@ -562,7 +562,7 @@ void AiController::validateTarget(int g) {  // FUN_004237a0: drop a dead/exclude
     if (idx == 0xffff) return;
     const int ts = gB(g, gTargetSide);
     if (kindOf(ts, idx) != 1) return;
-    const Unit& t = w.sides_[ts & 7].units[idx % kObjectsPerSide];
+    const Unit& t = w.sides_[ts & 7].units[idx % w.sides_[ts & 7].units.size()];
     if ((t.flags & unit_flags::kExcluded) || T.units[t.type].specialBehavior == behaviour::kSandworm ||
         t.state == UnitState::Dead)
         gSW(g, gTargetIndex, 0xffff);
@@ -639,7 +639,7 @@ const Building* AiController::bestBuilding(int tside, int x, int y, float weight
         const double v = static_cast<double>(maxD - k.dist) * weight * F(0xf64) + k.pri;
         if (fpuC0(v, best) || fpuC3(v, best)) continue;
         best = static_cast<float>(v);
-        if (k.idx != 0xffff && k.idx <= 1000) r = &ts.buildings[k.idx];
+        if (k.idx != 0xffff && k.idx < ts.poolSize()) r = &ts.buildings[k.idx];
     }
     return r;
 }
@@ -810,7 +810,7 @@ bool AiController::unitInBase(int tside, Unit*& out) {
 void AiController::attackObject(Unit& u, int tside, int tidx) {
     u.enemySide = tside & 0xff;
     u.enemyIndex = tidx & 0xffff;
-    if ((tside & 0xff) >= 8 || (tidx & 0xffff) >= 1000) return;
+    if ((tside & 0xff) >= 8 || (tidx & 0xffff) >= w.sides_[tside & 7].poolSize()) return;
     const int k = kindOf(tside, tidx);
     if (k == 1) {
         Unit& t = w.sides_[tside].units[tidx];
@@ -1859,7 +1859,7 @@ void AiController::monitorBuildings() {
     });
     for (int i = 0; i < B(0xf0c); ++i) {
         const std::ptrdiff_t e = static_cast<std::ptrdiff_t>(kInitPos) + i * 16;
-        const int idx = W(e + 2) % kObjectsPerSide;
+        const int idx = W(e + 2) % S.poolSize();
         // (the original reads the slot's state field whatever it now holds; a freed slot keeps
         // the dead building's data)
         const bool dead = S.links[idx].kind == SlotKind::Unit ? false : S.buildings[idx].state == 17;

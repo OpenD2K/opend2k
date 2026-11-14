@@ -35,6 +35,21 @@ float hdrOutputHeadroom();
 void setScreenTarget(SDL_Texture* t);
 SDL_Texture* screenTarget();
 
+// Display adjustments (Options -> Display: Brightness / Contrast / Gamma / Saturation), the last colour
+// step of the frame, in presentCanvas: saturation around the luminance in linear light, then gamma
+// (e^(1/gamma)), contrast (a power curve around mid grey that keeps black and white) and brightness
+// (lift towards white / scale towards black) on the sRGB-coded value. Nothing clips; EDR values above
+// SDR white keep their headroom. Identity = the picture unchanged (no extra pass at all).
+struct DisplayAdjust {
+    float brightness = 0;  // -0.25 .. 0.25
+    float contrast = 0;    // -0.3 .. 0.3 (curve power 1 / (1 - 2c) .. 1 + 2c)
+    float gamma = 1;       // 0.8 .. 1.4
+    float saturation = 0;  // -0.5 .. 0.5
+    bool identity() const { return brightness == 0 && contrast == 0 && gamma == 1 && saturation == 0; }
+    // From the settings' slider values (-50..50; gamma 80..140).
+    static DisplayAdjust fromSettings(int brightness, int contrast, int gamma, int saturation);
+};
+
 class Hdr {
 public:
     explicit Hdr(SDL_Renderer* r);
@@ -54,9 +69,10 @@ public:
     // Returns false (nothing drawn) when unavailable.
     bool compose(SDL_Texture* scene, int srcW, int srcH, SDL_Texture* bloom, float bloomStrength, const SDL_FRect& dst,
                  bool tonemap);
-    // EDR output: draws the canvas (extended sRGB-coded values) to `dst` of the current target (the
-    // float backbuffer) as linear light. False when unavailable.
-    bool presentCanvas(SDL_Texture* canvas, const SDL_FRect& dst);
+    // Draws the frame's canvas (sRGB-coded values; EDR: extended above 1) to `dst` of the current
+    // target with the display adjustments: linearOut (EDR, the float backbuffer) = as linear light,
+    // else sRGB-coded (an SDR backbuffer). False when unavailable.
+    bool presentCanvas(SDL_Texture* canvas, const SDL_FRect& dst, bool linearOut = true, const DisplayAdjust& adjust = {});
 
 private:
     bool init();
@@ -71,6 +87,7 @@ private:
     SDL_Texture* black_ = nullptr;          // bound when there is no bloom
     bool tried_ = false, ok_ = false;
     float exposure_ = 1.0f;
+    float sdrKnee_ = 0.6f;  // the SDR shoulder start (linear; compose)
 };
 
 }  // namespace d2k::render

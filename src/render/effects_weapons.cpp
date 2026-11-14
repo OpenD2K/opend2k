@@ -9,6 +9,7 @@
 
 #include "render/effects_internal.hpp"
 #include "render/map_renderer.hpp"
+#include "render/muzzle_tips.hpp"
 #include "render/tileset.hpp"
 
 #include <algorithm>
@@ -755,20 +756,84 @@ void Effects::spawnMuzzle(WeaponClass c, float x, float y, float z, float dx, fl
     }
 }
 
-// One shot from the world's shot log: the muzzle flash at the end of the gun (the bullet starts
-// at the firer's position + the template's ShootOffset along the aim, 2-5 px: inside the body;
-// the flash goes to where the barrel ends: infantry 6 px, vehicles 2 x offset + 4 px - trike /
-// raider / quad 10, tanks 14, devastator 18 - turrets 12 px from their centre), plus a tracer
-// gun -> aim point for machine guns (the bullet itself lands within the tick).
+// Where a unit's gun ends this frame (docs/enhanced-graphics.md "Barrel tips"): the fx_muzzle anchors
+// of its 3D model (Graphics: 3D, the model turned by its turret) or of the rendered art pack's model
+// (2D, projected like the pack's frames, render::PackAnchors); else the tip measured on its original
+// turret / body frame (render::MuzzleTips); infantry: the rifle's muzzle (ahead and a little right
+// of the figure, chest high). Render only.
+bool Effects::muzzlePoints(const game::World& w, int s, int unit, std::vector<EffectAnchor>& out) const {
+    out.clear();
+    if (s < 0 || s >= int(w.sides().size())) return false;
+    const auto& side = w.sides()[std::size_t(s)];
+    if (unit < 0 || unit >= int(side.units.size()) || side.links[std::size_t(unit)].kind != game::SlotKind::Unit) return false;
+    const game::Unit& u = side.units[std::size_t(unit)];
+    if (!u.alive || u.type < 0 || u.type >= formats::kMaxUnitTypes) return false;
+    if (anchors_ && anchors_->unitAnchors(w, s, unit, "fx_muzzle", out) && !out.empty()) return true;
+    out.clear();
+    const auto& ut = t_.bin.units[u.type];
+    const float ux = float(u.posX) / 65536.0f, uy = float(u.posY) / 65536.0f, uz = float(u.posZ) / 65536.0f;
+    if (ut.isInfantry) {
+        const float a = float(u.facing & 31) * (kPi / 16), fx = std::sin(a), fy = -std::cos(a);
+        out.push_back(EffectAnchor{ux + fx * 7 - fy * 1.5f, uy + fy * 7 + fx * 1.5f, 6 + uz, 1});
+        return true;
+    }
+    if (tips_) {
+        const UnitVisual* vis = unitVisual(s, unit);
+        const bool tur = tips_->turreted(u.type);
+        const float f = tur ? (vis ? vis->turret : float(u.facingTurret & 31)) : (vis ? vis->facing : float(u.facing & 31));
+        float dx = 0, dy = 0, z = 0;
+        if (tips_->tip(u, f, dx, dy, z)) {
+            out.push_back(EffectAnchor{ux + dx, uy + dy, z + uz, 1});
+            return true;
+        }
+    }
+    return false;
+}
+
+// One shot from the world's shot log: the muzzle flash at the end of the gun, plus a tracer gun ->
+// aim point for machine guns (the bullet itself lands within the tick). The gun's end: its barrel
+// tip (muzzlePoints; a unit with several guns fires them in turn, the devastator both), else - a
+// building's turret, a unit without art - pushed along the aim from where the bullet starts (the
+// firer + the template's ShootOffset, 2-5 px, inside the body): infantry 6 px, vehicles 2 x offset
+// + 4 px, turrets 12 px from their centre.
 void Effects::spawnShot(const game::World& w, const game::ShotEvent& e, WeaponClass c) {
     if (c == WeaponClass::None || c == WeaponClass::Bomb || c == WeaponClass::Debris || c == WeaponClass::Spice) return;
     const auto& side = w.sides()[std::size_t(e.side)];
     float x = float(e.srcX), y = float(e.srcY);
-    const float dx = float(e.dstX) - x, dy = float(e.dstY) - y, dist = std::hypot(dx, dy);
-    const float ux = dist > 0 ? dx / dist : 0, uy = dist > 0 ? dy / dist : 1;
     float extra = 0, z = 6;
     if (e.firer >= 0 && e.firer < int(side.links.size())) {
         const auto kind = side.links[std::size_t(e.firer)].kind;
+        if (kind == game::SlotKind::Unit && muzzlePoints(w, e.side, e.firer, muzzleTmp_)) {
+            auto& ls = lastShot_[std::size_t(e.side)];
+            if (ls.size() != side.units.size()) ls.assign(side.units.size(), LastShot{});
+            LastShot& last = ls[std::size_t(e.firer)];
+            const std::size_t n = muzzleTmp_.size();
+            const bool twin = c == WeaponClass::Plasma && n >= 2;
+            const EffectAnchor m = muzzleTmp_[twin ? 0 : last.count % n];
+            ++last.count;
+            last.tick = e.tick + std::uint32_t(std::max(0, e.delay));
+            last.valid = true;
+            last.at = m;
+            for (std::size_t k = 0; k < (twin ? 2u : 1u); ++k) {
+                const EffectAnchor& a = twin ? muzzleTmp_[k] : m;
+                const float dx = float(e.dstX) - a.x, dy = float(e.dstY) - a.y;
+                if (c == WeaponClass::Plasma && !twin) {  // one measured tip: the twin flashes around it (MUZ_DEVAS)
+                    const float l = std::max(1.0f, std::hypot(dx, dy)), px = -dy / l, py = dx / l;
+                    for (int q = -1; q <= 1; q += 2)
+                        spawnMuzzle(c, a.x + px * kPlasmaTwinHalf * float(q), a.y + py * kPlasmaTwinHalf * float(q), a.z, dx, dy, 0,
+                                    side.house);
+                } else {
+                    spawnMuzzle(c, a.x, a.y, a.z, dx, dy, 0, side.house);
+                }
+            }
+            if (twin) {  // the bolt's drawn start: between the two cannons
+                last.at.x = (muzzleTmp_[0].x + muzzleTmp_[1].x) * 0.5f;
+                last.at.y = (muzzleTmp_[0].y + muzzleTmp_[1].y) * 0.5f;
+                last.at.z = (muzzleTmp_[0].z + muzzleTmp_[1].z) * 0.5f;
+            }
+            if (c == WeaponClass::Gun) spawnTracer(m.x, m.y, m.z, float(e.dstX), float(e.dstY), 0);
+            return;
+        }
         if (kind == game::SlotKind::Unit) {
             const auto& u = side.units[std::size_t(e.firer)];
             if (u.type >= 0 && u.type < formats::kMaxUnitTypes) {
@@ -783,6 +848,8 @@ void Effects::spawnShot(const game::World& w, const game::ShotEvent& e, WeaponCl
             z = 10;
         }
     }
+    const float dx = float(e.dstX) - x, dy = float(e.dstY) - y, dist = std::hypot(dx, dy);
+    const float ux = dist > 0 ? dx / dist : 0, uy = dist > 0 ? dy / dist : 1;
     extra = std::min(extra, dist * 0.5f);
     x += ux * extra;
     y += uy * extra;

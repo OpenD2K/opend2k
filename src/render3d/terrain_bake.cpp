@@ -1,5 +1,7 @@
 #include "render3d/terrain_bake.hpp"
 
+#include "render/frame_probe.hpp"
+
 #include "game/world.hpp"
 #include "render/tileset.hpp"
 #include "render3d/gpu.hpp"
@@ -67,6 +69,7 @@ TerrainBaker::~TerrainBaker() {
         SDL_Log("Terrain: Designed (2D) detail tiles: %llu baked, %llu evicted, peak %.1f MB resident (budget %zu MB)",
                 (unsigned long long)tilesBaked_, (unsigned long long)tilesEvicted_, double(peakDetailBytes_) / (1024.0 * 1024.0),
                 detailBudget_ >> 20);
+    if (bakeFence_) SDL_ReleaseGPUFence(dev_, bakeFence_);
     releaseTiles();
     releaseChunks();
     for (SDL_GPUTexture* t : {msaa_, depth_, shadow_, clearMask_})
@@ -90,6 +93,8 @@ bool TerrainBaker::init() {
     detailTexelsPerFrame_ = kDetailTexelsPerFrame;
     if (const char* e = SDL_getenv("D2K_BAKE_DETAIL_FRAME"))
         detailTexelsPerFrame_ = std::uint64_t(std::clamp(std::atoll(e), 1LL << 16, 1LL << 26));
+    rampTexels_ = std::max<std::uint64_t>(detailTexelsPerFrame_ / 8, 1);
+    if (SDL_getenv("D2K_BAKE_NORAMP")) rampTexels_ = detailTexelsPerFrame_;  // (A/B measurements)
     const SDL_GPUTextureUsageFlags dsUse = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
     if (SDL_GPUTextureSupportsFormat(dev_, SDL_GPU_TEXTUREFORMAT_D32_FLOAT, SDL_GPU_TEXTURETYPE_2D, dsUse))
         depthFormat_ = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
@@ -409,12 +414,15 @@ bool TerrainBaker::update(const game::World& w, const render::TileAtlas* atlas) 
                         }
         }
     }
-    // Re-bake only the dirty part of each dirty chunk (a harvested cell: 3 x 3 cells), a few per
-    // frame so a big change (a spice bloom, a slab of concrete) spreads over some frames.
+    // Re-bake only the dirty part of each dirty chunk (a harvested cell: 3 x 3 cells), one region
+    // per frame (each one renders its own 2048^2 sun shadow map: two in a frame were a GPU spike
+    // that could miss a vsync), so a big change (a spice bloom, a slab of concrete) spreads over
+    // some frames. (A self-check bake test keeps several per frame.)
     std::vector<Job> todo;
     constexpr int kMaxCellsPerFrame = 160;
+    const std::size_t maxJobs = bakeTest_ ? chunks_.size() : 1;
     int cells = 0;
-    for (std::size_t i = 0; i < chunks_.size() && cells < kMaxCellsPerFrame; ++i) {
+    for (std::size_t i = 0; i < chunks_.size() && cells < kMaxCellsPerFrame && todo.size() < maxJobs; ++i) {
         Chunk& c = chunks_[i];
         if (!c.dirty()) continue;
         todo.push_back({&c, c.dx0, c.dy0, c.dx1, c.dy1});
@@ -445,6 +453,7 @@ bool TerrainBaker::update(const game::World& w, const render::TileAtlas* atlas) 
             SDL_SubmitGPUCommandBuffer(cmd);
         }
         rebakeMs_ = double(SDL_GetTicksNS() - tg) / 1e6 / reps;
+        if (render::FrameProbe::get().on) render::FrameProbe::get().add("chunkRebakeCells", Uint64(cells) * 1000000);
         rebakeCells_ = cells;
         if (timing_)
             SDL_Log("Terrain: Designed (2D) re-baked %d region(s), %d cells in %.2f ms (CPU recording %.2f ms)",
@@ -740,7 +749,23 @@ void TerrainBaker::updateDetail(const render::Camera& cam, int viewW, int viewH)
 
     const bool sync = syncDetail_;
     syncDetail_ = false;
-    const std::uint64_t budget = sync ? ~std::uint64_t(0) : detailTexelsPerFrame_;
+    // The GPU still busy with the last frame's bake (its fence not signalled): no new tiles this
+    // frame (they would queue up behind it and the frame would miss its refresh).
+    bool gpuBehind = false;
+    if (bakeFence_) {
+        if (SDL_QueryGPUFence(dev_, bakeFence_)) {
+            SDL_ReleaseGPUFence(dev_, bakeFence_);
+            bakeFence_ = nullptr;
+        } else {
+            gpuBehind = !sync;
+        }
+    }
+    // Ramp: after a pause (the camera at rest) the GPU runs at a low clock - the first bake of a
+    // zoom-in took 3-5x as long as the next ones (measured: 0.15 M texels 3.9 ms after 5 s at rest,
+    // 0.7 ms right after other work). Start at 1/8 of the budget and double every baking frame.
+    static const bool noRamp = SDL_getenv("D2K_BAKE_NORAMP") != nullptr;
+    if (!noRamp && frame_ - lastBakeFrame_ > kRampIdleFrames) rampTexels_ = std::max<std::uint64_t>(detailTexelsPerFrame_ / 8, 1);
+    const std::uint64_t budget = sync ? ~std::uint64_t(0) : gpuBehind ? 0 : std::min(rampTexels_, detailTexelsPerFrame_);
     std::uint64_t texels = 0;
     std::vector<Job> jobs;
     std::vector<Tile*> fresh;
@@ -768,11 +793,11 @@ void TerrainBaker::updateDetail(const render::Camera& cam, int viewW, int viewH)
             ++it;
         }
     };
-    collectDirty(budget);
+    if (budget > 0) collectDirty(budget);
     // 2. Missing tiles of the wanted level: the view from its centre out, then a ring of one tile
     //    around it (scrolling); not while the zoom is still changing level (a wheel / pinch).
     constexpr std::uint64_t kSettleFrames = 6;
-    if (want >= 0 && (sync || frame_ - wantSince_ >= kSettleFrames)) {
+    if (want >= 0 && budget > 0 && (sync || frame_ - wantSince_ >= kSettleFrames)) {
         struct Cand {
             int tx, ty;
             float d;
@@ -846,12 +871,16 @@ void TerrainBaker::updateDetail(const render::Camera& cam, int viewW, int viewH)
                     what, int(jobs.size()), double(texels) / 1e6, wantLevel_ >= 0 ? kDetailPpc[wantLevel_] : 0,
                     double(SDL_GetTicksNS() - t0) / 1e6, recordMs, tiles_.size(), double(detailBytes_) / (1024.0 * 1024.0));
         } else {
-            SDL_SubmitGPUCommandBuffer(cmd);
+            if (bakeFence_) SDL_ReleaseGPUFence(dev_, bakeFence_);
+            bakeFence_ = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
         }
+        lastBakeFrame_ = frame_;
+        rampTexels_ = std::min(rampTexels_ * 2, detailTexelsPerFrame_);
         for (Tile* t : fresh) t->baked = true;
         fresh.clear();
         jobs.clear();
     };
+    if (render::FrameProbe::get().on && !jobs.empty()) render::FrameProbe::get().add("detailMTexels", texels);  // (M texels as "ms")
     run(sync ? "first view" : "tiles");
     if (sync && bakeTest_) {  // self-check: partial re-bakes of the tiles must match their full bake
         for (int y = 2; y + 3 < mapH_; y += 7)

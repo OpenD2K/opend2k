@@ -3,13 +3,19 @@
 
 #include "render/map_renderer.hpp"
 
+#include "render/group_badge.hpp"
+#include "render/order_feedback.hpp"
+#include "render/frame_probe.hpp"
+
 #include "game/random.hpp"
 #include "render/bloom.hpp"
 #include "render/buildup_fx.hpp"
 #include "render/hdr.hpp"
 #include "render/effects.hpp"
 #include "render/lighting.hpp"
+#include "render/muzzle_tips.hpp"
 #include "render/scene_lights.hpp"
+#include "render/vehicle_motion.hpp"
 #include "render/soft_shroud.hpp"
 #include "render/weld_fx.hpp"
 
@@ -54,6 +60,8 @@ void MapRenderer::setModernEffects(bool on) {
     if (on) {
         effects_ = std::make_unique<Effects>(r_, templates_);
         effects_->setHouseColours(sprites_.colours());
+        if (!muzzleTips_) muzzleTips_ = std::make_unique<MuzzleTips>(sprites_, templates_);
+        effects_->setMuzzleTips(muzzleTips_.get());
     }
     else effects_.reset();
     lastClock_ = -1;
@@ -85,6 +93,7 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
     static const bool noWarp = std::getenv("D2K_NO_SHADOW_WARP") != nullptr;  // check: the drawn shadows as before
     if (noWarp) shadowWarp_.active = false;
     if (effects_) {
+        FrameProbe::Scope ps("fxUpdate");
         updateEffects(w, viewCam, viewW, viewH);
         cam.x += effects_->shakeX();
         cam.y += effects_->shakeY();
@@ -155,8 +164,15 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
         }
     }
     const bool haze = hazeTex_ && SDL_GetRenderTarget(r_) == hazeTex_;
-    drawTerrain(w, cam, viewW, viewH);
-    if (effects_) effects_->drawGround(cam);
+    {
+        FrameProbe::Scope ps("terrain");
+        drawTerrain(w, cam, viewW, viewH);
+    }
+    if (effects_) {
+        FrameProbe::Scope ps("fxGround");
+        effects_->drawGround(cam);
+    }
+    FrameProbe::Scope objScope("objects");
 
     // Display__DrawInfantryBehindObjects 0x42af00: infantry on a vehicle's cell (flag 0x1000000,
     // not NOT_DRAWN) is drawn before the building bases and the sorted list, i.e. under the
@@ -216,6 +232,7 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
                 list.push_back({game::fixToPixel(u.posY - u.posZ), order++, nullptr, &u});
         }
     }
+    FrameProbe::Scope sortedScope("sorted");
     std::sort(list.begin(), list.end(),
               [](const Entry& a, const Entry& b) { return a.key != b.key ? a.key < b.key : a.order > b.order; });
     for (const auto& e : list) {
@@ -230,6 +247,7 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
             }
         }
     }
+    FrameProbe::Scope aboveScope("above");
     // Layers above the sorted list (rendering.md §4): low explosions, flyers, high explosions, projectiles.
     drawExplosions(w, cam, false);
     drawFlyers(w, cam, 0);  // shadows, carried units and cargo, low flyers
@@ -273,6 +291,7 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
     }
     if (effects_) effects_->setGrade(graded ? lightingGrade : nullptr);
     // The buildings' emission layers (lit windows, lamps, cyan cores), over the graded picture.
+    FrameProbe::Scope glowScope("glowsLamps");
     for (const GlowDraw& g : glows_) {
         // up to x2 in two passes (colour mods stop at 255)
         const float k = std::min(2.0f, g.k);
@@ -290,8 +309,12 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
         sceneLights->setGrade(graded ? lightingGrade : kOne);
         sceneLights->draw2D(cam, viewW, viewH);
     }
-    if (effects_) effects_->drawAir(cam);
-    if (bloomOn) {  // back to the real target: the picture, then its bloom
+    if (effects_) {
+        FrameProbe::Scope ps("fxAir");
+        effects_->drawAir(cam);
+    }
+    if (bloomOn) {
+        FrameProbe::Scope ps("bloom");  // back to the real target: the picture, then its bloom
         SDL_SetRenderTarget(r_, bloomTarget);
         SDL_SetRenderViewport(r_, bloomVpSet ? &bloomVp : nullptr);
         SDL_SetRenderClipRect(r_, bloomClipOn ? &bloomClip : nullptr);
@@ -304,8 +327,13 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
             bloom->apply(sceneTex_, bloomVp.w, bloomVp.h, all, lighting->bloom, lighting->bloomThreshold);
         }
     }
-    if (!classicSelection) drawHealthBars(w, cam);
+    if (classicSelection) drawCursorPuffs(cam);  // Display__DrawBattlefield: after BlitBullets, before the shroud
+    if (!classicSelection) {
+        FrameProbe::Scope ps("hpBars");
+        drawHealthBars(w, cam);
+    }
     if (showShroud) {
+        FrameProbe::Scope ps("shroud");
         if (softShroud) {
             if (!soft_) soft_ = std::make_unique<SoftShroud>(r_, sprites_);
             soft_->draw(w, cam, viewW, viewH);
@@ -317,6 +345,56 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
     if (showMarkers)
         for (const auto& o : s.objects)
             if (o.kind != game::ObjectKind::Building && o.kind != game::ObjectKind::Unit) drawMarker(o, cam);
+}
+
+void MapRenderer::enableArtPrefetch() {
+    std::vector<int> starts;
+    for (const auto* v : {&templates_.unitArtFirstFrame, &templates_.buildingArtFirstFrame, &templates_.projectileArtFirstFrame,
+                          &templates_.animationArtFirstFrame, &templates_.buildupArtFirstFrame,
+                          &templates_.buildingAnimationFirstFrame})
+        for (int f : *v)
+            if (f >= 0) starts.push_back(f);
+    if (const char* e = std::getenv("D2K_SPRITE_ASYNC"); e && e[0] == '0') return;  // A/B: the old on-demand builds
+    sprites_.setPrefetchGroups(std::move(starts));
+}
+
+// The frames every unit / building shows now (and their neighbours), also off screen: ready before
+// they scroll into view or turn (SpriteCache::prefetch; cached frames cost a lookup).
+void MapRenderer::prefetchArt(const game::World& w, const float* view) {
+    constexpr int kRadius = 1;
+    auto inView = [&](std::int32_t fx, std::int32_t fy) {  // 16.16 world px, a 96 px margin
+        if (!view) return true;
+        const float x = float(fx >> 16), y = float(fy >> 16);
+        return x > view[0] - 96 && y > view[1] - 96 && x < view[2] + 96 && y < view[3] + 96;
+    };
+    for (const auto& side : w.sides()) {
+        const int house = side.house;
+        for (int i = side.firstUnit; i >= 0; i = side.nextObject(i)) {
+            const auto& unit = side.units[i];
+            if (!unit.alive || unit.type < 0 || unit.type >= formats::kMaxUnitTypes || !inView(unit.posX, unit.posY)) continue;
+            const auto& u = templates_.bin.units[unit.type];
+            if (u.unitArt >= 0 && u.unitArt < formats::kMaxUnitArt && std::size_t(u.unitArt) < templates_.unitArtFirstFrame.size()) {
+                // This facing's frame (and the next facings), and its other animation frames (infantry walking).
+                const int dirs = templates_.bin.unitArtDirectionFrames[u.unitArt];
+                const int base = templates_.unitArtFirstFrame[std::size_t(u.unitArt)] + u.directionFrames[unit.facing & 31];
+                const int anims = std::clamp(int(templates_.bin.unitArtAnimationFrames[u.unitArt]), 1, 8);
+                for (int k = 0; k < anims; ++k) sprites_.prefetch(base + k * dirs, house, k == unit.animFrame ? kRadius : 0);
+            }
+            if (u.barrelArt >= 0 && std::size_t(u.barrelArt) < templates_.unitArtFirstFrame.size())
+                sprites_.prefetch(templates_.unitArtFirstFrame[std::size_t(u.barrelArt)] + u.directionFrames[unit.facingTurret & 31],
+                                  house, kRadius);
+        }
+        for (int i = side.firstBuilding; i >= 0; i = side.nextObject(i)) {
+            const auto& b = side.buildings[i];
+            if (!b.alive || b.type < 0 || b.type >= formats::kMaxBuildingTypes || !inView(b.posX, b.posY)) continue;
+            const auto& t = templates_.bin.buildings[b.type];
+            if (t.buildingArt >= 0 && std::size_t(t.buildingArt) < templates_.buildingArtFirstFrame.size())
+                sprites_.prefetch(templates_.buildingArtFirstFrame[std::size_t(t.buildingArt)] + 1, house, kRadius);  // base, main, ...
+            if (t.barrelArt >= 0 && std::size_t(t.barrelArt) < templates_.buildingArtFirstFrame.size())
+                sprites_.prefetch(templates_.buildingArtFirstFrame[std::size_t(t.barrelArt)] + 1 + t.directionFrames[b.facing & 31], house,
+                                  kRadius);
+        }
+    }
 }
 
 MapRenderer::~MapRenderer() {
@@ -409,6 +487,19 @@ void MapRenderer::drawExplosions(const game::World& w, const Camera& cam, bool h
             blit(*sp, float(game::fixToPixel(e.posX) - sp->frame->x),
                  float(game::fixToPixel(e.posY - e.posZ) - sp->frame->y), cam, mode);
         }
+}
+
+// Display__DrawCursorPuffs 0x428220: each running entry of the queue 0x516490 as EX_PUFF frame
+// `frame`, subtractive (Image__BlitTImageSubtractive, like explosion flag 2), at the click point
+// minus the frame offset. The queue advances in OrderFeedback::update (per 1/60 s).
+void MapRenderer::drawCursorPuffs(const Camera& cam) {
+    if (!orderFeedback || orderFeedback->puffFirstFrame() < 0) return;
+    for (const auto& p : orderFeedback->puffs()) {
+        if (p.frame >= orderFeedback->puffFrames()) continue;
+        const Sprite* sp = sprites_.getIntensity(orderFeedback->puffFirstFrame() + p.frame);
+        if (!sp) continue;
+        blit(*sp, float(p.x - sp->frame->x), float(p.y - sp->frame->y), cam, Blend::Subtract);
+    }
 }
 
 // BlitBullets 0x428070.
@@ -736,10 +827,51 @@ void MapRenderer::blitUnit(const Sprite& sp, float anchorX, float anchorY, const
 
 void MapRenderer::blitScreen(const Sprite& sp, float sx, float sy, float zoom, Blend mode, float degrees,
                              SDL_FPoint centre) {
-    const SDL_FRect dst{sx, sy, std::round(sp.drawW * zoom), std::round(sp.drawH * zoom)};
+    SDL_FRect dst{sx, sy, std::round(sp.drawW * zoom), std::round(sp.drawH * zoom)};
     const Sprite::Level& lv = sp.levels.empty() ? Sprite::Level{sp.texture, sp.shadow, 1} : sp.level(zoom);
     SDL_Texture* tex = lv.texture;
+    // Vehicle animation (warp_): the sprite as a quad moved per corner (smooth sub-pixel motion with
+    // the linearly filtered Enhanced art); pixel art sampled nearest keeps whole-pixel offsets only.
+    bool warpQuad = false;
+    SDL_FRect bodyDst = dst;
+    if (warp_.on && tex) {
+        SDL_ScaleMode sm = SDL_SCALEMODE_LINEAR;
+        SDL_GetTextureScaleMode(tex, &sm);
+        warpQuad = sm != SDL_SCALEMODE_NEAREST;
+        if (!warpQuad) {
+            bodyDst.x += std::round(warp_.tx);
+            bodyDst.y += std::round(warp_.ty + warp_.c);
+        }
+    }
+    auto drawQuad = [&](SDL_Texture* t) {
+        const float cx = dst.x + centre.x, cy = dst.y + centre.y, rad = degrees * 3.14159265f / 180.0f;
+        const float c = std::cos(rad), sn = std::sin(rad);
+        float cr = 1, cg = 1, cb = 1, ca = 1;
+        SDL_GetTextureColorModFloat(t, &cr, &cg, &cb);
+        SDL_GetTextureAlphaModFloat(t, &ca);
+        const float px[4] = {dst.x, dst.x + dst.w, dst.x + dst.w, dst.x}, py[4] = {dst.y, dst.y, dst.y + dst.h, dst.y + dst.h};
+        const float u[4] = {0, 1, 1, 0}, v[4] = {0, 0, 1, 1};
+        SDL_Vertex vx[4];
+        for (int k = 0; k < 4; ++k) {
+            const float rx = px[k] - cx, ry = py[k] - cy;
+            const float X = cx + rx * c - ry * sn, Y = cy + rx * sn + ry * c;
+            vx[k].position = {X + warp_.tx, Y + warp_.ty + warp_.a * (X - warp_.ax) + warp_.b * (Y - warp_.ay) + warp_.c};
+            vx[k].color = {cr, cg, cb, ca};
+            vx[k].tex_coord = {u[k], v[k]};
+        }
+        static const int idx[6] = {0, 1, 2, 0, 2, 3};
+        SDL_RenderGeometry(r_, t, vx, 4, idx, 6);
+    };
     auto draw = [&](SDL_Texture* t) {
+        if (warp_.on && t == tex) {
+            if (warpQuad) {
+                drawQuad(t);
+                return;
+            }
+            if (degrees != 0) SDL_RenderTextureRotated(r_, t, nullptr, &bodyDst, degrees, &centre, SDL_FLIP_NONE);
+            else SDL_RenderTexture(r_, t, nullptr, &bodyDst);
+            return;
+        }
         if (degrees != 0) SDL_RenderTextureRotated(r_, t, nullptr, &dst, degrees, &centre, SDL_FLIP_NONE);
         else SDL_RenderTexture(r_, t, nullptr, &dst);
     };
@@ -752,9 +884,9 @@ void MapRenderer::blitScreen(const Sprite& sp, float sx, float sy, float zoom, B
         }
         draw(tex);
         if (lv.glow && glowK_ > 0.01f && degrees == 0) glows_.push_back({lv.glow, dst.x, dst.y, dst.w, dst.h, glowK_});
-        if (mode == Blend::Flash) {  // grey hit flash (0x4326b0): brighten towards grey
+        if (mode == Blend::Flash) {  // Enhanced attack-order flash (Original draws the grey 0x4326b0 frames instead): brighten
             SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_ADD);
-            SDL_SetTextureColorMod(tex, 110, 110, 110);
+            SDL_SetTextureColorMod(tex, 220, 220, 220);
             draw(tex);
             SDL_SetTextureColorMod(tex, 255, 255, 255);
             SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
@@ -830,7 +962,8 @@ void MapRenderer::drawShadowWarped(SDL_Texture* t, float x, float y, float w, fl
         SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD);
     const SpriteShadowWarp& sw = shadowWarp_;
     const ShadowPivot& pv = shadowPivot_;
-    const float a = sw.strength, k = rendered3d ? sw.kPack : sw.k;
+    const float a = sw.strength * packShadowK_, k = rendered3d ? sw.kPack : sw.k;
+    if (a < 0.004f) return;
     const SDL_FColor col{a, a, a, a};
     const float rad = degrees * 3.14159265f / 180.0f, cs = std::cos(rad), sn = std::sin(rad);
     const float px = x + cx, py = y + cy;
@@ -866,6 +999,65 @@ void MapRenderer::drawShadowWarped(SDL_Texture* t, float x, float y, float w, fl
     SDL_BlendMode old = SDL_BLENDMODE_MOD;
     SDL_GetTextureBlendMode(t, &old);
     SDL_SetTextureBlendMode(t, kFade);
+    SDL_RenderGeometry(r_, t, shadowV_.data(), int(shadowV_.size()), shadowI_.data(), int(shadowI_.size()));
+    SDL_SetTextureBlendMode(t, old);
+}
+
+// A unit's silhouette cast on the ground (3D-rendered pack frames away from Day). The pack's .shadow.png
+// holds only the rim of the 58-degree sun's shadow that sticks out from under the model; turned and
+// stretched it became a thin dark streak beside the unit (owner 2026-11-14). Instead the layer's alpha
+// is taken as the unit seen 45 degrees from above - its ground footprint swept up by its height: the rows
+// above the ground line yB are squeezed towards it by rho (the footprint: the height taken out), then the
+// footprint is stretched along the sun's shadow direction by the cast length v (height x cot(el)): a
+// point at the footprint's sun side stays, the far side moves by v - the sweep of the footprint along
+// v, i.e. the shadow of a box of that height. Body and turret use the body's frame (one ground). It
+// darkens dst like the pack's shadow core (x 0.5) times the warp's strength and the silhouette's
+// share: dst * (1 - alpha * a); the body is drawn over it afterwards. No vehicle-motion warp.
+void MapRenderer::drawSilhouetteShadow(const Sprite& sp, float anchorX, float anchorY, const Camera& cam, float degrees) {
+    const SpriteShadowWarp& sw = shadowWarp_;
+    const float a = 0.5f * sw.strength * sw.silhouette;
+    if (a < 0.004f) return;
+    const float z = cam.zoom;
+    const float ox = std::round(float(sp.frame->x) * z), oy = std::round(float(sp.frame->y) * z);
+    const float x = std::round(anchorX * z - std::round(cam.x * z)) - ox;
+    const float y = std::round(anchorY * z - std::round(cam.y * z)) - oy;
+    const float w = std::round(sp.drawW * z), h = std::round(sp.drawH * z);
+    const Sprite::Level& lv = sp.levels.empty() ? Sprite::Level{sp.texture, sp.shadow, 1} : sp.level(z);
+    SDL_Texture* t = lv.texture;
+    if (!t || w <= 0 || h <= 0) return;
+    static const SDL_BlendMode kDarken = SDL_ComposeCustomBlendMode(
+        SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD, SDL_BLENDFACTOR_ZERO,
+        SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD);
+    const float rad = degrees * 3.14159265f / 180.0f, cs = std::cos(rad), sn = std::sin(rad);
+    const float px = x + ox, py = y + oy;  // rotated about the anchor (blitUnit)
+    const SDL_FColor col{0, 0, 0, a};
+    constexpr int N = 8;
+    shadowV_.clear();
+    shadowI_.clear();
+    for (int j = 0; j <= N; ++j) {
+        const float v = float(j) / N;
+        for (int i = 0; i <= N; ++i) {
+            const float u = float(i) / N;
+            float qx = x + u * w, qy = y + v * h;
+            if (degrees != 0) {
+                const float rx = qx - px, ry = qy - py;
+                qx = px + rx * cs - ry * sn;
+                qy = py + rx * sn + ry * cs;
+            }
+            const SilhouetteShadow& ss = silhouette_;
+            if (qy < ss.yB) qy = ss.yB - (ss.yB - qy) * ss.rho;
+            const float lam = std::clamp((qx * ss.ux + qy * ss.uy - ss.mn) / std::max(1e-3f, ss.mx - ss.mn), 0.0f, 1.0f);
+            shadowV_.push_back({{qx + lam * ss.vx, qy + lam * ss.vy}, col, {u, v}});
+        }
+    }
+    for (int j = 0; j < N; ++j)
+        for (int i = 0; i < N; ++i) {
+            const int b = j * (N + 1) + i;
+            shadowI_.insert(shadowI_.end(), {b, b + 1, b + N + 2, b, b + N + 2, b + N + 1});
+        }
+    SDL_BlendMode old = SDL_BLENDMODE_BLEND;
+    SDL_GetTextureBlendMode(t, &old);
+    SDL_SetTextureBlendMode(t, kDarken);
     SDL_RenderGeometry(r_, t, shadowV_.data(), int(shadowV_.size()), shadowI_.data(), int(shadowI_.size()));
     SDL_SetTextureBlendMode(t, old);
 }
@@ -1195,7 +1387,8 @@ void MapRenderer::drawBuildupRubble(const game::Building& bld, float x0, float x
 // never with the original sprites, which have no .glow.png) x render::buildingGlow (power, damage, pulse).
 float MapRenderer::buildingGlowK(const game::World& w, const game::Building& b) const {
     if (!lighting || lighting->identity || lighting->lamps <= 0.001f || classicSelection) return 0;
-    return buildingGlow(w, templates_, b.side, b.index, lighting->lamps, std::max(0.0, effectClock_) / 20.0);
+    return buildingGlow(w, templates_, b.side, b.index, lighting->lamps, std::max(0.0, effectClock_) / 20.0, false,
+                        packAnchors ? packAnchors->buildingGlowBlink(b.type) : 0);
 }
 
 const Sprite* MapRenderer::drawBuilding(const game::World& w, const game::Building& bld, const Camera& cam) {
@@ -1242,15 +1435,20 @@ const Sprite* MapRenderer::drawBuilding(const game::World& w, const game::Buildi
     const bool hasBarrel = b.barrelArt >= 0 && b.barrelArt < formats::kMaxBuildingArt;
     const int anchorX = bld.tileX * 32, anchorY = bld.tileY * 32 + b.artHeight;
     const int shiftX = hasBarrel ? b.exitPoint1X : 0, shiftY = hasBarrel ? b.exitPoint1Y : 0;
-    const Blend flash = (bld.flicker & 2) ? Blend::Flash : Blend::Normal;
+    // Attack-order flicker (Building+0x38 & 2, BlitVehicles 0x428e30): Original = the exact grey
+    // blit Image__BlitTImage_4326B0 (every channel (r + g + b) / 6 + 3, 5-bit) for the main, barrel
+    // and overlay frames (it wins over the additive overlay); Enhanced = a brightening flash.
+    const bool greyFlash = classicSelection && (bld.flicker & 2);
+    const Blend flash = (bld.flicker & 2) && !greyFlash ? Blend::Flash : Blend::Normal;
     float fcx, fcy, fhw, fhh;
     buildingFootprint(b, bld, fcx, fcy, fhw, fhh);
     const ShadowPivotScope pivot(shadowPivot_, cam, fcx, fcy, fhw, fhh);
 
-    const Sprite* mainSp = sprites_.get(mainFrame, house);
+    const Sprite* mainSp = sprites_.get(mainFrame, house, greyFlash);
     const Sprite* barrelSp = nullptr;
     if (hasBarrel)
-        barrelSp = sprites_.get(templates_.buildingArtFirstFrame[b.barrelArt] + 1 + b.directionFrames[bld.facing & 31], house);
+        barrelSp = sprites_.get(templates_.buildingArtFirstFrame[b.barrelArt] + 1 + b.directionFrames[bld.facing & 31], house,
+                                greyFlash);
     const Sprite* animSp = nullptr;
     bool animAdditive = false;
 
@@ -1264,7 +1462,7 @@ const Sprite* MapRenderer::drawBuilding(const game::World& w, const game::Buildi
         // Build-up / selling: buildupImg[template.buildupArt][counter/3] (rendering.md §3 pass B).
         const int k = bld.buildupCounter / 3;
         const Sprite* bsp = b.buildupArt < formats::kMaxBuildingTypes
-                                ? sprites_.get(templates_.buildupArtFirstFrame[b.buildupArt] + k, house)
+                                ? sprites_.get(templates_.buildupArtFirstFrame[b.buildupArt] + k, house, greyFlash)
                                 : nullptr;
         if (!mainSp || k < b.buildupFramesToShow) {
             mainSp = bsp;
@@ -1280,8 +1478,8 @@ const Sprite* MapRenderer::drawBuilding(const game::World& w, const game::Buildi
         if (a >= 0 && a < formats::kMaxBuildingTypes) {
             const int k = bld.animCounter / std::max(1, int(templates_.bin.buildings[a].animationSpeed));
             if (k < templates_.bin.buildingAnimationFrames[a])
-                animSp = sprites_.get(templates_.buildingAnimationFirstFrame[a] + k, house);
-            animAdditive = (b.flags & kAnimAlpha) != 0;
+                animSp = sprites_.get(templates_.buildingAnimationFirstFrame[a] + k, house, greyFlash);
+            animAdditive = (b.flags & kAnimAlpha) != 0 && !greyFlash;
         }
     }
 
@@ -1315,13 +1513,22 @@ const Sprite* MapRenderer::drawBuilding(const game::World& w, const game::Buildi
     if (barrelSp) blit(*barrelSp, float(anchorX + shiftX - barrelSp->frame->x), float(anchorY + shiftY - barrelSp->frame->y), cam, flash);
     // A redesigned building with fx_weld anchors (rendered pack): weld flashes in its new works
     // instead of the original overlay, which was painted for the original art.
-    if (animSp && !(bld.flags & kBuildupOrSelling) && packAnchors && drawWeldFlashes(w, bld, cam)) animSp = nullptr;
+    // (models.ini overlay = keep: the pack's own overlay frames stay, the flashes are drawn over them.)
+    const bool weld = animSp && !(bld.flags & kBuildupOrSelling) && packAnchors &&
+                      packAnchors->buildingAnchors(w, bld.side, bld.index, "fx_weld", weldTmp_) && !weldTmp_.empty();
+    if (weld && !packAnchors->buildingOverlayKeep(bld.type)) animSp = nullptr;
+    // models.ini `overlay = off`: the original overlay does not fit the redesigned art (and the pack
+    // has no frames of its own for it); `glow = blink` lets the frame's glow layer blink instead.
+    if (animSp && !(bld.flags & kBuildupOrSelling) && packAnchors && packAnchors->buildingOverlayOff(bld.type)) animSp = nullptr;
     if (animSp) {
         glowK_ = buildingGlowK(w, bld);  // overlay frames with a glow layer (the star port's landing lights)
         blit(*animSp, float(anchorX - animSp->frame->x), float(anchorY - animSp->frame->y), cam,
              animAdditive ? Blend::Additive : flash);
         glowK_ = 0;
     }
+    if (weld) drawWeldFlashes(w, bld, cam);
+    // Working lamps / launch flame of a redesigned building (fx_work*, fx_launch*: render/weld_fx.hpp).
+    if (packAnchors && !(bld.flags & kBuildupOrSelling)) drawWorkLamps(w, bld, cam);
     // Repairing (flag 1): wrench icon DAT_006dc468 centred on the main image (or the base
     // image), blinking with (MyIndex + gGameTicks) & 0x20 (BlitVehicles, before the box).
     if ((bld.flags & 0x1) && ((static_cast<std::uint32_t>(bld.index) + w.gameTicks()) & 0x20)) {
@@ -1361,6 +1568,49 @@ bool MapRenderer::drawWeldFlashes(const game::World& w, const game::Building& b,
         glow(9, kWeldCore, fl.a);
     }
     return true;
+}
+
+// Working lamps (fx_work*): an amber glow + hot core on the chase's lit lamp; launch flame (fx_launch*): an
+// orange flame flaring over the original's launch overlay frames (render/weld_fx.hpp).
+void MapRenderer::drawWorkLamps(const game::World& w, const game::Building& b, const Camera& cam) {
+    static const bool all = std::getenv("D2K_WORK_ALL") != nullptr;  // check: every lamp lit, steady
+    auto draw = [&](const EffectAnchor& an, float sizePx, const float* c, float a) {
+        const float z = cam.zoom;
+        const float sx = (an.x - cam.x) * z, sy = (an.y - an.z - cam.y) * z;
+        const float s = sizePx * an.size * z;
+        const SDL_FRect dst{sx - s * 0.5f, sy - s * 0.5f, s, s};
+        SDL_SetTextureColorModFloat(weldTex_, c[0], c[1], c[2]);
+        SDL_SetTextureAlphaModFloat(weldTex_, std::min(1.0f, a));
+        SDL_RenderTexture(r_, weldTex_, nullptr, &dst);
+    };
+    static const float kWhiteHot[3] = {1.0f, 0.93f, 0.75f};
+    if (packAnchors->buildingAnchors(w, b.side, b.index, "fx_work", weldTmp_) && !weldTmp_.empty()) {
+        float a[kMaxWorkLamps];
+        bool on = workLamps(w, b, templates_, int(weldTmp_.size()), a);
+        if (all) std::fill(a, a + kMaxWorkLamps, 1.0f), on = true;
+        if (on && !weldTex_) weldTex_ = makeWeldGlowTexture(r_);
+        if (on && weldTex_)
+            for (std::size_t q = 0; q < weldTmp_.size() && q < std::size_t(kMaxWorkLamps); ++q)
+                if (a[q] > 0.01f) {
+                    draw(weldTmp_[q], 18, kWorkLamp, a[q]);
+                    draw(weldTmp_[q], 7, kWhiteHot, a[q]);
+                }
+    }
+    if (packAnchors->buildingAnchors(w, b.side, b.index, "fx_launch", weldTmp_) && !weldTmp_.empty()) {
+        float a = 0, s = 1;
+        bool on = launchFlame(w, b, templates_, a, s);
+        if (all) a = 1, s = 1, on = true;
+        if (on && !weldTex_) weldTex_ = makeWeldGlowTexture(r_);
+        if (on && weldTex_)
+            for (const EffectAnchor& an : weldTmp_) {
+                draw(an, 64 * s, kLaunchHalo, 0.8f * a);
+                draw(an, 22 * s, kLaunchCore, a);
+            }
+    }
+    if (weldTex_) {
+        SDL_SetTextureColorModFloat(weldTex_, 1, 1, 1);
+        SDL_SetTextureAlphaModFloat(weldTex_, 1);
+    }
 }
 
 // The art is cut into vertical pieces; each shows the top (1 - sink) of its strip, moved down by
@@ -1423,6 +1673,9 @@ void MapRenderer::drawUnit(const game::World& w, const game::Unit& unit, const C
         dir32 = int(r) & 31;
         degrees = (f - r) * 11.25f;
     };
+    // Attack-order flicker (Unit+0x1d & 2): Original = the exact grey blit 0x4326b0 (checked before
+    // the cloak shimmer); Enhanced = a brightening flash.
+    const bool greyFlash = classicSelection && (unit.flicker & 2);
     Blend flash = (unit.flicker & 2) ? Blend::Flash : Blend::Normal;
     // Cloaked (0x4) or fading (stealth timer): own units shimmer, enemies are not drawn.
     if (unit.flags & 0x4) {
@@ -1431,10 +1684,43 @@ void MapRenderer::drawUnit(const game::World& w, const game::Unit& unit, const C
     } else if (unit.stealthTimer != 0) {
         flash = Blend::Half;
     }
+    if (greyFlash) flash = Blend::Normal;
 
     // The shadows' ground contact: the unit position; the body's half size (infantry / vehicles).
     const float bodyHalf = u.isInfantry ? 2.5f : 7.0f;
     const ShadowPivotScope pivot(shadowPivot_, cam, ax, ay, bodyHalf, bodyHalf);
+    // Vehicle animation: Modern (render/vehicle_motion.hpp): the hull's pitch / roll / lift as a
+    // vertical displacement linear over the sprite (a sprite pixel d screen px from the anchor is
+    // taken as the ground point (d.x, d.y / sin 45); its height change pitch * (g . forward) -
+    // roll * (g . right) + lift is drawn cos 45 higher), the recoil as a shift against the shot.
+    const VehicleMotion::Pose* pose =
+        vehicleMotion && !classicSelection ? vehicleMotion->pose(unit.side, unit.index) : nullptr;
+    struct WarpOff {
+        BodyWarp& w;
+        ~WarpOff() { w.on = false; }
+    } warpOff{warp_};
+    float turretKickX = 0, turretKickY = 0;
+    if (pose) {
+        constexpr float kS45 = 0.70710678f;
+        const float zoom = cam.zoom, a = bodyFacing * (3.14159265f / 16);
+        const float fx = std::sin(a), fy = -std::cos(a), rx = std::cos(a), ry = std::sin(a);
+        warp_.on = true;
+        warp_.ax = std::round(ax * zoom - std::round(cam.x * zoom));
+        warp_.ay = std::round(ay * zoom - std::round(cam.y * zoom));
+        warp_.a = -kS45 * (pose->pitch * fx - pose->roll * rx);
+        warp_.b = -(pose->pitch * fy - pose->roll * ry);
+        // The engine's shimmer only when zoomed in: below a screen pixel it would only flicker edges.
+        const float tremble = pose->tremble * std::clamp(zoom - 1.0f, 0.0f, 1.0f);
+        warp_.c = -(pose->lift + tremble) * kS45 * zoom;
+        warp_.tx = -pose->shotX * pose->recoil * zoom;
+        warp_.ty = -pose->shotY * pose->recoil * kS45 * zoom;
+        turretKickX = -pose->shotX * pose->turretRecoil * zoom;
+        turretKickY = -pose->shotY * pose->turretRecoil * kS45 * zoom;
+    }
+    // The body and turret / barrel frames.
+    const Sprite* bodySp = nullptr;
+    const Sprite* turretSp = nullptr;
+    float bodyRot = 0, turretRot = 0;
     if (u.unitArt >= 0 && u.unitArt < formats::kMaxUnitArt) {
         const int dirs = templates_.bin.unitArtDirectionFrames[u.unitArt];
         int f32 = unit.facing & 31;
@@ -1452,8 +1738,8 @@ void MapRenderer::drawUnit(const game::World& w, const game::Unit& unit, const C
             if (a < formats::kMaxExplosions) frame = templates_.animationArtFirstFrame[a] + unit.animFrame;
             rot = 0;
         }
-        if (const Sprite* sp = sprites_.get(frame, house))
-            blitUnit(*sp, ax, ay, cam, flash, rot);
+        bodySp = sprites_.get(frame, house, greyFlash);
+        bodyRot = rot;
     }
     if (u.barrelArt >= 0 && u.barrelArt < formats::kMaxUnitArt) {
         int f32 = unit.facingTurret & 31;
@@ -1461,8 +1747,47 @@ void MapRenderer::drawUnit(const game::World& w, const game::Unit& unit, const C
         if (vis) frameAndResidual(turretFacing, f32, rot);
         if (templates_.bin.unitArtDirectionFrames[u.barrelArt] != 32) rot = 0;
         const int frame = templates_.unitArtFirstFrame[u.barrelArt] + u.directionFrames[f32];
-        if (const Sprite* sp = sprites_.get(frame, house))
-            blitUnit(*sp, ax, ay, cam, flash, rot);
+        turretSp = sprites_.get(frame, house, greyFlash);
+        turretRot = rot;
+    }
+    // Away from Day, a unit drawn from 3D-rendered frames casts its silhouette (body and turret on one
+    // ground line, both before the body so the turret's shadow never darkens the hull); the pack's own
+    // shadow layers fade out meanwhile.
+    struct PackShadowK {
+        float& k;
+        ~PackShadowK() { k = 1; }
+    } packK{packShadowK_};
+    if (shadowWarp_.active && shadowWarp_.silhouette > 0 && bodySp && bodySp->rendered3d &&
+        (flash == Blend::Normal || flash == Blend::Flash)) {
+        const float z = cam.zoom;
+        // The body frame on screen (as blitUnit places it); beta = the share of its rise that is height.
+        const float bx = std::round(ax * z - std::round(cam.x * z)) - std::round(float(bodySp->frame->x) * z);
+        const float by = std::round(ay * z - std::round(cam.y * z)) - std::round(float(bodySp->frame->y) * z);
+        SilhouetteShadow& ss = silhouette_;
+        const float beta = u.isInfantry ? 0.8f : 0.42f;
+        ss.yB = by + bodySp->opaqueBottom * z;
+        const float rise = std::max(1.0f, (bodySp->opaqueBottom - bodySp->opaqueTop) * z);
+        ss.rho = 1 - beta;
+        constexpr float kCot58 = 0.6249f;  // the pack renderer's sun
+        const float len = beta * rise * kCot58 * shadowWarp_.kPack;
+        ss.ux = shadowWarp_.dx;
+        ss.uy = shadowWarp_.dy;
+        ss.vx = len * ss.ux;
+        ss.vy = len * ss.uy;
+        // The footprint's box: the opaque columns x the squeezed rows; its extent along the cast.
+        const float x0 = bx + bodySp->opaqueLeft * z, x1 = bx + bodySp->opaqueRight * z;
+        const float y0 = ss.yB - rise * ss.rho, y1 = ss.yB;
+        ss.mn = std::min({x0 * ss.ux + y0 * ss.uy, x1 * ss.ux + y0 * ss.uy, x0 * ss.ux + y1 * ss.uy, x1 * ss.ux + y1 * ss.uy});
+        ss.mx = std::max({x0 * ss.ux + y0 * ss.uy, x1 * ss.ux + y0 * ss.uy, x0 * ss.ux + y1 * ss.uy, x1 * ss.ux + y1 * ss.uy});
+        drawSilhouetteShadow(*bodySp, ax, ay, cam, bodyRot);
+        if (turretSp && turretSp->rendered3d) drawSilhouetteShadow(*turretSp, ax, ay, cam, turretRot);
+        packShadowK_ = 1 - shadowWarp_.silhouette;
+    }
+    if (bodySp) blitUnit(*bodySp, ax, ay, cam, flash, bodyRot);
+    if (turretSp) {
+        warp_.tx += turretKickX;  // the turret / barrel recoils further than the hull
+        warp_.ty += turretKickY;
+        blitUnit(*turretSp, ax, ay, cam, flash, turretRot);
     }
 }
 
@@ -1583,6 +1908,19 @@ void MapRenderer::drawHealthBars(const game::World& w, const Camera& cam) {
                 drawPipRow(left, top + barH + std::round(2 * z), width, std::round(3 * z), filled, n - 1, z);
             }
         }
+        // Own units' control-group badges, left of the health bar (drawSelection's bar for selected
+        // units: no altitude; the Always bar below: posY - posZ).
+        if (groupNumbers > 0 && groupFont && &side == &w.sides()[playerSide])
+            for (int i = side.firstUnit; i >= 0; i = side.nextObject(i)) {
+                const auto& u = side.units[i];
+                if (!u.alive || u.groupId < 1 || u.groupId > 10 || (u.flags & 0x1200100) || u.state == game::UnitState::Dead) continue;
+                if (!u.selected && groupNumbers != 2) continue;
+                const auto& t = templates_.bin.units[u.type];
+                const float cx = std::round(unitPx(u.posX) * zoom - ox);
+                const float cy = std::round(unitPx(u.selected ? u.posY : u.posY - u.posZ) * zoom - oy);
+                const float h = std::round((t.isInfantry ? 9.0f : 14.0f) * zoom);
+                drawGroupBadge(r_, groupFont, u.groupId, cx - h - std::round(2 * z), cy - h - std::round(5 * z) + std::round(1.5f * z), z);
+            }
         if (healthBars != 2) continue;
         for (int i = side.firstUnit; i >= 0; i = side.nextObject(i)) {
             const auto& u = side.units[i];
