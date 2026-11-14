@@ -2161,6 +2161,55 @@ void Session::renderPhoneUi(game::World& world) {
         sidebar_->drawTooltip(mouseX_, mouseY_, world, side, float(outW_), float(outH_));
 }
 
+// D2K_CAMERA_MOVE (recordings, debug): a scripted camera move over the first seconds of the game,
+// e.g. "secs=8,yaw=-30:30,tilt=40:55,zoom=2:2.6,at=10:9:14:12" - each key optional, from:to eased
+// (smoothstep); at = view centre in cells (x0:y0:x1:y1); zoom is ignored by Graphics: Original.
+void Session::applyCameraMove(double dt) {
+    static const struct Move {
+        bool on = false;
+        double secs = 10;
+        bool yaw = false, tilt = false, zoom = false, at = false;
+        float yaw0 = 0, yaw1 = 0, tilt0 = 0, tilt1 = 0, zoom0 = 1, zoom1 = 1, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    } mv = [] {
+        Move m;
+        const char* e = std::getenv("D2K_CAMERA_MOVE");
+        if (!e) return m;
+        m.on = true;
+        std::string s = e;
+        std::size_t p = 0;
+        while (p < s.size()) {
+            std::size_t q = s.find(',', p);
+            if (q == std::string::npos) q = s.size();
+            const std::string kv = s.substr(p, q - p);
+            p = q + 1;
+            const std::size_t eq = kv.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+            float a = 0, b = 0, c = 0, d = 0;
+            if (k == "secs") m.secs = std::max(0.01, std::atof(v.c_str()));
+            else if (k == "yaw" && std::sscanf(v.c_str(), "%f:%f", &a, &b) == 2) { m.yaw = true; m.yaw0 = a; m.yaw1 = b; }
+            else if (k == "tilt" && std::sscanf(v.c_str(), "%f:%f", &a, &b) == 2) { m.tilt = true; m.tilt0 = a; m.tilt1 = b; }
+            else if (k == "zoom" && std::sscanf(v.c_str(), "%f:%f", &a, &b) == 2) { m.zoom = true; m.zoom0 = a; m.zoom1 = b; }
+            else if (k == "at" && std::sscanf(v.c_str(), "%f:%f:%f:%f", &a, &b, &c, &d) == 4) {
+                m.at = true; m.x0 = a; m.y0 = b; m.x1 = c; m.y1 = d;
+            }
+        }
+        SDL_Log("D2K_CAMERA_MOVE: %s", e);
+        return m;
+    }();
+    if (!mv.on) return;
+    cameraMoveT_ += dt;
+    const float t = float(std::clamp(cameraMoveT_ / mv.secs, 0.0, 1.0)), u = t * t * (3 - 2 * t);
+    auto lerp = [u](float a, float b) { return a + (b - a) * u; };
+    if (mv.yaw) camYaw_ = render3d::radians(lerp(mv.yaw0, mv.yaw1));
+    if (mv.tilt) camTilt_ = render3d::radians(std::clamp(lerp(mv.tilt0, mv.tilt1), 0.0f, 66.0f));
+    const float cx = cam_.x + viewW_ / (2 * cam_.zoom), cy = cam_.y + viewH_ / (2 * cam_.zoom);
+    if (mv.zoom && !classicUi()) cam_.zoom = lerp(mv.zoom0, mv.zoom1) * ppp_;
+    const float nx = mv.at ? lerp(mv.x0, mv.x1) * 32.0f : cx, ny = mv.at ? lerp(mv.y0, mv.y1) * 32.0f : cy;
+    cam_.x = nx - viewW_ / (2 * cam_.zoom);
+    cam_.y = ny - viewH_ / (2 * cam_.zoom);
+}
+
 void Session::update() {
     syncGraphics();
     layout();
@@ -2187,6 +2236,7 @@ void Session::update() {
     const bool ku = keys[SDL_SCANCODE_UP], kd = keys[SDL_SCANCODE_DOWN];
     const bool el = edges && se.left, er = edges && se.right, eu = edges && se.up, ed = edges && se.down;
     panView(((kr || er) ? speed : 0.0f) - ((kl || el) ? speed : 0.0f), ((kd || ed) ? speed : 0.0f) - ((ku || eu) ? speed : 0.0f));
+    applyCameraMove(dt);  // D2K_CAMERA_MOVE (recordings)
     if (r3d_) {  // 3D: Q / E turn, Page Up / Down tilt
         const float fdt = float(dt);
         if (keys[SDL_SCANCODE_Q]) camYaw_ -= 1.6f * fdt;
@@ -2303,7 +2353,10 @@ void Session::drawPlacement(const game::World& world) {
 bool Session::prepareLighting(const game::World& w, bool threeD, const float view[4]) {
     light_ = render::SceneLight{};
     if (appliedGraphics_ == Settings::Graphics::Original) return false;
-    const double seconds = (cfg_.presetPreview ? 0.0 : settings_.cyclePhase) + (double(w.gameTicks()) + tickAccumulator_) / 20.0;
+    // D2K_CYCLE_START (recordings, debug): game seconds added to the clock of the day / night cycle.
+    static const double cycleStart = std::getenv("D2K_CYCLE_START") ? std::atof(std::getenv("D2K_CYCLE_START")) : 0.0;
+    const double seconds =
+        (cfg_.presetPreview ? 0.0 : settings_.cyclePhase) + cycleStart + (double(w.gameTicks()) + tickAccumulator_) / 20.0;
     lastCycleSeconds_ = seconds;
     const bool lite = settings_.deviceProfile == "lite";
     light_ = render::sceneLight(static_cast<render::TimeOfDay>(settings_.timeOfDay),

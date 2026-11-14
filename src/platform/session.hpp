@@ -398,6 +398,8 @@ private:
     double tickAccumulator_ = 0;  // model ticks owed (fraction = interpolation alpha)
     Uint64 last_ = 0;             // SDL_GetTicksNS of the previous update
     double fixedStep_ = 0;        // --record: fixed frame step (s), 0 = real time
+    double cameraMoveT_ = 0;      // D2K_CAMERA_MOVE: seconds into the move
+    void applyCameraMove(double dt);
     render::MotionInterpolator motion_;
     // Layout of the current frame.
     int outW_ = 0, outH_ = 0, viewW_ = 0, viewH_ = 0;

@@ -28,7 +28,9 @@ log frame times; one-frame, recording and `--simtest` runs use a hidden window a
 camera / options give bit-identical frames, so a Classic and a Modern run of the same battle line up frame for frame;
 `ffmpeg -framerate 30 -i DIR/frame_%05d.bmp -vf crop=1040:800:0:0 -c:v libx264 -pix_fmt yuv420p out.mp4`;
 `--record-fps F` with `--screenshot` and `--frames N` instead: the same fixed steps, only the last frame saved -
-e.g. a `--vfx-demo` scene N/F game seconds in),
+e.g. a `--vfx-demo` scene N/F game seconds in; for trailers: `D2K_CAMERA_MOVE="secs=12,yaw=-30:30,tilt=48:40,zoom=3:3.3,at=11:10:12:11"` eases
+the camera (each key optional; `at` = view centre in cells, zoom ignored by Graphics: Original) and `D2K_CYCLE_START=S`
+starts the day / night cycle S game seconds in (with `--time-of-day cycle`, `D2K_CYCLE_SECONDS`)),
 `--vfx-demo` (with `--at X Y`: a weapon effects gallery - rows of shots of every weapon kind and repeating
 vehicle-death / Death Hand / devastator explosions around the tile; changes the world, render checks only),
 `--menu-screenshot out.bmp --menu-page NAME` (render one menu page and exit; pages: main, campaign, house-confirm,

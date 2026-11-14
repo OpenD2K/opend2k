@@ -17,6 +17,13 @@ Current release: **0.0.1** (the first public release, see [CHANGELOG.md](CHANGEL
 Downloads: [Releases](https://github.com/OpenD2K/opend2k/releases) · Bugs: [Issues](https://github.com/OpenD2K/opend2k/issues) ·
 Ideas and questions: [Discussions](https://github.com/OpenD2K/opend2k/discussions)
 
+## Trailer
+
+[![OpenD2K 0.0.1 trailer: Original, Enhanced 2D and 3D (YouTube)](docs/media/trailer-thumbnail.jpg)](https://www.youtube.com/watch?v=pWEZdnSceE8)
+
+**[Watch the trailer on YouTube](https://www.youtube.com/watch?v=pWEZdnSceE8)** (1 min: Original, Enhanced 2D, day / night and 3D).
+Original game art © Westwood Studios / Electronic Arts; the music is our own.
+
 ## Screenshots
 
 ![The original 1998 graphics next to OpenD2K's Enhanced 2D mode](docs/media/original-vs-enhanced.jpg)
