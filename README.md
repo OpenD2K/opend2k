@@ -189,9 +189,9 @@ The original single-player game is complete and playable: campaigns, skirmish, A
 screens. What works, every option and the controls: [docs/STATUS.md](docs/STATUS.md).
 
 Next:
-- **0.0.2**: a real fire effect for burning buildings, redesigned working animations for the buildings (factory
-  cranes, research centre and starport lights, refinery and wind trap parts) in Enhanced and 3D, fixes from your
-  reports, Android improvements.
+- **0.0.3**: moving parts on the most-seen buildings (wind trap turbines, repair arm, refinery machinery,
+  factory doors), smoother infantry animation, building damage transitions, easier game-data setup (the game
+  picks up the Gruntmods installer from your Downloads folder), fixes from your reports.
 - **Later**: high-detail redesigned models for every unit and building; multiplayer (LAN, then internet, replays);
   shadows from lamps and fires; incremental art pack updates; and finally a new Emperor campaign in the style of
   the original ones.
