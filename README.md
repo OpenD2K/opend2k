@@ -13,7 +13,7 @@ quality-of-life features, each behind a setting.
 > **You need your own copy of Dune 2000.** OpenD2K contains no game data. The free community
 > *Gruntmods Edition* installer works directly, on every platform — no Windows or Wine needed to unpack it.
 
-Current release: **0.0.1** (the first public release, see [CHANGELOG.md](CHANGELOG.md)).
+Current release: **0.0.2** — [download the latest release](https://github.com/OpenD2K/opend2k/releases/latest) · what changed: [CHANGELOG.md](CHANGELOG.md).
 Downloads: [Releases](https://github.com/OpenD2K/opend2k/releases) · Bugs: [Issues](https://github.com/OpenD2K/opend2k/issues) ·
 Ideas and questions: [Discussions](https://github.com/OpenD2K/opend2k/discussions)
 
@@ -82,27 +82,27 @@ OpenD2K also finds a game folder placed next to it and the usual install locatio
 
 Downloads are on the [Releases](https://github.com/OpenD2K/opend2k/releases) page.
 
-**macOS 11 or later** (Apple Silicon and Intel): `OpenD2K-0.0.1-macos-universal.zip`. Unzip and move
+**macOS 11 or later** (Apple Silicon and Intel): `OpenD2K-<version>-macos-universal.zip`. Unzip and move
 `OpenD2K.app` to Applications. The app is not notarised by Apple, so the first start is blocked: open
 *System Settings → Privacy & Security* and click **Open Anyway** (or run
 `xattr -dr com.apple.quarantine /Applications/OpenD2K.app` once).
 
-**Windows 10 (1903) / 11, x64**: `OpenD2K-0.0.1-windows-x64.zip`. Unzip anywhere and start
+**Windows 10 (1903) / 11, x64**: `OpenD2K-<version>-windows-x64.zip`. Unzip anywhere and start
 `OpenD2K.exe` (`d2k.exe` is the same program with a console window and the command-line options).
 SmartScreen may warn about an unknown publisher: *More info → Run anyway*.
 
 **Linux x86-64** (glibc 2.38 and libstdc++ of GCC 13 or newer: Ubuntu 24.04, Debian 13, Fedora 39 or later):
-`OpenD2K-0.0.1-linux-x86_64.tar.gz`. Unpack and run `./d2k` in the folder. Needs X11 or Wayland, and
+`OpenD2K-<version>-linux-x86_64.tar.gz`. Unpack and run `./d2k` in the folder. Needs X11 or Wayland, and
 Vulkan drivers for the 3D mode. The file pickers use the desktop portal or `zenity`; without them start
 with `./d2k --install-from "Dune 2000 Gruntmods Edition 1.6.7.exe"` or `./d2k --data DIR`.
 
-**Android 8.0 or later** (arm64 / x86_64): `OpenD2K-0.0.1-android.apk`. Open the file on the device and allow
+**Android 8.0 or later** (arm64 / x86_64): `OpenD2K-<version>-android.apk`. Open the file on the device and allow
 your browser or file manager to *install unknown apps* when Android asks (the APK is not on Google Play).
 In the game, **Choose installer (.exe)…** picks the Gruntmods installer from Downloads. Updating: install the
 newer APK over the old one (settings, saves and the game data are kept).
 
 **iPad / iPhone (iPadOS / iOS 17+)**: no App Store version. Two ways:
-- **Sideload the unsigned IPA** `OpenD2K-0.0.1-ios-unsigned.ipa`: sign and install it with
+- **Sideload the unsigned IPA** `OpenD2K-<version>-ios-unsigned.ipa`: sign and install it with
   [AltStore](https://altstore.io) / [SideStore](https://sidestore.io) or [Sideloadly](https://sideloadly.io) using a
   (free) Apple ID, or install it with [TrollStore](https://github.com/opa334/TrollStore) on the iOS versions it
   supports. With a free Apple ID the app expires after **7 days** and must be re-signed (AltStore / SideStore
@@ -129,7 +129,7 @@ asks only when it finds nothing. The art pack is downloaded again only when a ne
 
 ### The redesigned art pack
 
-`OpenD2K-redesign-pack-0.0.1.zip` holds the redesigned 3D models and the sprites rendered from them (~580 MB).
+`OpenD2K-redesign-pack-<version>.zip` holds the redesigned 3D models and the sprites rendered from them (~580 MB).
 **Easiest: Options → Art pack → Download** in the game (also offered on the Graphics page's 3D tab). The game
 fetches it from this repository's GitHub release, checks its SHA-256, installs it into the settings folder's
 `artpacks/` and selects it. It looks for a newer pack only when you open Options (switch that off on the same
