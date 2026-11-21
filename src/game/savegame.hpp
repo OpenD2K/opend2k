@@ -31,7 +31,7 @@ namespace d2k::game {
 class World;
 
 inline constexpr char kSaveMagic[8] = {'D', '2', 'K', 'S', 'A', 'V', 'E', '\0'};
-inline constexpr std::uint32_t kSaveVersion = 8;  // 2: cheat state (World::cheats_); 3: Side::autoQueue;
+inline constexpr std::uint32_t kSaveVersion = 10;  // 2: cheat state (World::cheats_); 3: Side::autoQueue;
                                                   // 4: community extended events (World::ext_, tags);
                                                   // 5: cheat reinforcements, rally points, Order payload
                                                   // 6: play as any side (World::scriptSide_, SaveMeta::playAsSide)
@@ -40,6 +40,13 @@ inline constexpr std::uint32_t kSaveVersion = 8;  // 2: cheat state (World::chea
                                                   // 8: "Unit limit" (World::unlimitedObjects_) and the
                                                   //    pool slots past 1000, appended to the world
                                                   //    section (versions 6/7 load as 1000-slot pools)
+                                                  // 9: attack-moves (World::attackMoves_), at the end of
+                                                  //    the world section and only when there are any
+                                                  //    (older saves and unused: identical bytes)
+                                                  // 10: "Unit movement: Modern" (World::modernMovement_,
+                                                  //    Unit::mm) in a tail only Modern games have;
+                                                  //    SaveMeta::modernMovement. Original games save
+                                                  //    the same world section as version 9
 inline constexpr std::uint32_t kOldestSaveVersion = 6;
 
 struct SaveError : std::runtime_error {
@@ -124,6 +131,7 @@ struct SaveMeta {
     int campaignHouse = -1, missionIndex = -1;  // where the menu returns after the game
     int playerSide = 0;
     int playAsSide = -1;  // GameStart::playAsSide ("Play as any side"; -1 = the mission's own side)
+    bool modernMovement = false;  // GameStart::modernMovement ("Unit movement: Modern"; v10)
     float cameraX = 0, cameraY = 0, cameraZoom = 1;
     std::uint32_t gameTicks = 0;  // informational (also in the world section)
     // The frontend's on-screen mission message log (text already resolved, shown until `until`).

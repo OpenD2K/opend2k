@@ -1,9 +1,12 @@
 #include "platform/artpack_download.hpp"
+#include "formats/utf8_bom.hpp"
 
 #include "formats/sha256.hpp"
 #include "formats/zip_reader.hpp"
 #include "platform/app_update.hpp"
 #include "platform/http_client.hpp"
+#include "platform/language.hpp"
+#include "formats/language.hpp"
 #include "render/art_pack.hpp"
 
 #include <SDL3/SDL.h>
@@ -42,6 +45,7 @@ std::string trim(std::string s) {
 // key=value of a small ini file ("" when missing).
 std::string iniValue(const fs::path& file, const std::string& key) {
     std::ifstream in(file);
+    formats::skipUtf8Bom(in);
     std::string line;
     while (std::getline(in, line)) {
         const auto eq = line.find('=');
@@ -60,6 +64,16 @@ std::string formatBytes(std::uint64_t b) {
     else std::snprintf(buf, sizeof buf, "%.0f KB", double(b) / 1e3);
     return buf;
 }
+
+namespace {
+// The AI voice folder holds a set that this download did not write (the player generated it): never replaced.
+bool foreignVoiceSet(const formats::ArtPackManifest& m, const std::string& dest) {
+    std::error_code ec;
+    return m.install == formats::kInstallAiVoices && !dest.empty() && fs::exists(dest, ec) &&
+           !fs::exists(fs::path(dest) / "installed.ini", ec);
+}
+const char* const kForeignVoiceSet = "a voice set that was not downloaded is already in ";
+}  // namespace
 
 ArtPackDownloader& ArtPackDownloader::instance() {
     static ArtPackDownloader d;
@@ -89,9 +103,16 @@ void ArtPackDownloader::autoCheck(bool enabled) {
 }
 
 void ArtPackDownloader::check() { start(false); }
-void ArtPackDownloader::download() { start(true); }
+void ArtPackDownloader::download() { start(true, {std::string()}); }
+void ArtPackDownloader::download(const std::vector<std::string>& names) {
+    if (!names.empty()) start(true, names);
+}
 
-void ArtPackDownloader::cancel() { cancel_ = true; }
+void ArtPackDownloader::cancel() {
+    cancel_ = true;
+    std::lock_guard l(m_);
+    queue_.clear();
+}
 
 bool ArtPackDownloader::busy() const { return running_.load(); }
 
@@ -122,27 +143,33 @@ void ArtPackDownloader::previewState(State s, const formats::ArtPackManifest& m,
     autoChecked_ = true;
 }
 
-void ArtPackDownloader::start(bool download) {
-    if (running_.exchange(true)) {
-        // Busy (an update check that the Options page started): download right after it.
-        if (download) pendingDownload_ = true;
-        return;
+void ArtPackDownloader::start(bool download, const std::vector<std::string>& names) {
+    {
+        std::lock_guard l(m_);
+        if (download)
+            for (const std::string& n : names)
+                if (std::find(queue_.begin(), queue_.end(), n) == queue_.end()) queue_.push_back(n);
+        // Busy (an update check that the Options page started, or a download): the running worker
+        // takes the queue up when it is done.
+        if (running_.exchange(true)) return;
     }
     if (worker_.joinable()) worker_.join();
     cancel_ = false;
-    pendingDownload_ = false;
     worker_ = std::thread([this, download] {
-        work(download);
-        while (pendingDownload_.exchange(false) && !cancel_.load()) {
-            bool checked = false;
+        if (!download) work({});
+        for (;;) {
+            std::vector<std::string> next;
             {
                 std::lock_guard l(m_);
-                checked = st_.haveManifest;
+                if (cancel_.load()) queue_.clear();
+                next.swap(queue_);
+                if (next.empty()) {
+                    running_ = false;  // (under the lock: start() sees either the queue taken or the worker gone)
+                    return;
+                }
             }
-            if (!checked) break;
-            work(true);
+            work(next);
         }
-        running_ = false;
     });
 }
 
@@ -199,62 +226,108 @@ bool ArtPackDownloader::fetchManifest() {
     return true;
 }
 
-void ArtPackDownloader::work(bool download) {
+void ArtPackDownloader::work(const std::vector<std::string>& names) {
     bool have = false;
     {
         std::lock_guard l(m_);
         have = st_.haveManifest;
     }
-    if (!download || !have) {
+    if (names.empty() || !have) {
         if (!fetchManifest()) return;
     }
-    if (!download) return;
+    if (names.empty()) return;
     formats::ArtPackManifest m;
     {
         std::lock_guard l(m_);
         m = st_.manifest;
     }
+    // In the manifest's order (the main pack first: the Reimagined models overlay its models).
+    std::vector<const formats::ArtPackManifest*> items;
+    // kArtPack3dSet ("@3d"): what the 3D Reimagined look still lacks, known only now that the manifest is in.
+    const bool set3d = std::find(names.begin(), names.end(), std::string(kArtPack3dSet)) != names.end();
+    const std::vector<std::string> missing3d = set3d ? missingFor3d(m) : std::vector<std::string>{};
+    auto wanted = [&](const std::string& n) {
+        return std::find(names.begin(), names.end(), n) != names.end() ||
+               std::find(missing3d.begin(), missing3d.end(), n) != missing3d.end();
+    };
+    if (set3d && missing3d.empty() && names.size() == 1) {  // everything is there already
+        std::lock_guard l(m_);
+        st_.state = State::Done;
+        st_.error.clear();
+        return;
+    }
+    if (wanted("") || wanted(m.name)) items.push_back(&m);
+    for (const formats::ArtPackManifest& e : m.extras)
+        if (wanted(e.name)) items.push_back(&e);
+    if (items.empty()) {
+        fail(State::Failed, "the art pack list has changed - press Check now");
+        return;
+    }
+    std::string mainInstalled;
+    std::vector<std::string> done;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        {
+            std::lock_guard l(m_);
+            st_.current = items[i]->name;
+            st_.currentTitle = items[i]->title;
+            st_.queuePos = int(i) + 1;
+            st_.queueLen = int(items.size());
+        }
+        if (!installItem(*items[i])) return;  // (failed / cancelled: the state says why; the rest is dropped)
+        if (!items[i]->isExtra) mainInstalled = items[i]->name;
+        done.push_back(items[i]->name);
+    }
+    std::lock_guard l(m_);
+    st_.state = State::Done;
+    st_.error.clear();
+    st_.current.clear();
+    st_.currentTitle.clear();
+    st_.installedNames = done;
+    if (!mainInstalled.empty()) installedName_ = mainInstalled;
+}
+
+bool ArtPackDownloader::installItem(const formats::ArtPackManifest& m) {
     if (!m.minEngine.empty() && formats::compareVersions(D2K_VERSION, m.minEngine) < 0) {
         fail(State::Failed, "this art pack needs OpenD2K " + m.minEngine + " or newer");
-        return;
+        return false;
     }
     const std::string user = render::ArtPack::userDir();
     if (user.empty()) {
         fail(State::Failed, "no writable app data folder");
-        return;
+        return false;
+    }
+    if (const std::string dest = installDir(m); foreignVoiceSet(m, dest)) {  // (checked before downloading too)
+        fail(State::Failed, kForeignVoiceSet + dest + " - move it away first");
+        return false;
     }
     std::error_code ec;
     const fs::path dl = fs::path(user) / ".download";
     fs::create_directories(dl, ec);
     if (ec) {
         fail(State::Failed, "cannot create " + dl.string() + ": " + ec.message());
-        return;
+        return false;
     }
     // Room for the zip and its unpacked copy (PNGs are stored, so about the same again).
     if (const fs::space_info sp = fs::space(dl, ec); !ec && sp.available < m.size * 2 + (64ull << 20)) {
         fail(State::Failed, "not enough free disk space (needs about " + formatBytes(m.size * 2) + ")");
-        return;
+        return false;
     }
     // Same name for the same file: an interrupted download of this very zip resumes.
     const std::string part = (dl / (m.name + "-" + m.sha256.substr(0, 16) + ".zip.part")).string();
-    if (!downloadZip(part)) return;
-    if (!verify(part)) return;
-    if (!install(part)) return;
+    if (!downloadZip(m, part)) return false;
+    if (!verify(m, part)) return false;
+    if (!install(m, part)) return false;
     fs::remove(part, ec);
     fs::remove(dl, ec);  // only when empty
     render::ArtPack::invalidate();
-    std::lock_guard l(m_);
-    st_.state = State::Done;
-    st_.error.clear();
-    installedName_ = m.name;
-    SDL_Log("Art pack %s %s installed in %s", m.name.c_str(), m.version.c_str(), user.c_str());
+    if (m.install == formats::kInstallAiVoices) noteAiVoicesChanged();
+    SDL_Log("Art pack %s %s installed in %s", m.name.c_str(), m.version.c_str(), installDir(m).c_str());
+    return true;
 }
 
-bool ArtPackDownloader::downloadZip(const std::string& part) {
-    formats::ArtPackManifest m;
+bool ArtPackDownloader::downloadZip(const formats::ArtPackManifest& m, const std::string& part) {
     {
         std::lock_guard l(m_);
-        m = st_.manifest;
         st_.state = State::Downloading;
         st_.error.clear();
         st_.total = m.size;
@@ -320,11 +393,9 @@ bool ArtPackDownloader::downloadZip(const std::string& part) {
     return false;
 }
 
-bool ArtPackDownloader::verify(const std::string& part) {
-    formats::ArtPackManifest m;
+bool ArtPackDownloader::verify(const formats::ArtPackManifest& m, const std::string& part) {
     {
         std::lock_guard l(m_);
-        m = st_.manifest;
         st_.state = State::Verifying;
         st_.done = 0;
         st_.total = m.size;
@@ -364,18 +435,16 @@ bool ArtPackDownloader::verify(const std::string& part) {
     return true;
 }
 
-bool ArtPackDownloader::install(const std::string& part) {
-    formats::ArtPackManifest m;
+bool ArtPackDownloader::install(const formats::ArtPackManifest& m, const std::string& part) {
     std::string raw;
     {
         std::lock_guard l(m_);
-        m = st_.manifest;
         raw = rawManifest_;
         st_.state = State::Installing;
         st_.done = 0;
     }
     // The pack folder inside the zip: <name>/pack.ini, else artpacks/<name>/pack.ini, else the one
-    // folder that has a pack.ini.
+    // folder that has a pack.ini. An extra (no pack.ini): the folder <name>/ (or artpacks/<name>/).
     formats::zip::Archive a;
     std::string err;
     if (!a.open(part, err)) {
@@ -394,14 +463,32 @@ bool ArtPackDownloader::install(const std::string& part) {
         }
         if (std::count(dir.begin(), dir.end(), '/') <= 1) candidates.push_back(dir);
     }
-    if (prefix.empty() && candidates.size() == 1) prefix = candidates[0];
+    if (prefix.empty() && candidates.size() == 1 && !m.isExtra) prefix = candidates[0];
+    if (prefix.empty() && m.isExtra)
+        for (const auto& e : a.entries()) {
+            const std::string safe = formats::zip::safeRelativePath(e.name);
+            for (const std::string& dir : {m.name, "artpacks/" + m.name})
+                if (safe.size() > dir.size() + 1 && safe.compare(0, dir.size() + 1, dir + "/") == 0) prefix = dir;
+            if (!prefix.empty()) break;
+        }
     if (prefix.empty()) {
-        fail(State::Failed, "the zip has no " + m.name + "/pack.ini");
+        fail(State::Failed, "the zip has no " + m.name + (m.isExtra ? "/ folder" : "/pack.ini"));
         return false;
     }
-    const fs::path user(render::ArtPack::userDir());
-    const fs::path tmp = user / (".install-" + m.name), dest = user / m.name, old = user / (".old-" + m.name);
+    const fs::path dest(installDir(m));
+    if (dest.empty()) {
+        fail(State::Failed, "no writable folder for " + m.name);
+        return false;
+    }
+    const fs::path user = dest.parent_path();
+    const fs::path tmp = user / (".install-" + m.name), old = user / (".old-" + m.name);
     std::error_code ec;
+    fs::create_directories(user, ec);
+    // A voice set the player generated (no installed.ini: not from this download) stays untouched.
+    if (foreignVoiceSet(m, dest.string())) {
+        fail(State::Failed, kForeignVoiceSet + dest.string() + " - move it away first");
+        return false;
+    }
     fs::remove_all(tmp, ec);
     fs::remove_all(old, ec);
     const formats::zip::ExtractResult x =
@@ -416,7 +503,7 @@ bool ArtPackDownloader::install(const std::string& part) {
         fail(x.cancelled ? State::Cancelled : State::Failed, "unpacking failed: " + x.error);
         return false;
     }
-    if (!fs::exists(tmp / "pack.ini", ec)) {
+    if (!m.isExtra && !fs::exists(tmp / "pack.ini", ec)) {
         fs::remove_all(tmp, ec);
         fail(State::Failed, "the unpacked pack has no pack.ini");
         return false;
@@ -456,7 +543,11 @@ InstalledArtPack ArtPackDownloader::installed(const std::string& name) {
     for (const auto& d : render::ArtPack::searchDirs()) {
         const fs::path root = fs::path(d) / name;
         std::error_code ec;
-        if (!fs::exists(root / "pack.ini", ec)) continue;
+        if (!fs::exists(root / "pack.ini", ec)) {
+            // An extra (no pack.ini): installed.ini (the download) or any content (a copy by hand).
+            if (name == kArtPackName || !fs::is_directory(root, ec)) continue;
+            if (!fs::exists(root / "installed.ini", ec) && fs::directory_iterator(root, ec) == fs::directory_iterator()) continue;
+        }
         r.installed = true;
         r.root = root.string();
         r.version = iniValue(root / "installed.ini", "version");
@@ -472,6 +563,49 @@ bool ArtPackDownloader::updateAvailable() const {
     const Status s = status();
     if (!s.haveManifest) return false;
     return isUpdate(s.manifest, installed(s.manifest.name));
+}
+
+std::string ArtPackDownloader::installDir(const formats::ArtPackManifest& item) {
+    if (item.install == formats::kInstallAiVoices) return defaultAiVoicesDir();
+    const std::string user = render::ArtPack::userDir();
+    return user.empty() ? std::string() : (fs::path(user) / item.name).string();
+}
+
+InstalledArtPack ArtPackDownloader::installed(const formats::ArtPackManifest& item) {
+    if (item.install != formats::kInstallAiVoices) return installed(item.name);
+    // The AI voice folder: the download's installed.ini, or a set the player generated (version unknown).
+    InstalledArtPack r;
+    r.name = item.name;
+    const std::string dir = defaultAiVoicesDir();
+    std::error_code ec;
+    if (dir.empty() || !fs::is_directory(dir, ec)) return r;
+    const fs::path ini = fs::path(dir) / "installed.ini";
+    if (!fs::exists(ini, ec) && formats::lang::findAiVoices(dir).empty()) return r;
+    r.installed = true;
+    r.root = dir;
+    r.version = iniValue(ini, "version");
+    r.sha256 = iniValue(ini, "sha256");
+    return r;
+}
+
+bool ArtPackDownloader::needed(const formats::ArtPackManifest& item) {
+    const InstalledArtPack i = installed(item);
+    return !i.installed || isUpdate(item, i);
+}
+
+std::vector<std::string> ArtPackDownloader::missingFor3d(const formats::ArtPackManifest& m) {
+    std::vector<std::string> r;
+    if (!installed(m.name).installed) r.push_back(m.name);
+    for (const formats::ArtPackManifest& e : m.extras)
+        if (e.for3d && needed(e)) r.push_back(e.name);
+    return r;
+}
+
+std::uint64_t ArtPackDownloader::sizeOf(const formats::ArtPackManifest& m, const std::vector<std::string>& names) {
+    std::uint64_t t = 0;
+    for (const std::string& n : names)
+        if (const formats::ArtPackManifest* i = m.item(n.empty() ? m.name : n)) t += i->size;
+    return t;
 }
 
 bool ArtPackDownloader::isUpdate(const formats::ArtPackManifest& m, const InstalledArtPack& i) {
@@ -493,15 +627,31 @@ int ArtPackDownloader::runBlocking(bool doInstall, const std::function<void(cons
     const InstalledArtPack inst = installed(s.manifest.name);
     log("Pack " + s.manifest.name + " " + s.manifest.version + ", " + formatBytes(s.manifest.size) + ", sha256 " +
         s.manifest.sha256 + "; installed: " + (inst.installed ? (inst.version.empty() ? "yes (unknown version)" : inst.version) + " at " + inst.root : "no"));
+    // --artpack-install: the main pack and every extra (the full 3D Reimagined set).
+    std::vector<std::string> names{s.manifest.name};
+    for (const formats::ArtPackManifest& e : s.manifest.extras) {
+        const InstalledArtPack ei = installed(e);
+        log("  extra " + e.name + " " + e.version + ", " + formatBytes(e.size) + (e.for3d ? ", for 3D" : "") + ", " + e.licence +
+            "; installed: " + (ei.installed ? (ei.version.empty() ? "yes (unknown version)" : ei.version) + " at " + ei.root : "no"));
+        if (foreignVoiceSet(e, installDir(e))) {
+            log(std::string("    (skipped: ") + kForeignVoiceSet + installDir(e) + ")");
+            continue;
+        }
+        names.push_back(e.name);
+    }
     if (!doInstall) return 0;
-    start(true);
+    download(names);
     State last = State::Idle;
+    std::string lastItem;
     int lastPct = -1;
     while (busy()) {
         SDL_Delay(200);
         s = status();
         const int pct = s.total ? int(s.done * 100 / s.total) : 0;
-        if (s.state != last || pct / 10 != lastPct / 10) {
+        if (s.state != last || pct / 10 != lastPct / 10 || s.current != lastItem) {
+            if (s.current != lastItem && !s.current.empty())
+                log("  [" + std::to_string(s.queuePos) + "/" + std::to_string(s.queueLen) + "] " + s.current);
+            lastItem = s.current;
             static const char* const kNames[] = {"idle", "checking", "checked", "check failed", "downloading", "verifying",
                                                  "installing", "done", "failed", "cancelled"};
             log(std::string("  ") + kNames[int(s.state)] + " " + std::to_string(pct) + "% (" + formatBytes(s.done) + ")");
@@ -515,7 +665,8 @@ int ArtPackDownloader::runBlocking(bool doInstall, const std::function<void(cons
         log("Install failed: " + s.error);
         return 1;
     }
-    log("Installed " + s.manifest.name + " " + s.manifest.version + " in " + render::ArtPack::userDir());
+    log("Installed " + std::to_string(names.size()) + " pack(s) (" + s.manifest.name + " " + s.manifest.version + (names.size() > 1 ? " + extras" : "") +
+        ") in " + render::ArtPack::userDir());
     return 0;
 }
 

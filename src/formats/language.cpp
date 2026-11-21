@@ -361,7 +361,7 @@ Availability availability(Id id, const Sources& s) {
         a.voices = !s.aiVoicesDir.empty();
         a.text = a.voices && !s.translation.textDir.empty();
         a.movies = a.voices && !s.translation.moviesDir.empty();
-        if (!a.voices) a.needs = "no AI voices: generate with tools/voice/gen_ru_ai.py";
+        if (!a.voices) a.needs = "no AI voices: download them in Options > Art pack";  // (the ru-ai-voices extra)
         else if (!a.text) a.needs = "text needs the Russian translation folder (ru-pc)";
         else if (!a.movies) a.needs = "no Russian cutscenes in the translation folder (English ones play)";
         break;

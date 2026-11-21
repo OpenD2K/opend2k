@@ -303,13 +303,14 @@ fragment float4 terrain2_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], 
     const float vis = mix(u.light.w, 1.0, sm);
     const float3 shade = sunAmb(pl, u.light.x, u.light.y * ndl * vis) * u.light.z;
     float3 rgb = satur(pl, albedo) * shade + albedo * pointLights(pl, plg, in.wpos, n, 0.3);
+    rgb *= dustHaze(pl, in.wpos);  // Reimagined: drifting dust veils (0 strength = off)
     float s = 0.0;
     // fog2.w: 0 no shroud, 1 shroud, 2 baked for the Enhanced 2D view (no shroud, no edge fade).
     if (u.fog2.w > 0.5 && u.fog2.w < 1.5) s = shroud.sample(shroudSamp, p / mapSize).a;
     const float2 e = min(p, mapSize - p);
     if (u.fog2.w < 1.5) s = max(s, 1.0 - smoothstep(0.0, 8.0, min(e.x, e.y)));
     const float d = distance(in.wpos, u.fog.xyz);
-    const float f = smoothstep(u.fog.w, u.fog2.x, d);
+    const float f = smoothstep(u.fog.w, u.fog2.x, d) * aerialK(pl);
     rgb = mix(rgb, u.fogColor.rgb, f) * (1.0 - s);
     return float4(rgb, 1.0);
 }
@@ -383,9 +384,9 @@ float shadowPCF(depth2d<float> sm, sampler ss, float3 lp, float4 sh) {
 
 fragment float4 rock_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], constant PointLights& pl [[buffer(1)]], const device uint4* plg [[buffer(2)]],
                         texture2d_array<float> tex [[texture(0)]], texture2d<float> shroud [[texture(1)]],
-                        depth2d<float> shadowMap [[texture(2)]],
+                        depth2d<float> shadowMap [[texture(2)]], texture2d<float> ssaoTex [[texture(3)]],
                         sampler texSamp [[sampler(0)]], sampler shroudSamp [[sampler(1)]],
-                        sampler shadowSamp [[sampler(2)]]) {
+                        sampler shadowSamp [[sampler(2)]], sampler ssaoSamp [[sampler(3)]]) {
     const uint layer = uint(in.layer + 0.5);
     // Recoloured by luminance to the map's cliff colour (tint.rgb = target / mean luminance,
     // a = mean luminance), contrast eased, a tenth of the scan's own (greyish) hue kept.
@@ -398,16 +399,21 @@ fragment float4 rock_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], cons
     const float sm = u.shadow.x > 0.5 ? shadowPCF(shadowMap, shadowSamp, (u.lightVP * float4(in.wpos, 1.0)).xyz, u.shadow) : in.sun;
     const float vis = mix(u.light.w, 1.0, sm);
     // Sky light brighter on top faces, contact darkening near the ground.
-    const float amb = u.light.x * (0.78 + 0.22 * n.y) * mix(0.62, 1.0, smoothstep(0.0, 0.55, in.ao));
+    // (Ambient occlusion, docs/3d-mode.md: the darker of the rock's own and the screen-space term.)
+    const float amb = u.light.x * (0.78 + 0.22 * n.y) *
+                      min(mix(0.62, 1.0, smoothstep(0.0, 0.55, in.ao)), ssaoAt(pl, ssaoTex, ssaoSamp, in.pos.xy));
     float3 rgb = satur(pl, albedo) * sunAmb(pl, amb, u.light.y * ndl * vis) * u.light.z + albedo * pointLights(pl, plg, in.wpos, n, 0.25);
     const float2 p = in.wpos.xz, mapSize = u.fog2.yz;
     float s = 0.0;
-    // fog2.w: 0 no shroud, 1 shroud, 2 baked for the Enhanced 2D view (no shroud, no edge fade).
+    // fog2.w: 0 no shroud, 1 shroud, 2 baked for the Enhanced 2D view (no shroud, no edge fade), 3 shroud
+    // without the edge fade (the world beyond the map).
     if (u.fog2.w > 0.5 && u.fog2.w < 1.5) s = shroud.sample(shroudSamp, p / mapSize).a;
+    if (u.fog2.w > 2.5) s = shroudAt(pl, shroud, shroudSamp, p, mapSize);  // (beyond the map: the fixed fog level)
     const float2 e = min(p, mapSize - p);
     if (u.fog2.w < 1.5) s = max(s, 1.0 - smoothstep(0.0, 8.0, min(e.x, e.y)));
     if (s > 0.996) discard_fragment();
-    const float f = smoothstep(u.fog.w, u.fog2.x, distance(in.wpos, u.fog.xyz));
+    rgb *= dustHaze(pl, in.wpos);  // Reimagined: drifting dust veils
+    const float f = smoothstep(u.fog.w, u.fog2.x, distance(in.wpos, u.fog.xyz)) * aerialK(pl);
     rgb = mix(rgb, u.fogColor.rgb, f) * (1.0 - s);
     return float4(rgb, 1.0);
 }

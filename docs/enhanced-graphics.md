@@ -15,6 +15,7 @@ their own RNG (xorshift), so the game RNG, the saves and `--simtest` do not chan
 | `graphicsPreset` | `original`, `enhanced`, `3d`, `custom` | new players: `enhanced` (no key: the preset the values match, else `custom`) | Options → Graphics: the tabs; original SETTINGS page: "Graphics:" button. See "Presets" below |
 | `artPack` | `original`, `upscaled`, or an art-pack folder name | `upscaled` (built-in default; the Enhanced / 3D presets set `original` unless a redesign pack is chosen) | Graphics page → Custom: "Art"; in-game options |
 | `effects` | `classic`, `modern` | `modern` | Graphics page → Custom: "Effects"; in-game options; Original UIL game options: "Modern effects" |
+| `effectsIntensity` | `clean`, `balanced`, `cinematic` | `balanced` (not part of any preset; one-frame runs: `balanced`) | Graphics page → Custom → Effects: "Intensity" (next to "Effects"); `--effects-intensity`. See "Effects intensity" below |
 | `vehicleAnimation` | `original`, `modern` | `modern` (the Enhanced / 3D presets: `modern`; inert in Graphics: Original) | Graphics page → Custom → Effects: "Vehicle animation"; `--vehicle-animation`. See "Vehicle animation" below |
 | `shroud` | `classic`, `soft` | `soft` (absent key: `soft` with Modern effects, `classic` with Classic) | Graphics page → Custom: "Shroud"; in-game options (row shared with "Health") |
 | `healthBars` | `selected`, `damaged`, `always` | `selected` | Graphics page → Custom → Interface: "Health bars"; in-game options |
@@ -32,6 +33,10 @@ Options → Graphics (`Menu::pageGraphics`, `Settings::applyPreset` / `matchesPr
 | Original | `graphics=original` | `graphics` only (the Enhanced-only values are inert and kept) |
 | Enhanced | `graphics=enhanced`, `terrain2d=faithful`, `effects=modern`, `timeOfDay=day`, `lighting=modern`, `shroud=soft`, `healthBars=selected`, `panelTransparency=off`, `classicView=hold`, `artPack` = the chosen redesign pack (`ArtPack::isRedesign`: pack.ini `kind=rendered`/`redesign`, or written by `tools/render_sprites/render_pack.py`) else `original` | all of these |
 | 3D | the Enhanced values with `graphics=3d`, plus `terrain3d=faithful`, `shadows3d=on` (`models3d` left alone) | all but `terrain2d` |
+
+Not compared (a change keeps the preset), but set by the tabs: Original sets `unitMovement=original` and `reimagined=off`;
+Enhanced and 3D set `unitMovement=modern` (new games; docs/modern-movement.md) and 3D also `reimagined=on`
+(except the "lite" iPad profile) - owner 2026-11-16. A settings.ini from before those keys follows its preset.
 | Custom | — | anything else |
 
 A tap on a preset tab applies it. Any change to one of these values on the Custom tab or in the in-game options
@@ -118,7 +123,7 @@ measure performance.
 case-insensitively. `artpacks/` is gitignored, because packs are derived from copyrighted art.
 
 **Search paths** (`ArtPack::searchDirs`):
-1. `<pref path>/artpacks/` (`~/Library/Application Support/d2k-mac/Dune 2000/artpacks/`)
+1. `<pref path>/artpacks/` (`~/Library/Application Support/OpenD2K/Dune 2000/artpacks/`)
 2. `artpacks/` next to the executable and up to four folders above it. For `build/d2k` that
    includes the repository root; for the app bundle, the folder that holds `Dune 2000.app`.
 3. `artpacks/` in the working directory.
@@ -547,7 +552,7 @@ vehicle glbs have one `body` mesh (no wheel / track nodes), so nothing turns or 
 | EX_DEVIATE (deviator hit) | a swirling cloud of the firer's house-coloured gas, a soft glow and motes (the original sprite and the conversion stay underneath) |
 | EX_GREENEXP (the deviator's per-tick trail explosion) | nothing extra: the bullet trail draws the gas (the original sprite stays) |
 | EX_DEVASTATOR (devastator hit) | magenta plasma burst that pulses twice (white-hot flash, then a magenta pulse ~0.09 s later: the twin bolts), three shock rings, streak motes, glow blobs, a little dark smoke, a scorch, a light kick; no flames |
-| moving ground vehicles | dust trail (terrain colour; more on sand, wheeled vehicles more), tread marks on sand for tracked vehicles (fading decals, 9 s) |
+| moving ground vehicles | dust trail (terrain colour; more on sand, wheeled vehicles more), tread marks on sand for tracked vehicles (fading decals, 9 s; 3D: lit track / tyre imprints for every vehicle, docs/3d-mode.md "Track marks") |
 | damaged vehicles / buildings | only the original's smoke events (EX_SMOKE3 / EX_FLAME above), no health thresholds |
 | destroyed buildings (state 17) | the collapse sequence below; their EX_BUILDING death explosions become fireballs without their own light or shake (see "Modern weapon effects") |
 
@@ -742,7 +747,9 @@ key and Graphics: Original keep every original sprite exactly.
 | bombs, debris | a dark falling bomb with a shadow; burning chunks (ember glow, smoke) |
 | devastator, deviator, sonic | devastator: TWIN plasma bolts 8 px apart across the flight (the original DEVBULLET frames show two orbs, MUZ_DEVAS two flashes; still ONE bullet per shot in the model), twin muzzle flashes; house-coloured gas orb; sonic beam as before |
 | small-arms impact (EX_MG / EX_HMG; `spawnImpact`) | armour (a vehicle / building cell, or in the air): 3-4 short sparks, a glow, a tiny light, a smoke wisp; sand: dust puffs in the terrain colour and flying grains; rock: dust, a chip and maybe one spark |
-| fireballs (EX_ROCKET ... EX_BANG14, EX_155MMGUN, EX_DEATHHAND, EX_DEVDEATH; size per type, `exScale_`) | flash core + timed light; a billowing fireball of `kFire` puffs (additive white-hot cores, deep orange alpha flames, soot), colour held hot then cooling (`kFxHot`), part of it rolling up for up to 0.6 s; secondary bursts for blasts over 1.3; a smoke column released over ~1 s (first puffs lit orange) that rises and drifts; a few falling sparks (no glitter); debris chunks (vehicle deaths and bigger) with dust where they land; on the ground: a dust ring pushed out, a dust-ring mark, a scorch decal (`kScorch`, 22 - 50 s, glowing for 2 s), a bright shockwave ring for Huge ones. Sizes grow ~s^0.6 above 1 and counts with s, so big blasts keep detail |
+| tank shells (EX_TANKGUN, `ExClass::Shell`) | a heavy impact: sparks + a short flash on armour; on the ground a dust burst in the terrain colour and a small mark; no fireball |
+| artillery (EX_155MMGUN: siege tank howitzer, grenade ~0.6 size told apart by the grenades in flight, crate trap; `spawnArtillery`) | no fireball: a white flash for a few frames + a short light; on the ground a fountain of sand / earth (terrain colour darkened) thrown up ~90 px that spreads and sinks back, a grit spray, clods of earth raining down, a low dust ring, a short-lived brown-grey cloud drifting with the wind, a sand shock ring (mark kind 7) and the crater; on armour: flash, sparks and a small burst of dark smoke |
+| fireballs (EX_ROCKET ... EX_BANG14, EX_DEATHHAND, EX_DEVDEATH; size per type, `exScale_`) | flash core + timed light; a billowing fireball of `kFire` puffs (additive white-hot cores, deep orange alpha flames, soot), colour held hot then cooling (`kFxHot`), part of it rolling up for up to 0.6 s; secondary bursts for blasts over 1.3; a smoke column released over ~1 s (first puffs lit orange) that rises and drifts; a few falling sparks (no glitter); debris chunks (vehicle deaths and bigger) with dust where they land; on the ground: a dust ring pushed out, a dust-ring mark, a scorch decal (`kScorch`, 22 - 50 s, glowing for 2 s), a bright shockwave ring for Huge ones. Sizes grow ~s^0.6 above 1 and counts with s, so big blasts keep detail |
 | vehicle death (EX_WHITEN1 under the death explosion) | a burning wreck: a charred hulk mark (scorch + blackened chunks, 45 s) and a fire (9 - 14 s) with a dark smoke column and a flickering light |
 | destroyed buildings | the EX_BUILDING sprites become staggered fireballs over the building (thinner where they bunch), on top of the existing collapse / smoke / ruin sequence; a shockwave ring at the death |
 | building damage | smoke from 60 % health (grey, thickening and darkening, up to 3 points, turrets included), fire from 40 % growing to 10 %, flickering light; the BUILEXP smoke / flame sprites are hidden |
@@ -752,6 +759,11 @@ key and Graphics: Original keep every original sprite exactly.
 Particles are capped at 9000 (`kMaxParticles`); explosions and impacts thin out (x0.7 / x0.45) once
 the budget is 40 % / 67 % used (`Effects::load`). Timed lights are capped at 256, ground marks at 420
 (the oldest scorch goes first).
+The particle list is the draw order (2D draws it as it is, 3D breaks depth ties by it): dead particles are
+dropped with the survivors kept in spawn order, and a spawn at the full budget is dropped. (Until 2026-11-16 a
+dead particle's slot took the last one - a fresh puff then drew under older ones from one frame to the next -
+and a spawn at the budget replaced a random live particle; with many overlapping smoke puffs both made the
+smoke flicker.)
 
 ### Light list
 `Effects::lights()` is the frame's list of light sources (rebuilt by every `update`): every
@@ -790,6 +802,47 @@ Performance (M-series MacBook, 120 Hz, debug build, `--frames 600`, CPU update+r
 0.98 / 1.85 ms, 3D Classic 1.28 / 2.41 ms, 3D Modern 1.04 / 2.09 ms; the `--vfx-demo` stress scene
 (~10 explosions and 15 shots a second on screen, zoom 1): Enhanced 2.02 / 3.88 ms, 3D 2.72 /
 4.85 ms. All runs stay locked to the 120 Hz vsync (frame avg 8.34 - 8.36 ms).
+
+### Effects intensity (`render/fx_budget.hpp`, `render/effects_budget.cpp`; Settings `effectsIntensity`)
+
+Owner feedback (2026-11-16): "with a lot of tanks it's just a lot of smoke and explosions and looks messy". Options →
+Graphics → Custom → Effects: **Intensity** (next to "Effects") Clean / Balanced / Cinematic (`effectsIntensity`,
+`--effects-intensity`; one-frame runs use the default, Clean - owner 2026-11-16). Render-only, for the Modern effects in Enhanced 2D
+and plain 3D and the Reimagined cinematic particles (`render3d/cinematic_fx.*`, which copy the Modern effects'
+budget every frame).
+- **Busy level** (`FxBudget`): every weapon event that spawns in view adds a weight (tank shell 0.8, rocket / medium
+  blast 1, howitzer 1 x size, big 1.5, huge 2.5, small arms 0.15) to a load that decays with 2.5 s; times the view's
+  area factor (reference 1600 x 900 world px: zoomed in, the same events fill more of the screen) it maps
+  smoothstep 5..25 onto a target busy level 0..1, which the level follows with hysteresis (rises in ~0.6 s, settles
+  over ~4 s: nothing pops). A single explosion never leaves 0. `D2K_FX_BUDGET_LOG=1` logs it once a second.
+- **Transient vs lasting**: particles spawned inside an event (`Effects::EventScope`: explosions, hits, artillery,
+  muzzles, tracers, projectile trails, debris landings / trails; cinematic: every event except wreck / ruin / building
+  columns and drop-in dust, `lasting_`) are budgeted at spawn (`Effects::budgetSpawn`, `CinematicFx::budgetSpawn`):
+  smoke / dust / soot puffs get a cap `cut` (Balanced 3 s calm .. 1.2 s busy, Clean 1 s): up to the cap the puff looks
+  exactly as spawned, then it fades out over the last ~1 s (`FxBudget::capAlpha`) and goes. With the busy level:
+  puffs x(1 - 0.3 level) in size, x(1 - 0.4 level) in opacity, and smoke / dust / sparks / debris thinned to
+  (1 - 0.55 level) (a hashed counter, not the effects' RNG - calm scenes stay bit-identical); cinematic cool smoke
+  drifts towards a pale sandy haze (and less soot) as the level rises. Flashes, flames, the fireball's core, ground
+  marks stay. Clean = level >= 0.7 always.
+- **Ground dust** (Reimagined: vehicle dust trails, placement dust ring; docs/3d-mode.md "Atmosphere") is not a battle
+  event and not thinned by the busy level; the intensity scales it directly (Clean 0.6, Balanced 0.8, Cinematic 1).
+- **Lasting columns** (burning wrecks / ruins / burning buildings) keep their smoke, but: a vehicle wreck burning
+  within 48 px (~1.5 tiles) of another stokes that one instead of starting its own (cinematic `addBurner`: 48 px
+  instead of 20; burning-building fire points within 48 px of a stronger one feed its column); only so many columns
+  per screen area (Balanced 7, Clean 3 per reference area; `FxBudget::columnCap`) - past it the oldest die down over
+  a few seconds; their emission rate / puff life x(1 - 0.35 busy) (Clean x0.45).
+- **Units stay readable** (`Effects::updateSeeThrough`, `CinematicFx::seeThrough`): every alpha-blended puff eases
+  (10/s) a `clear` towards how much it covers a unit (screen-plane distance from the puff's middle against its
+  radius + the unit's; cinematic: only puffs in front of the unit) and its opacity is x(1 - clear): down to 38 %
+  over units (20 % over the player's selected units and buildings) in Balanced, 25 / 12 % in Clean, 75 / 55 % in
+  Cinematic (the "light" version). Health bars and selection markers are drawn after the effects in 2D / as the 3D
+  overlay; the 3D selection rings lie under the unit, where the smoke is see-through.
+- **Cinematic** = no budget: everything spawns as before (calm scenes and busy ones bit-identical to before apart
+  from the light see-through).
+- Measurement switches (no effect otherwise): `D2K_FX_HIDE=1` simulates the particles but draws none (2D, 3D,
+  cinematic), `D2K_HIDE_UNITS=1` draws no ground units, `D2K_RECORD_EVERY=K` records every K-th frame;
+  `D2K_VFX_DEMO=bigfight` (32 tanks a side, two buildings destroyed) and `D2K_VFX_DEMO=single` (one event at a time in
+  an empty area). Numbers: ~/Desktop/d2k-compare/effects-readability/README.md.
 
 ### Presentation
 - **Smooth turning**: vehicles with 32 direction frames ease their body and turret facing towards
@@ -1183,7 +1236,7 @@ the flyers and the projectiles, then particles and lights (`drawAir`), then the 
 vignette (`drawPost`). Effects under full shroud are not spawned, and the shroud covers the rest.
 
 ### Performance
-Particles are capped at 9000 and tread marks at 4000 in a ring. Everything is drawn in four
+Particles are capped at 9000 and track-mark trail nodes at 8192 in a ring (2D stamps at the `stamp` nodes). Everything is drawn in four
 `SDL_RenderGeometry` batches (ground, alpha, light, additive) from one 768x64 procedural texture
 atlas (glow, smoke, spark, debris, flame, ring, soft, premultiplied glow, wave, gas, arc, line). A
 sonic beam is about 500-800 strips; four sonic tanks and four deviators firing at once at zoom 2

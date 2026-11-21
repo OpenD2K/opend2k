@@ -2,6 +2,7 @@
 
 #include "platform/audio.hpp"
 #include "platform/cheat_menu.hpp"
+#include "platform/community_menu.hpp"
 #include "platform/campaign_screens.hpp"
 #include "platform/game_options.hpp"
 #include "platform/pointer.hpp"
@@ -13,6 +14,7 @@
 #include "platform/sound_bank.hpp"
 #include "platform/ui.hpp"
 #include "render/art_pack.hpp"
+#include "render/mem_stats.hpp"
 #include "render/frame_probe.hpp"
 #include "render/bloom.hpp"
 #include "render/hdr.hpp"
@@ -44,6 +46,11 @@
 #include <sstream>
 
 namespace d2k::platform {
+
+// Settings::EffectsIntensity maps onto render::FxIntensity by value (Session sets it on the effects every frame).
+static_assert(int(Settings::EffectsIntensity::Clean) == int(render::FxIntensity::Clean) &&
+              int(Settings::EffectsIntensity::Balanced) == int(render::FxIntensity::Balanced) &&
+              int(Settings::EffectsIntensity::Cinematic) == int(render::FxIntensity::Cinematic));
 
 namespace {
 
@@ -206,13 +213,23 @@ Session::Session(SDL_Renderer* r, std::unique_ptr<GameData> data, Settings& sett
         SDL_Log("UI_ENG.R16 missing or incomplete: the Original graphics mode uses the modern panel");
     }
 
-    cam_.zoom = cfg_.zoom;
+    // The zoom of the last played game (Settings::lastZoom; owner 2026-11-14), unless --zoom asked for another:
+    // here at the start of every game (syncGraphics only runs when the graphics mode changes). The display's
+    // pixel density is applied by layout() (ppp_ starts at 1). Previews / one-frame runs: lastZoom is 0.
+    cam_.zoom = !cfg_.presetPreview && cfg_.zoom == 1.0f && settings_.lastZoom > 0.1f && !classicUi()
+                    ? std::clamp(settings_.lastZoom, 0.25f, 4.0f) : cfg_.zoom;
+    if (cam_.zoom != cfg_.zoom) SDL_Log("Zoom: %.2f (from the last game)", cam_.zoom);
     camTilt_ = cfg_.cameraTilt ? render3d::radians(std::clamp(*cfg_.cameraTilt, 0.0f, 66.0f)) : render3d::Camera3D::kDefaultTilt;
     camYaw_ = cfg_.cameraYaw ? render3d::radians(*cfg_.cameraYaw) : 0.0f;
     sync3d();
     if (classicPeekAvailable()) ensureClassicPeek();  // the classic view key: instant from the first press
     last_ = SDL_GetTicksNS();
     createWorld();
+    if (modelsAfterWorld_) {  // (syncModels in sync3d above waited for the world)
+        modelsAfterWorld_ = false;
+        syncModels();
+        last_ = SDL_GetTicksNS();  // the game starts after the models are read
+    }
     cursorMode_ = cfg_.cursorMode;
     // Phone layout screenshots: "drawer", "hide-ui", "radar-large", "radar-off", "idle", "awake", "place"
     // (the first buildable building follows --cursor-at), comma-separated.
@@ -263,7 +280,9 @@ Session::~Session() {
     // The day / night cycle continues in the next game from here (Settings::cyclePhase); previews and
     // one-frame runs never write settings (App::persist_), so only played games move it.
     // The zoom carries over to the next game too (Enhanced / 3D; the Original view has no zoom).
-    if (!cfg_.presetPreview && !classicUi() && ppp_ > 0) settings_.lastZoom = cam_.zoom / ppp_;
+    if (!cfg_.presetPreview && !classicUi() && ppp_ > 0)
+        settings_.lastZoom = (camSmooth_.zooming() ? camSmooth_.zoomTarget() : cam_.zoom) / ppp_;  // (a zoom glide: its end)
+    if (cameraLog_) std::fclose(cameraLog_);
     if (!cfg_.presetPreview && settings_.timeOfDay == Settings::TimeOfDay::Cycle && lastCycleSeconds_ > 0)
         settings_.cyclePhase = std::fmod(lastCycleSeconds_, render::cycleLength());
     // D2K_LOG_HASH: the world's state hash at the end (render-only features must not change it).
@@ -305,6 +324,8 @@ void Session::createWorld() {
         world_ = std::make_unique<game::World>(g.map, g.mission, g.tileAtr, g.tileData, rules, playerSide_,
                                                g.playAs() ? g.missionSide : -1);
     game::World& world = *world_;
+    // "Unit movement" (not original): a rule of this game (GameStart; a load overwrites it from the save).
+    world.setModernMovement(g.start.movement < 0 ? settings_.modernMovement : g.start.modernMovement());
     if (!g.start.skirmish) world.difficulty = std::clamp(g.start.sk.difficulty, 0, 2);  // gDifficultyLevel
     if (cfg_.battle) orderBattle(world);
     if (cfg_.selectAll) {
@@ -320,6 +341,8 @@ void Session::createWorld() {
     if (("," + cfg_.sidebarPage + ",").find(",demo-base,") != std::string::npos) demoBase(world, playerSide_);
     // D2K_PREVIEW_SCENE (check): the Graphics previews' scene (a base, tanks, infantry) on this map too.
     if (cfg_.presetPreview || std::getenv("D2K_PREVIEW_SCENE")) presetPreviewScene(world, playerSide_);
+    if (std::getenv("D2K_ATTACK_MOVE_DEMO"))
+        attackMoveDemoScene(world, playerSide_, cfg_.at ? cfg_.at->first - 8 : 4, cfg_.at ? cfg_.at->second : 4);
     if (const char* fd = std::getenv("D2K_FACING_DEMO"))
         facingDemoScene(world, playerSide_, fd, cfg_.at ? cfg_.at->first - 10 : 4, cfg_.at ? cfg_.at->second - 3 : 4);
     if (("," + cfg_.sidebarPage + ",").find(",demo-groups,") != std::string::npos) {
@@ -343,13 +366,28 @@ void Session::createWorld() {
         if (std::strchr(bu, 'g')) {  // g: a gallery from cell (2, 2): a row of buildings per house (sides 0..2)
             static const char* kHouse[] = {"ATREIDES ", "HARKONNEN ", "ORDOS "};
             static const char* kRow[] = {"CONSTRUCTION YARD", "REFINERY", "BARRACKS", "WIND TRAP", "HEAVY FACTORY", "PALACE"};
-            for (int h = 0; h < 3; ++h) {
+            // D2K_BUILDUP_AT=x,y moves the gallery; D2K_BUILDUP_ROW="REFINERY,HEAVY FACTORY" picks its buildings,
+            // D2K_BUILDUP_HOUSES=n its rows (drop-in recordings, docs/3d-mode.md "Drop-in build-up").
+            int gx = 2, gy = 2, houses = 3;
+            if (const char* at = std::getenv("D2K_BUILDUP_AT")) std::sscanf(at, "%d,%d", &gx, &gy);
+            if (const char* hs = std::getenv("D2K_BUILDUP_HOUSES")) houses = std::clamp(std::atoi(hs), 1, 3);
+            std::vector<std::string> row(std::begin(kRow), std::end(kRow));
+            if (const char* r = std::getenv("D2K_BUILDUP_ROW")) {
+                row.clear();
+                std::string s = r;
+                for (std::size_t a = 0; a <= s.size();) {
+                    const std::size_t e = std::min(s.find(',', a), s.size());
+                    if (e > a) row.push_back(s.substr(a, e - a));
+                    a = e + 1;
+                }
+            }
+            for (int h = 0; h < houses; ++h) {
                 world.sides()[std::size_t(h)].house = h;
-                int x = 2;
-                for (const char* n : kRow)
+                int x = gx;
+                for (const std::string& n : row)
                     for (int ty = 0; ty < int(T.buildingCount); ++ty)
                         if (std::string(kHouse[h]) + n == T.buildingNames[ty]) {
-                            world.addBuilding(h, ty, x, 2 + h * 5, true, true, true);
+                            world.addBuilding(h, ty, x, gy + h * 5, true, true, true);
                             x += std::max(1, int(T.buildings[ty].artWidth) / 32) + 1;
                             break;
                         }
@@ -369,7 +407,10 @@ void Session::createWorld() {
             }
     }
     snd_.reset();  // FUN_0046f980 at mission start
+    if (models3d_) models3d_->settle();  // Assemble: the buildings that stand at the start do not assemble
     motion_.reset();
+    drive_.reset();
+    camSmooth_.reset();
     vmClock_ = -1;
     minimap_->rebuild(world, playerSide_);
     // Open the view on the player's first building or unit (unless --at is given).
@@ -419,6 +460,10 @@ void Session::showPausePage(const std::string& name) {
         showPauseOptions();
         if (name == "pause-options-end") pauseOptionsScroll_ = 1e6f;
     }
+    else if (name == "pause-briefing" || name == "pause-briefing-end") {  // -end: scrolled to the bottom
+        if (hasBriefing()) openBriefing();
+        if (name == "pause-briefing-end") briefingScroll_ = 1e6f;
+    }
     else if (name == "pause-save") showPauseSlots(true);
     else if (name == "pause-load") showPauseSlots(false);
     else if (name.rfind("pause-cheats", 0) == 0) {  // pause-cheats[-money|-tech|-build|-deliver|-spawn|-toggles]
@@ -427,21 +472,74 @@ void Session::showPausePage(const std::string& name) {
     }
 }
 
+// The in-game briefing page of this game (CInterface__Create: IG<h><n>MIS.UID), "" = none:
+// skirmish (INGAME_SKIRMISH has no Briefing button).
+std::string Session::recapFile() const {
+    const GameStart& st = data_->start;
+    int house = 0, mission = 0;
+    // (campaignHouse 3 = custom missions, 4 = community campaigns: platform/community_menu.hpp)
+    if (!st.skirmish && st.campaignHouse < 3 && CampaignScreens::parseCampaignMap(st.map, house, mission))
+        return std::string("IG") + "AHO"[house] + std::to_string(mission) + "MIS";
+    if (!st.skirmish && st.campaignHouse >= 3) {
+        // Custom missions: the patch's IG<house>0MIS page with the mission's own briefing.
+        const int h = std::clamp(world_->sides()[std::size_t(std::clamp(playerSide_, 0, 7))].house, 0, 2);
+        return std::string("IG") + "AHO"[h] + "0MIS";
+    }
+    return {};
+}
+
+// The text of the RECAP page for the Enhanced pause menu: its list box's "EnterText" keys in
+// order (Text.UIB in the current language: "Mission 1", then the IG_ text with the objective);
+// a key without text (custom missions) is the mission's own briefing.
+void Session::buildBriefing() {
+    if (briefingBuilt_) return;
+    briefingBuilt_ = true;
+    briefingHeading_.clear();
+    briefingText_.clear();
+    const GameStart& st = data_->start;
+    if (st.skirmish) return;
+    bool usedOwn = false;
+    auto add = [&](std::string t) {
+        const auto blank = [](char ch) { return ch == ' ' || ch == '\n' || ch == '\r'; };
+        while (!t.empty() && blank(t.back())) t.pop_back();
+        std::size_t lead = 0;
+        while (lead < t.size() && blank(t[lead])) ++lead;
+        t.erase(0, lead);
+        if (t.empty()) return;
+        if (!briefingText_.empty()) briefingText_ += "\n\n";
+        briefingText_ += t;
+    };
+    if (const std::string recap = recapFile(); !recap.empty()) {
+        OriginalUi res(r_);
+        res.setData(data_->dataDir, &data_->text);
+        if (const formats::UilPage* p = res.page(recap)) {
+            bool first = true;
+            for (const auto& w : p->widgets) {
+                if (w.kind != "LISTBOX") continue;
+                for (const auto& c : w.commands()) {
+                    if (c.rfind("EnterText ", 0) != 0) continue;
+                    std::string t = uiUtf8(res.text(c.substr(10)));
+                    if (t.empty() && !usedOwn) { t = st.briefing; usedOwn = true; }
+                    if (first && !t.empty() && t.find('\n') == std::string::npos && t.size() < 40) briefingHeading_ = t;
+                    else add(t);
+                    first = false;
+                }
+            }
+        }
+    }
+    if (!usedOwn && briefingText_.empty()) add(st.briefing);
+}
+
+bool Session::hasBriefing() {
+    buildBriefing();
+    return !briefingText_.empty();
+}
+
 void Session::ensurePages(Ui& ui) {
     if (pages_) return;
     pages_ = std::make_unique<InGamePages>(r_, ui, settings_);
     const GameStart& st = data_->start;
-    std::string recap;
-    int house = 0, mission = 0;
-    // (campaignHouse 3 = custom missions, 4 = community campaigns: platform/community_menu.hpp)
-    if (!st.skirmish && st.campaignHouse < 3 && CampaignScreens::parseCampaignMap(st.map, house, mission)) {
-        recap = std::string("IG") + "AHO"[house] + std::to_string(mission) + "MIS";
-    } else if (!st.skirmish && st.campaignHouse >= 3) {
-        // Custom missions: the patch's IG<house>0MIS page with the mission's own briefing.
-        const int h = std::clamp(world_->sides()[std::size_t(std::clamp(playerSide_, 0, 7))].house, 0, 2);
-        recap = std::string("IG") + "AHO"[h] + "0MIS";
-    }
-    pages_->setup(data_->dataDir, &data_->text, st.skirmish, recap, st.briefing);
+    pages_->setup(data_->dataDir, &data_->text, st.skirmish, recapFile(), st.briefing);
     pages_->saveGame = [this](int slot, const std::string& name, std::string& err) { return saveToSlot(slot, err, name); };
 }
 
@@ -471,7 +569,7 @@ void Session::drawOriginalMenu(Ui& ui) {
 }
 
 void Session::setPaused(bool p) {
-    if (p && !paused_) { pauseOpened_ = true; pauseOptions_ = false; pauseSlots_ = 0; }
+    if (p && !paused_) { pauseOpened_ = true; pauseOptions_ = false; pauseSlots_ = 0; pauseBriefing_ = false; }
     paused_ = p;
     leftDown_ = dragging_ = minimapDrag_ = false;
     last_ = SDL_GetTicksNS();
@@ -509,12 +607,15 @@ bool Session::saveToSlot(int slot, std::string& error, const std::string& name) 
 
 void Session::applySave(const game::SaveMeta& meta, std::span<const std::uint8_t> worldSection) {
     game::loadWorldState(*world_, worldSection, meta.version);
+    if (models3d_) models3d_->settle();  // Assemble: a loaded game's buildings stand finished
     playerSide_ = world_->mySide();
     mapRenderer_->playerSide = playerSide_;
     cam_.x = meta.cameraX;
     cam_.y = meta.cameraY;
     if (meta.cameraZoom > 0.1f && settings_.enhanced()) cam_.zoom = meta.cameraZoom * ppp_;
     motion_.reset();
+    drive_.reset();
+    camSmooth_.reset();
     vmClock_ = -1;
     snapCamera_ = true;
     minimap_->rebuild(*world_, playerSide_);
@@ -561,6 +662,8 @@ SDL_Rect Session::battlefieldRect() const {
 void Session::runTicks(int n) {
     for (int t = 0; t < n; ++t) world_->tick();
     motion_.reset();
+    drive_.reset();
+    camSmooth_.reset();
     vmClock_ = -1;
     minimap_->rebuild(*world_, playerSide_);
 }
@@ -595,6 +698,7 @@ void Session::syncGraphics() {
     pauseOpened_ = paused_;
     pauseOptions_ = false;
     pauseSlots_ = 0;
+    pauseBriefing_ = false;
     SDL_Log("Graphics: %s", Settings::graphicsName(settings_.graphics));
     appliedArtPack_ = enhanced ? "upscaled" : "";  // the textures just built
     appliedTerrainKey_ = enhanced ? "hq|" : "classic";
@@ -653,10 +757,23 @@ void Session::sync3d() {
 // are billboards of the 3D art pack's redesigned frames (syncVisuals), never the original sprites.
 void Session::syncModels() {
     if (!r3d_) return;
+    // The models a game needs depend on its world (render3d::ModelRenderer::wantedFor): read once it exists.
+    if (!world_) {
+        modelsAfterWorld_ = true;
+        return;
+    }
     using M = Settings::Models3D;
     const M src = settings_.models3d;
     const std::string pack = src == M::New ? render3d::ModelRenderer::packPath(settings_.modelPack) : std::string();
-    const std::string key = std::string(Settings::models3dName(src)) + "|" + (src == M::Ps1 ? settings_.ps1Image : pack);
+    // Reimagined look: the Reimagined model pack (artpacks/models-reimagined) over the 3D art pack's models
+    // (docs/3d-models.md "Reimagined models"); without it, or with Reimagined off, the models as before.
+    std::string overlay;
+    if (src == M::New && settings_.reimagined && !pack.empty()) {
+        overlay = render3d::ModelRenderer::packPath(render3d::ModelRenderer::kReimaginedPack);
+        if (overlay == pack) overlay.clear();
+    }
+    std::string key = std::string(Settings::models3dName(src)) + "|" + (src == M::Ps1 ? settings_.ps1Image : pack);
+    if (!overlay.empty()) key += "|" + overlay;
     if (key == appliedModels_ && models3d_) {
         r3d_->setModelHook(models3d_.get());  // a re-created Renderer3D
         return;
@@ -669,10 +786,15 @@ void Session::syncModels() {
             modelsJobKey_ = key;
             r3d_->setModelHook(nullptr);  // billboards until the models are in
             modelsJob_ = std::async(std::launch::async, [t = &data_->templates, c = &data_->colours, ma = &data_->modArt, rs,
-                                                         ps1 = settings_.ps1Image, pack] {
+                                                         ps1 = settings_.ps1Image, pack, overlay,
+                                                         want = render3d::ModelRenderer::wantedFor(data_->templates, *world_),
+                                                         caps = render3d::modelTextureCaps(render3d::gpuDeviceOf(r_))] {
                 const Uint64 t0 = SDL_GetTicks();
                 auto m = std::make_unique<render3d::ModelRenderer>(*t, *c);
                 m->setModelKeys(ma->unitKeyName, ma->unitKeyGroup, ma->buildingKeyName, ma->buildingKeyGroup);  // (as below)
+                m->setOverlayPack(overlay);
+                m->setTextureCaps(caps);
+                m->setWanted(want);
                 m->load(rs, ps1, pack);
                 SDL_Log("3D models: %d unit + %d building models read in %llu ms (background)", m->unitModels(), m->buildingModels(),
                         (unsigned long long)(SDL_GetTicks() - t0));
@@ -682,6 +804,7 @@ void Session::syncModels() {
         }
         if (modelsJob_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
         models3d_ = std::move(*modelsJob_.get());  // valid() is false from here
+        models3d_->upload(render3d::gpuDeviceOf(r_));
         appliedModels_ = key;
         r3d_->setModelHook(models3d_.get());
         snapCamera_ = true;
@@ -698,9 +821,14 @@ void Session::syncModels() {
     }
     if (src == M::New && pack.empty()) SDL_Log("3D models: no model pack found (artpacks/<name>/models)");
     const Uint64 t0 = SDL_GetTicks();
+    models3d_->setOverlayPack(overlay);
+    models3d_->setTextureCaps(render3d::modelTextureCaps(render3d::gpuDeviceOf(r_)));
+    models3d_->setWanted(render3d::ModelRenderer::wantedFor(data_->templates, *world_));
     models3d_->load(rs, settings_.ps1Image, pack);
     SDL_Log("3D models: %d unit + %d building models read in %llu ms", models3d_->unitModels(), models3d_->buildingModels(),
             (unsigned long long)(SDL_GetTicks() - t0));
+    render::mem::checkpoint("3D models read");
+    models3d_->upload(render3d::gpuDeviceOf(r_));
     r3d_->setModelHook(models3d_.get());
     snapCamera_ = true;
     logModelCoverage();
@@ -745,13 +873,48 @@ void Session::logModelCoverage() const {
     if (campaign) SDL_Log("3D coverage: %d types drawn with the campaign's own sprites (render/mod_art.hpp)", campaign);
 }
 
+// World beyond the map (Graphics: 3D, Reimagined; docs/3d-mode.md): is it shown - the 3D camera may then
+// scroll kSurroundScroll past the map's edges.
+bool Session::surroundWanted() const {
+    static const bool off = std::getenv("D2K_SURROUND_OFF") != nullptr;
+    return view3d() && settings_.reimagined && settings_.mapSurroundings && !off &&
+           settings_.terrain3d == Settings::Terrain3D::Faithful;
+}
+
+// Realistic grade (Graphics: 3D, Reimagined; docs/3d-mode.md "Realistic grade"): is it shown?
+bool Session::naturalGradeWanted() const {
+    static const bool off = std::getenv("D2K_GRADE_OFF") != nullptr;
+    return view3d() && settings_.reimagined && settings_.naturalGrade && !off &&
+           settings_.terrain3d == Settings::Terrain3D::Faithful;
+}
+
+// A red cross where a click (or the moving pointer) lies on the land beyond the map. Feedback only: the
+// click's own handling (orders, selection, placement) is not touched.
+void Session::markOutside(float sx, float sy, bool click) {
+    const render3d::Renderer3D* v = view3d();
+    if (!v || !v->ready() || !v->surroundActive() || paused_) return;
+    float wx = 0, wy = 0;
+    if (!v->outsidePoint(sx, sy, wx, wy)) return;
+    if (click) orderFeedback_.addOutside(wx, wy);
+    else orderFeedback_.hoverOutside(wx, wy);
+}
+
 void Session::screenToWorld(float sx, float sy, float& wx, float& wy, bool units) const {
+    // Units are picked where they are drawn (interpolated / eased, render::MotionInterpolator), and
+    // the point is then moved by that unit's drawn -> simulated offset (Enhanced / 3D).
+    const bool drawn = units && pickDrawn();
     if (view3d() && view3d()->ready()) {
+        if (drawn) motion_.applyDrawn(*world_);
         const bool hit = units ? view3d()->pick(*world_, sx, sy, wx, wy) : view3d()->screenToGround(sx, sy, wx, wy);
-        if (hit) return;
+        if (drawn) motion_.restoreDrawn(*world_);
+        if (hit) {
+            if (drawn) motion_.toSim(*world_, wx, wy);
+            return;
+        }
     }
     wx = cam_.x + sx / cam_.zoom;
     wy = cam_.y + sy / cam_.zoom;
+    if (drawn) motion_.toSim(*world_, wx, wy);
 }
 
 // A selection box keeps its start point on the battlefield while the view scrolls (owner 2026-11-14:
@@ -1075,6 +1238,17 @@ void Session::playSoundEvents(const game::World& world) {
     }
 }
 
+// Drop-in build-up (render/building_dropin.hpp): the landing thud - the original's concrete placement
+// sound (S_BUILDCONC) at the building, one per frame, only for landings in view (Effects reports those).
+void Session::playDropInSounds(const game::World& world, const render::Effects& fx) {
+    if (fx.dropInImpacts().empty() || !out_->ok() || !sounds_) return;
+    static const int kThud = sounds_->idOf("S_BUILDCONC");
+    if (kThud < 0) return;
+    const auto& im = fx.dropInImpacts().front();
+    game::SoundSystem::playAt(*out_, kThud, int(im.x0 + im.x1) / 64, int(im.y0 + im.y1) / 64, soundView(), world.width(),
+                              sfxVolume());
+}
+
 // Top-left tile of the placement footprint, centred on the cursor. Concrete keeps the
 // original anchor (Display__DrawConcretePlacementMarkers 0x4288d0: the cursor cell is the
 // top-left of the 4x4 tilesOccupiedSolid mask).
@@ -1087,7 +1261,20 @@ std::pair<int, int> Session::placementTile(float sx, float sy) const {
     return {int(wx) / 32 - (fw - 1) / 2, int(wy) / 32 - (fh - 1) / 2};
 }
 
+// Picking / box selection with the units where they are drawn (Session::pickDrawn), for one call.
+struct Session::DrawnScope {
+    const Session& s;
+    bool on;
+    explicit DrawnScope(const Session& ss) : s(ss), on(ss.pickDrawn() && ss.world_) {
+        if (on) s.motion_.applyDrawn(*s.world_);
+    }
+    ~DrawnScope() {
+        if (on) s.motion_.restoreDrawn(*s.world_);
+    }
+};
+
 void Session::selectInRect(float x0, float y0, float x1, float y1, bool additive) {
+    const DrawnScope drawn(*this);
     if (x0 > x1) std::swap(x0, x1);
     if (y0 > y1) std::swap(y0, y1);
     const bool click = (x1 - x0) < 4 && (y1 - y0) < 4;
@@ -1155,6 +1342,7 @@ bool Session::anyUnitSelected() const {
 // (not carried/flying 0x140, not still leaving a factory, not state 0x11). Only when there is
 // at least one does it replace the selection. Shift adds instead (not original).
 bool Session::originalBoxSelect(float x0, float y0, float x1, float y1, bool additive) {
+    const DrawnScope drawn(*this);
     const int wx0 = int(cam_.x + std::min(x0, x1) / cam_.zoom), wx1 = int(cam_.x + std::max(x0, x1) / cam_.zoom);
     const int wy0 = int(cam_.y + std::min(y0, y1) / cam_.zoom), wy1 = int(cam_.y + std::max(y0, y1) / cam_.zoom);
     auto& me = world_->sides()[playerSide_];
@@ -1330,12 +1518,66 @@ void Session::orderFeedback(Feedback kind, float wx, float wy, int targetSide, i
     case Feedback::RadarMove:
         if (!original) orderFeedback_.addMove(wx, wy, false);
         break;
+    case Feedback::AttackMove:  // not original: the puff like a move (Original), an orange ring (Enhanced / 3D)
+        if (original) orderFeedback_.addPuff(int(wx), int(wy));
+        else orderFeedback_.addAttackMove(wx, wy);
+        break;
+    case Feedback::RadarAttackMove:
+        if (!original) orderFeedback_.addAttackMove(wx, wy);
+        break;
     case Feedback::AttackUnit:
     case Feedback::AttackBuilding:
         // Only the target's blink (its flicker counter, as in the original; Enhanced draws it as a brief
         // brightening) - no red ring around it (owner 2026-11-14: "I don't like this red circle").
         break;
     }
+}
+
+// Attack-move input (not original; Settings::attackMove, game/attack_move.cpp).
+bool Session::attackMoveHeld() const {
+    int n = 0;
+    const bool* keys = SDL_GetKeyboardState(&n);
+    // The physical A key (scancode), so it works with any keyboard layout (a Russian layout has no "a"
+    // keycode - the owner's attack-move did nothing there). Same for the other letter hotkeys.
+    const SDL_Scancode sc = SDL_SCANCODE_A;
+    if (!keys || sc <= SDL_SCANCODE_UNKNOWN || int(sc) >= n || !keys[sc]) return false;
+    return (SDL_GetModState() & (SDL_KMOD_CTRL | SDL_KMOD_GUI | SDL_KMOD_ALT)) == 0;
+}
+
+bool Session::attackMoveActive() const {
+    return settings_.attackMove && !touchInput_ && cursorMode_ == 0 && placingType_ < 0 &&
+           (attackMoveArmed_ || attackMoveHeld());
+}
+
+bool Session::attackMoveClick(float wx, float wy) {
+    attackMoveArmed_ = false;
+    game::World& world = *world_;
+    const int side = playerSide_;
+    const int tx = int(wx) >> 5, ty = int(wy) >> 5;
+    if (!world.inBounds(tx, ty) || !anyUnitSelected()) return false;
+    // A visible enemy under the cursor: the ordinary attack order on it.
+    if (!(mapRenderer_->showShroud && world.shrouded(tx, ty))) {
+        int os = -1, oi = -1;
+        bool enemy = false;
+        if (const game::Unit* u = world.unitAt(int(wx), int(wy), os, oi))
+            enemy = os != side && world.diplomacy(side, os) != 0 && !(u->flags & game::unit_flags::kExcluded) &&
+                    !(u->flags & game::unit_flags::kCloaked);
+        if (!enemy && world.buildingAt(tx, ty, os, oi)) enemy = os != side && world.diplomacy(side, os) != 0;
+        if (enemy) {
+            const game::SmartOrder r = world.smartOrder(side, int(wx), int(wy), false, false);
+            logOrder("attack-move click", r, int(wx), int(wy));
+            if (r == game::SmartOrder::AttackUnit || r == game::SmartOrder::TurretAttackUnit)
+                orderFeedback(Feedback::AttackUnit, wx, wy, os, oi);
+            else if (r == game::SmartOrder::AttackBuilding || r == game::SmartOrder::TurretAttackBuilding)
+                orderFeedback(Feedback::AttackBuilding, wx, wy, os, oi);
+            if (r == game::SmartOrder::AttackUnit || r == game::SmartOrder::AttackBuilding) unitResponse(true);
+            if (r != game::SmartOrder::None) return true;
+        }
+    }
+    if (world.orderGroupAttackMove(side, tx, ty) == 0) return false;  // the selected units (Order limit)
+    orderFeedback(Feedback::AttackMove, wx, wy);
+    unitResponse(true);
+    return true;
 }
 
 // An order through the radar / minimap at world point (wx, wy). Plain: GenerateUnitMoveOrder to
@@ -1350,6 +1592,13 @@ bool Session::minimapOrder(float wx, float wy, bool smart) {
     const int tx = int(wx) >> 5, ty = int(wy) >> 5;
     if (!world.inBounds(tx, ty)) return false;
     const float cx = tx * 32.0f + 16, cy = ty * 32.0f + 16;
+    if (attackMoveActive()) {  // not original: attack-move there
+        attackMoveArmed_ = false;
+        if (world.orderGroupAttackMove(side, tx, ty) == 0) return false;
+        unitResponse(true);
+        orderFeedback(Feedback::RadarAttackMove, cx, cy);
+        return true;
+    }
     if (smart && !(mapRenderer_->showShroud && world.shrouded(tx, ty))) {
         const SDL_Keymod mod = SDL_GetModState();
         game::SmartOrder r =
@@ -1389,8 +1638,31 @@ bool Session::minimapPoint(float sx, float sy, float& wx, float& wy) const {
 bool Session::centreFromMinimap(float sx, float sy) {
     float wx = 0, wy = 0;
     if (!minimapPoint(sx, sy, wx, wy)) return false;
-    centreViewOn(wx, wy);
+    glideViewOn(wx, wy);
     return true;
+}
+
+void Session::glideViewOn(float wx, float wy) {
+    if (!smoothCam() || view3d() || classicUi() || !world_) {  // 3D: render3d::Camera3D eases the jump itself
+        camSmooth_.cancelGlide();
+        centreViewOn(wx, wy);
+        return;
+    }
+    render::Camera to = cam_;
+    to.x = wx - viewW_ / (2 * cam_.zoom);
+    to.y = wy - viewH_ / (2 * cam_.zoom);
+    clampCamera(to, data_->scenario, viewW_, viewH_);
+    camSmooth_.cancelZoom();
+    // Near (within ~1.5 views): a quick glide; farther: a cut (a long glide only smears the map).
+    const float vw = viewW_ / cam_.zoom, vh = viewH_ / cam_.zoom;
+    if (std::abs(to.x - cam_.x) <= 1.5f * vw && std::abs(to.y - cam_.y) <= 1.5f * vh) {
+        camSmooth_.glideTo(to.x, to.y);
+    } else {
+        camSmooth_.cancelGlide();
+        camSmooth_.stop();
+        cam_.x = to.x;
+        cam_.y = to.y;
+    }
 }
 
 void Session::centreViewOn(float wx, float wy) {
@@ -1555,6 +1827,10 @@ bool Session::handleClassicEvent(SDL_Event& e) {
                     minimapOrder(rwx + 16.0f, rwy + 16.0f, true);
                     return true;
                 }
+                if (e.button.button == SDL_BUTTON_LEFT && attackMoveActive() && anyUnitSelected()) {
+                    minimapOrder(rwx + 16.0f, rwy + 16.0f, false);  // attack-move (not original)
+                    return true;
+                }
                 if (e.button.button == SDL_BUTTON_LEFT) {
                     cam_.x = rwx - viewW_ / (2 * cam_.zoom);
                     cam_.y = rwy - viewH_ / (2 * cam_.zoom);
@@ -1698,7 +1974,7 @@ void Session::classicMapClick(float mx, float my) {
 
 void Session::handleEvent(const SDL_Event& ev) {
     // Ctrl+Shift+C: the cheats page (also while paused; again closes it). Off with Settings::cheats.
-    if (settings_.cheats && ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_C && !ev.key.repeat && (ev.key.mod & SDL_KMOD_CTRL) &&
+    if (settings_.cheats && ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_C && !ev.key.repeat && (ev.key.mod & SDL_KMOD_CTRL) &&
         (ev.key.mod & SDL_KMOD_SHIFT) && result_ == SessionResult::None) {
         if (cheatsOpen_) {
             cheatsOpen_ = false;
@@ -1728,37 +2004,66 @@ void Session::handleEvent(const SDL_Event& ev) {
     const bool ended = world.gameEndState() != game::GameEnd::None;
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
+        if (e.key.key == SDLK_ESCAPE && attackMoveArmed_) {  // Esc first drops a pending attack-move
+            attackMoveArmed_ = false;
+            break;
+        }
+        // Attack-move (not original): A then a click (Modern controls, like StarCraft); holding A
+        // works in both schemes (attackMoveHeld).
+        if (e.key.scancode == SDL_SCANCODE_A && !e.key.repeat && settings_.attackMove && !originalControls() &&
+            !(e.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI | SDL_KMOD_ALT)) && anyUnitSelected())
+            attackMoveArmed_ = true;
         if (e.key.key == SDLK_ESCAPE) {
             if (cheatMenu_ && cheatMenu_->placing()) cheatMenu_->cancelPlacing();
             else if (placingType_ >= 0) placingType_ = -1;
             else if (!ended) setPaused(true);
             break;
         }
-        if (e.key.key == SDLK_P && !ended) { setPaused(true); break; }
+        if (e.key.scancode == SDL_SCANCODE_P && !ended) { setPaused(true); break; }
         if (view3d() && e.key.key == SDLK_HOME) {  // 3D: camera back to north-up, default tilt
             camYaw_ = std::round(camYaw_ / (2 * render3d::kPi)) * 2 * render3d::kPi;
             camTilt_ = render3d::Camera3D::kDefaultTilt;
             break;
         }
-        if (e.key.key == SDLK_M) mapRenderer_->showMarkers = !mapRenderer_->showMarkers;
-        if (e.key.key == SDLK_F) mapRenderer_->showShroud = !mapRenderer_->showShroud;
+        // (M debug markers / F shroud view are cheats now: the Cheats page's Toggles - owner 2026-11-15.)
         {
             auto& me = world.sides()[side];
-            if (e.key.key == SDLK_S)  // GenerateStopOrder 0x459c40 (max 64)
+            if (e.key.scancode == SDL_SCANCODE_S)  // GenerateStopOrder 0x459c40 (max 64)
                 for (int i : world.orderGroup(side)) world.orderStop(side, i);
-            if (e.key.key == SDLK_D)
+            if (e.key.scancode == SDL_SCANCODE_D)
                 for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
                     if (me.units[i].selected && world.canDeploy(side, i)) world.orderDeploy(side, i);
             if (e.key.key >= SDLK_0 && e.key.key <= SDLK_9) {
                 // Control groups (UI-side): Ctrl+N assigns, N selects; 0 is group 10.
                 const int grp = e.key.key == SDLK_0 ? 10 : int(e.key.key - SDLK_1) + 1;
-                controlGroup(grp, (SDL_GetModState() & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0);
+                const bool assign = (SDL_GetModState() & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0;
+                controlGroup(grp, assign);
+                // Smooth camera (not original): the same group key twice within 0.4 s centres the
+                // view on the group (a glide when near).
+                const Uint64 nowNs = SDL_GetTicksNS();
+                if (!assign && !e.key.repeat && smoothCam() && grp == lastGroupKey_ && nowNs - lastGroupKeyNs_ < 400000000ull) {
+                    double sx = 0, sy = 0;
+                    int n = 0;
+                    for (int i = me.firstUnit; i != -1; i = me.nextObject(i))
+                        if (me.units[i].alive && me.units[i].selected) {
+                            sx += game::fixToPixel(me.units[i].posX);
+                            sy += game::fixToPixel(me.units[i].posY);
+                            ++n;
+                        }
+                    if (n > 0) glideViewOn(float(sx / n), float(sy / n));
+                    lastGroupKey_ = -1;
+                } else if (!e.key.repeat) {
+                    lastGroupKey_ = assign ? -1 : grp;
+                    lastGroupKeyNs_ = nowNs;
+                }
             }
         }
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         if (view3d() && e.button.button == SDL_BUTTON_MIDDLE && e.button.x < viewW_) { middleDrag_ = true; break; }
         if (ended) break;  // the end prompt takes clicks
+        // World beyond the map: a click on the land out there shows a red cross (the click itself goes on as ever).
+        if (!overUi(e.button.x, e.button.y)) markOutside(e.button.x, e.button.y, true);
         if (!classicUi()) {
             const float x = e.button.x, y = e.button.y;
             const int button = e.button.button;
@@ -1788,10 +2093,10 @@ void Session::handleEvent(const SDL_Event& ev) {
             // deselects. Modern controls: left = camera (drag), right = order there (minimapOrder).
             if (float mwx = 0, mwy = 0; minimapPoint(x, y, mwx, mwy)) {
                 if (button == SDL_BUTTON_LEFT) {
-                    if (originalControls() && anyUnitSelected()) {
+                    if ((originalControls() || attackMoveActive()) && anyUnitSelected()) {
                         minimapOrder(mwx, mwy, false);
                     } else {
-                        centreViewOn(mwx, mwy);
+                        glideViewOn(mwx, mwy);
                         minimapDrag_ = true;
                     }
                 } else if (button == SDL_BUTTON_RIGHT) {
@@ -1864,6 +2169,8 @@ void Session::handleEvent(const SDL_Event& ev) {
         if (e.button.button == SDL_BUTTON_RIGHT) {
             dragging_ = true;
             rightMoved_ = false;
+            camSmooth_.dragBegin();  // (also stops a glide / coasting view: the hand holds the map)
+            camSmooth_.cancelGlide();
             rightPressX_ = e.button.x;
             rightPressY_ = e.button.y;
             // Original controls: a right click on the battlefield ALWAYS deselects (owner 2026-11-14; the
@@ -1888,6 +2195,9 @@ void Session::handleEvent(const SDL_Event& ev) {
             sidebar_->mouseUp();
         }
         if (e.button.button == SDL_BUTTON_RIGHT) {
+            // Smooth camera: a drag pan let go while moving keeps some of its speed (a flick).
+            if (dragging_ && rightMoved_ && smoothCam())
+                camSmooth_.dragRelease(double(SDL_GetTicksNS()) / 1e9, 6000.0f / cam_.zoom);
             dragging_ = false;
             if (!rightMoved_ && e.button.x < viewW_ && !ended) {
                 if (originalControls()) {
@@ -1901,7 +2211,11 @@ void Session::handleEvent(const SDL_Event& ev) {
                     float wx = 0, wy = 0;
                     screenToWorld(e.button.x, e.button.y, wx, wy);
                     const SDL_Keymod mod = SDL_GetModState();
-                    if (settings_.rallyPoints && rallyClick(world, side, int(wx), int(wy))) {
+                    const bool attackMove = settings_.attackMove && attackMoveHeld() && cursorMode_ == 0;
+                    attackMoveArmed_ = false;  // a right click drops "A then click"
+                    if (attackMove && attackMoveClick(wx, wy)) {
+                        // A + right click: attack-move (not original)
+                    } else if (settings_.rallyPoints && rallyClick(world, side, int(wx), int(wy))) {
                         uiSound("BUTTON");
                     } else {
                         game::SmartOrder r = world.smartOrder(side, int(wx), int(wy), (mod & SDL_KMOD_CTRL) != 0,
@@ -1939,13 +2253,25 @@ void Session::handleEvent(const SDL_Event& ev) {
                     const bool alt = (SDL_GetModState() & SDL_KMOD_ALT) != 0;  // Alt: factory rally point (not original)
                     float rwx = 0, rwy = 0;
                     if (!box && alt) screenToWorld(e.button.x, e.button.y, rwx, rwy, false);
+                    float awx = 0, awy = 0;
+                    const bool attackMove = !box && attackMoveActive();  // A + left click (not original)
+                    if (attackMove) screenToWorld(e.button.x, e.button.y, awx, awy);
                     if (!box && alt && settings_.rallyPoints && rallyClick(world, side, int(rwx), int(rwy)))
                         uiSound("BUTTON");
-                    else if (!box) originalLeftClick(e.button.x, e.button.y);
+                    else if (attackMove && attackMoveClick(awx, awy)) {
+                    } else if (!box) originalLeftClick(e.button.x, e.button.y);
                     else if (originalBoxSelect(leftX_, leftY_, e.button.x, e.button.y, shift)) unitResponse(false);
                 } else {
-                    selectInRect(leftX_, leftY_, e.button.x, e.button.y, shift);
-                    unitResponse(false);
+                    // A then left click / A + left click: attack-move (not original); a drag still selects.
+                    const bool box = std::abs(e.button.x - leftX_) >= 4 && std::abs(e.button.y - leftY_) >= 4;
+                    float awx = 0, awy = 0;
+                    const bool attackMove = !box && attackMoveActive();
+                    if (attackMove) screenToWorld(e.button.x, e.button.y, awx, awy);
+                    attackMoveArmed_ = false;
+                    if (!(attackMove && attackMoveClick(awx, awy))) {
+                        selectInRect(leftX_, leftY_, e.button.x, e.button.y, shift);
+                        unitResponse(false);
+                    }
                 }
             }
             leftDown_ = false;
@@ -1954,6 +2280,8 @@ void Session::handleEvent(const SDL_Event& ev) {
     case SDL_EVENT_MOUSE_MOTION:
         mouseX_ = e.motion.x;
         mouseY_ = e.motion.y;
+        if (!dragging_ && !minimapDrag_ && !middleDrag_ && !ended && !overUi(e.motion.x, e.motion.y))
+            markOutside(e.motion.x, e.motion.y, false);  // the pointer over the land beyond the map
         if (minimapDrag_ && !classicUi()) centreFromMinimap(e.motion.x, e.motion.y);
         if (dragging_) {
             // A right click that wobbles a few px is still a click (deselect / order), not a pan: only a
@@ -1962,6 +2290,7 @@ void Session::handleEvent(const SDL_Event& ev) {
             const float tol = 6.0f * std::max(1.0f, pixelsPerPoint(r_));
             if (std::abs(e.motion.x - rightPressX_) > tol || std::abs(e.motion.y - rightPressY_) > tol) rightMoved_ = true;
             panView(-e.motion.xrel / cam_.zoom, -e.motion.yrel / cam_.zoom);
+            if (rightMoved_) camSmooth_.dragSample(-e.motion.xrel / cam_.zoom, -e.motion.yrel / cam_.zoom, double(SDL_GetTicksNS()) / 1e9);
         }
         if (middleDrag_ && view3d()) {  // 3D: middle drag turns (x) and tilts (y) the camera
             camYaw_ += e.motion.xrel * 0.006f;
@@ -1979,6 +2308,13 @@ void Session::handleEvent(const SDL_Event& ev) {
         if (overUi(mx, my)) break;
         if (view3d() && (SDL_GetModState() & SDL_KMOD_CTRL)) {  // 3D: Ctrl+wheel tilts
             camTilt_ = std::clamp(camTilt_ - e.wheel.y * 0.06f, render3d::Camera3D::kMinTilt, render3d::Camera3D::kMaxTilt);
+            break;
+        }
+        if (smoothCam() && !view3d() && !classicUi()) {
+            // Smooth camera: the wanted zoom moves, the shown one glides there around the cursor
+            // (applyCameraSmoothing). 3D eases its own camera (render3d::Camera3D).
+            camSmooth_.cancelGlide();
+            camSmooth_.zoomBy(e.wheel.y > 0 ? 1.1f : 1 / 1.1f, cam_.zoom, mx, my, 0.25f * ppp_, 4.0f * ppp_);
             break;
         }
         zoomAround(e.wheel.y > 0 ? 1.1f : 1 / 1.1f, mx, my);
@@ -2007,6 +2343,142 @@ void Session::zoomAround(float factor, float mx, float my) {
     cam_.zoom = std::clamp(cam_.zoom * factor, 0.25f * ppp_, 4.0f * ppp_);
     cam_.x = wx - mx / cam_.zoom;
     cam_.y = wy - my / cam_.zoom;
+}
+
+// Smooth camera (render/camera_smooth.hpp): one frame of the eased scrolling (want = the held keys'
+// / edges' velocity, view-aligned world px per second), the wheel zoom's glide (re-anchored at the
+// cursor point every step) and a minimap / group glide. The map-edge clamp in update() follows.
+void Session::applyCameraSmoothing(double dt, float wantX, float wantY) {
+    const float fdt = float(dt);
+    if (wantX != 0 || wantY != 0) camSmooth_.cancelGlide();  // the keys take over
+    float dx = 0, dy = 0;
+    camSmooth_.scroll(wantX, wantY, fdt, dx, dy);
+    if (dx != 0 || dy != 0) panView(dx, dy);
+    if (camSmooth_.zooming()) {
+        if (view3d() || classicUi()) {
+            camSmooth_.cancelZoom();
+        } else {
+            const float z = camSmooth_.zoomStep(cam_.zoom, fdt);
+            if (z != cam_.zoom) zoomAround(z / cam_.zoom, camSmooth_.anchorX(), camSmooth_.anchorY());
+        }
+    }
+    if (camSmooth_.gliding()) {
+        if (view3d() || classicUi()) camSmooth_.cancelGlide();
+        else camSmooth_.glideStep(cam_.x, cam_.y, fdt);
+    }
+}
+
+// D2K_DEMO_INPUT (recordings, debug): scripted camera input, e.g.
+// "0.5:wheel:1:640:400;1.5:keys:right:0.8;3:drag:900:400:500:400:0.25;4.5:minimap:x:y" -
+// seconds since the game started : wheel:<notches, + = in>:<x>:<y> (output pixels; the notches
+// arrive together) | keys:<left|right|up|down>[+...]:<seconds held> | drag:<x0>:<y0>:<x1>:<y1>:<seconds>
+// (a right-button drag at an even speed, released at the end) | minimap:<x>:<y> (a left click
+// there). D2K_CAMERA_LOG=<file.csv>: one line per frame (t, dt, camera x / y / zoom, 3D yaw / tilt).
+void Session::applyDemoInput(double dt) {
+    struct Item { double t; int kind; float a, b, c, d, e; int keys; };
+    static const std::vector<Item> items = [] {
+        std::vector<Item> v;
+        const char* env = std::getenv("D2K_DEMO_INPUT");
+        if (!env) return v;
+        std::stringstream ss(env);
+        std::string it;
+        while (std::getline(ss, it, ';')) {
+            double t = 0;
+            char kind[16] = {}, rest[128] = {};
+            if (std::sscanf(it.c_str(), "%lf:%15[^:]:%127s", &t, kind, rest) < 2) continue;
+            Item x{t, 0, 0, 0, 0, 0, 0, 0};
+            const std::string k = kind;
+            if (k == "wheel" && std::sscanf(rest, "%f:%f:%f", &x.a, &x.b, &x.c) == 3) {
+                x.kind = 1;
+            } else if (k == "keys") {
+                char names[64] = {};
+                if (std::sscanf(rest, "%63[^:]:%f", names, &x.a) == 2) {
+                    const std::string n = names;
+                    x.keys = (n.find("left") != std::string::npos ? 1 : 0) | (n.find("right") != std::string::npos ? 2 : 0) |
+                             (n.find("up") != std::string::npos ? 4 : 0) | (n.find("down") != std::string::npos ? 8 : 0);
+                    x.kind = 2;
+                }
+            } else if (k == "drag" && std::sscanf(rest, "%f:%f:%f:%f:%f", &x.a, &x.b, &x.c, &x.d, &x.e) == 5) {
+                x.kind = 3;
+            } else if (k == "minimap" && std::sscanf(rest, "%f:%f", &x.a, &x.b) == 2) {
+                x.kind = 4;
+            }
+            if (x.kind) v.push_back(x);
+        }
+        SDL_Log("D2K_DEMO_INPUT: %d items", int(v.size()));
+        return v;
+    }();
+    if (!cameraLog_ && cameraLogT_ == 0) {
+        if (const char* f = std::getenv("D2K_CAMERA_LOG")) {
+            cameraLog_ = std::fopen(f, "w");
+            if (cameraLog_) std::fprintf(cameraLog_, "t,dt,x,y,zoom,yaw,tilt\n");
+        }
+    }
+    if (cameraLog_) {
+        std::fprintf(cameraLog_, "%.4f,%.4f,%.3f,%.3f,%.4f,%.4f,%.4f\n", cameraLogT_, dt, double(cam_.x), double(cam_.y),
+                     double(cam_.zoom / ppp_), double(camYaw_), double(camTilt_));
+        std::fflush(cameraLog_);
+    }
+    cameraLogT_ += dt;
+    if (items.empty()) return;
+    const double before = demoInputT_, now = demoInputT_ + dt;
+    demoInputT_ = now;
+    demoKeys_ = 0;
+    for (const Item& it : items) {
+        SDL_Event ev{};
+        if (it.kind == 2 && now > it.t && before < it.t + it.a) demoKeys_ |= std::uint8_t(it.keys);
+        if (it.kind == 1 && it.t >= before && it.t < now) {
+            SDL_WarpMouseInWindow(SDL_GetRenderWindow(r_), it.b / windowToPixels(r_), it.c / windowToPixels(r_));
+            const int n = int(std::lround(std::abs(it.a)));
+            ev.type = SDL_EVENT_MOUSE_WHEEL;
+            ev.wheel.y = it.a > 0 ? 1.0f : -1.0f;
+            ev.wheel.mouse_x = it.b;
+            ev.wheel.mouse_y = it.c;
+            for (int i = 0; i < std::max(1, n); ++i) handleEvent(ev);
+        }
+        if (it.kind == 3 && now > it.t && before < it.t + it.e) {
+            auto at = [&](double t) {
+                const float u = float(std::clamp((t - it.t) / it.e, 0.0, 1.0));
+                return std::pair<float, float>{it.a + (it.c - it.a) * u, it.b + (it.d - it.b) * u};
+            };
+            if (before <= it.t) {
+                ev.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+                ev.button.button = SDL_BUTTON_RIGHT;
+                ev.button.down = true;
+                ev.button.x = it.a;
+                ev.button.y = it.b;
+                handleEvent(ev);
+            }
+            const auto [px, py] = at(std::max(before, it.t));
+            const auto [nx, ny] = at(now);
+            ev = {};
+            ev.type = SDL_EVENT_MOUSE_MOTION;
+            ev.motion.x = nx;
+            ev.motion.y = ny;
+            ev.motion.xrel = nx - px;
+            ev.motion.yrel = ny - py;
+            handleEvent(ev);
+            if (now >= it.t + it.e) {
+                ev = {};
+                ev.type = SDL_EVENT_MOUSE_BUTTON_UP;
+                ev.button.button = SDL_BUTTON_RIGHT;
+                ev.button.x = nx;
+                ev.button.y = ny;
+                handleEvent(ev);
+            }
+        }
+        if (it.kind == 4 && it.t >= before && it.t < now) {
+            ev.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+            ev.button.button = SDL_BUTTON_LEFT;
+            ev.button.down = true;
+            ev.button.x = it.a;
+            ev.button.y = it.b;
+            handleEvent(ev);
+            ev.type = SDL_EVENT_MOUSE_BUTTON_UP;
+            ev.button.down = false;
+            handleEvent(ev);
+        }
+    }
 }
 
 // ---- Touch (platform/touch_controls.hpp) ----
@@ -2059,11 +2531,23 @@ void Session::touchPan(float dx, float dy) {
         panView(-dx, -dy);
         return;
     }
+    if (!touchPanning_) {
+        touchPanning_ = true;
+        camSmooth_.dragBegin();
+        camSmooth_.cancelGlide();
+    }
     panView(-dx / cam_.zoom, -dy / cam_.zoom);
+    camSmooth_.dragSample(-dx / cam_.zoom, -dy / cam_.zoom, double(SDL_GetTicksNS()) / 1e9);
+}
+
+void Session::touchPanEnd(bool fling) {
+    if (touchPanning_ && fling && smoothCam()) camSmooth_.dragRelease(double(SDL_GetTicksNS()) / 1e9, 6000.0f / cam_.zoom);
+    touchPanning_ = false;
 }
 
 void Session::touchZoom(float factor, float x, float y) {
     if (classicUi() || !(factor > 0)) return;
+    camSmooth_.cancelZoom();  // a pinch follows the fingers 1:1 (direct manipulation)
     zoomAround(factor, x, y);
 }
 
@@ -2436,9 +2920,10 @@ void Session::applyCameraMove(double dt) {
 
 // D2K_DEMO_CLICKS (recordings, debug): scripted mouse clicks through handleEvent, e.g.
 // "0.5:L:400:300;1.2:R:900:120:ctrl" = seconds since the game started : L / R : output-pixel
-// position : optional ctrl / alt / shift. Each is a press and a release at the same point.
+// position : optional ctrl / alt / shift / amove (amove: the attack-move key, as if A was
+// pressed just before). Each is a press and a release at the same point.
 void Session::applyDemoClicks(double dt) {
-    struct Click { double t; int button; float x, y; SDL_Keymod mod; };
+    struct Click { double t; int button; float x, y; SDL_Keymod mod; bool attackMove; };
     static std::vector<Click> clicks = [] {
         std::vector<Click> v;
         const char* e = std::getenv("D2K_DEMO_CLICKS");
@@ -2457,7 +2942,7 @@ void Session::applyDemoClicks(double dt) {
             if (ms.find("ctrl") != std::string::npos) m |= SDL_KMOD_LCTRL;
             if (ms.find("alt") != std::string::npos) m |= SDL_KMOD_LALT;
             if (ms.find("shift") != std::string::npos) m |= SDL_KMOD_LSHIFT;
-            v.push_back({t, b == 'R' ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT, x, y, m});
+            v.push_back({t, b == 'R' ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT, x, y, m, ms.find("amove") != std::string::npos});
         }
         SDL_Log("D2K_DEMO_CLICKS: %d clicks", int(v.size()));
         return v;
@@ -2475,6 +2960,7 @@ void Session::applyDemoClicks(double dt) {
         ev.motion.y = c.y;
         handleEvent(ev);
         ev = {};
+        if (c.attackMove && settings_.attackMove) attackMoveArmed_ = true;
         ev.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
         ev.button.button = Uint8(c.button);
         ev.button.down = true;
@@ -2511,23 +2997,32 @@ void Session::update() {
     // frame when the cursor touches a screen edge (fullscreen) or a scroll key is held).
     // Original UI: ScrollRate is in game pixels (= world pixels at its 1:1 scale), so the integer
     // display scale must not slow the scroll down; Enhanced keeps screen pixels at any zoom.
-    const float speed = settings_.scrollPixelsPerSecond() * float(dt) / (classicUi() ? 1.0f : cam_.zoom / ppp_);
+    const float rate = settings_.scrollPixelsPerSecond() / (classicUi() ? 1.0f : cam_.zoom / ppp_);  // world px / s
+    const float speed = rate * float(dt);
     // Fullscreen edge scrolling against the display edges (platform/pointer.hpp): also works
     // with the pointer in the notch / menu-bar band above the content area.
     ScreenEdges se;
     const bool edges = settings_.fullscreen && screenEdges(SDL_GetRenderWindow(r_), se);
-    const bool kl = keys[SDL_SCANCODE_LEFT], kr = keys[SDL_SCANCODE_RIGHT];
-    const bool ku = keys[SDL_SCANCODE_UP], kd = keys[SDL_SCANCODE_DOWN];
+    applyDemoInput(dt);  // D2K_DEMO_INPUT (recordings): wheel / held arrows / drags
+    const bool kl = keys[SDL_SCANCODE_LEFT] || (demoKeys_ & 1), kr = keys[SDL_SCANCODE_RIGHT] || (demoKeys_ & 2);
+    const bool ku = keys[SDL_SCANCODE_UP] || (demoKeys_ & 4), kd = keys[SDL_SCANCODE_DOWN] || (demoKeys_ & 8);
     const bool el = edges && se.left, er = edges && se.right, eu = edges && se.up, ed = edges && se.down;
-    panView(((kr || er) ? speed : 0.0f) - ((kl || el) ? speed : 0.0f), ((kd || ed) ? speed : 0.0f) - ((ku || eu) ? speed : 0.0f));
+    const float wantX = ((kr || er) ? 1.0f : 0.0f) - ((kl || el) ? 1.0f : 0.0f), wantY = ((kd || ed) ? 1.0f : 0.0f) - ((ku || eu) ? 1.0f : 0.0f);
+    if (smoothCam()) {
+        applyCameraSmoothing(dt, wantX * rate, wantY * rate);
+    } else {
+        camSmooth_.reset();
+        panView(wantX * speed, wantY * speed);
+    }
     applyCameraMove(dt);  // D2K_CAMERA_MOVE (recordings)
     applyDemoClicks(dt);  // D2K_DEMO_CLICKS (recordings)
-    if (r3d_) {  // 3D: Q / E turn, Page Up / Down tilt
+    if (r3d_) {  // 3D: Q / E turn, Page Up / Down tilt (Smooth camera: the rates ease in / out)
         const float fdt = float(dt);
-        if (keys[SDL_SCANCODE_Q]) camYaw_ -= 1.6f * fdt;
-        if (keys[SDL_SCANCODE_E]) camYaw_ += 1.6f * fdt;
-        if (keys[SDL_SCANCODE_PAGEUP]) camTilt_ = std::max(render3d::Camera3D::kMinTilt, camTilt_ - 0.8f * fdt);
-        if (keys[SDL_SCANCODE_PAGEDOWN]) camTilt_ = std::min(render3d::Camera3D::kMaxTilt, camTilt_ + 0.8f * fdt);
+        const float turn = (keys[SDL_SCANCODE_E] ? 1.6f : 0.0f) - (keys[SDL_SCANCODE_Q] ? 1.6f : 0.0f);
+        const float tilt = (keys[SDL_SCANCODE_PAGEDOWN] ? 0.8f : 0.0f) - (keys[SDL_SCANCODE_PAGEUP] ? 0.8f : 0.0f);
+        camYaw_ += smoothCam() ? camSmooth_.turn(turn, fdt) : turn * fdt;
+        camTilt_ = std::clamp(camTilt_ + (smoothCam() ? camSmooth_.tilt(tilt, fdt) : tilt * fdt), render3d::Camera3D::kMinTilt,
+                              render3d::Camera3D::kMaxTilt);
         r3d_->constrainPose(camYaw_, camTilt_);  // sprites: north up, modest tilt (docs/3d-mode.md)
     }
     if (view3d()) {
@@ -2539,12 +3034,20 @@ void Session::update() {
         const float ex = hw * c * c + hh * sn * sn, ey = hh * c * c + hw * sn * sn;
         const float mapW = g.scenario.width * 32.0f, mapH = g.scenario.height * 32.0f;
         const float offX = hw, offY = hh;
-        const float lx = ex * 2 >= mapW ? mapW / 2 : std::clamp(cam_.x + offX, ex, mapW - ex);
-        const float ly = ey * 2 >= mapH ? mapH / 2 : std::clamp(cam_.y + offY, ey, mapH - ey);
+        // World beyond the map (docs/3d-mode.md): the view may go kSurroundScroll past each edge, so a base on
+        // the edge is not jammed against the screen border. Off: m = 0, the clamp as it always was.
+        const float m = surroundWanted() ? kSurroundScroll : 0.0f;
+        const float lx = ex * 2 >= mapW + 2 * m ? mapW / 2 : std::clamp(cam_.x + offX, ex - m, mapW - ex + m);
+        const float ly = ey * 2 >= mapH + 2 * m ? mapH / 2 : std::clamp(cam_.y + offY, ey - m, mapH - ey + m);
+        // Smooth camera: momentum stops at the map's edge (no push past it).
+        if (std::abs(lx - offX - cam_.x) > 0.01f || std::abs(ly - offY - cam_.y) > 0.01f) camSmooth_.stop();
         cam_.x = lx - offX;
         cam_.y = ly - offY;
     } else {
+        const float bx = cam_.x, by = cam_.y;
         clampCamera(cam_, g.scenario, viewW_, viewH_);
+        if (cam_.x != bx) camSmooth_.stopX();
+        if (cam_.y != by) camSmooth_.stopY();
     }
     // Scroll arrows (0x4433a0): the screen edge in fullscreen, the scroll keys in a window;
     // the crossed-out arrow when the view is already at that edge.
@@ -2689,6 +3192,7 @@ bool Session::prepareLighting(const game::World& w, bool threeD, const float vie
             if (artPack_->hotspot(T.unitArtFirstFrame[std::size_t(art)], hx, hy)) redesignedUnitTypes_[std::size_t(ty)] = 1;
         }
         packAnchors_.setEffects(mapRenderer_->effects());
+        sceneLights_->setDropIn(threeD && models3d_ && models3d_->active() ? models3d_.get() : nullptr);
         sceneLights_->update(w, light_, seconds, view, mapRenderer_->showShroud, mapRenderer_->effects(),
                              threeD ? static_cast<const render::EffectAnchors*>(view3d()) : packAnchors2D(), &redesignedTypes_,
                              &redesignedUnitTypes_);
@@ -2761,7 +3265,21 @@ void Session::render(Ui& ui) {
     // Smooth motion: units/projectiles drawn between the last two ticks (render only; restored
     // right after the draw so the simulation keeps its exact positions).
     const bool smooth = settings_.smoothMotion;
-    if (smooth) motion_.apply(world, float(tickAccumulator_));
+    const Uint64 nowNs = SDL_GetTicksNS();  // monotonic
+    const float frameDt = fixedStep_ > 0 ? float(fixedStep_)
+                          : lastRenderNs_ ? std::min(0.1f, float(double(nowNs - lastRenderNs_) / 1e9)) : 0.0f;
+    lastRenderNs_ = nowNs;
+    // Smooth camera (Enhanced / 3D): the ground units' drawn positions also ease their starts / stops.
+    const bool easeUnits = smoothCam() && appliedGraphics_ != Settings::Graphics::Original && !peek;
+    // Smooth driving (Enhanced / 3D; render/smooth_drive.hpp): vehicles drive round their route's corners.
+    // Modern movement: always on there - it draws the vehicles' true heading between the ticks
+    // (no path faking: the simulation drives the curves itself).
+    const bool driveOn = smooth && (settings_.smoothDriving || world.modernMovement()) &&
+                         appliedGraphics_ != Settings::Graphics::Original && !peek;
+    if (driveOn) drive_.beginFrame(double(world.gameTicks()) + tickAccumulator_, float(tickAccumulator_), frameDt);
+    if (smooth) motion_.apply(world, float(tickAccumulator_), easeUnits ? frameDt : -1.0f, driveOn ? &drive_ : nullptr);
+    const render::SmoothDrive* drive = driveOn ? &drive_ : nullptr;
+    if (render::Effects* fx = mapRenderer_ ? mapRenderer_->effects() : nullptr) fx->setDrive(drive);
     // Vehicle animation: Modern (Enhanced / 3D): the hulls' render-only pose, from the drawn positions.
     const render::VehicleMotion* vm = nullptr;
     if (vehicleMotion_ && appliedGraphics_ != Settings::Graphics::Original &&
@@ -2773,15 +3291,11 @@ void Session::render(Ui& ui) {
             vdt = 0;
         }
         vmClock_ = clock;
-        vehicleMotion_->update(world, vdt);
+        vehicleMotion_->update(world, vdt, drive, view3d() != nullptr);
         vm = vehicleMotion_.get();
     } else {
         vmClock_ = -1;
     }
-    const Uint64 nowNs = SDL_GetTicksNS();
-    const float frameDt = fixedStep_ > 0 ? float(fixedStep_)
-                          : lastRenderNs_ ? std::min(0.1f, float(double(nowNs - lastRenderNs_) / 1e9)) : 0.0f;
-    lastRenderNs_ = nowNs;
     render3d::Renderer3D::Options o3;
     if (view3d()) {  // 3D mode (docs/3d-mode.md): the 2.5D battlefield instead of the 2D map
         o3.showShroud = mapRenderer_->showShroud;
@@ -2792,6 +3306,23 @@ void Session::render(Ui& ui) {
         o3.designedTerrain = settings_.terrain3dDesigned();
         o3.faithfulTerrain = settings_.terrain3d == Settings::Terrain3D::Faithful;
         o3.shadowMap = settings_.shadows3d;
+        o3.reimagined = settings_.reimagined;
+        o3.groundDetail = static_cast<int>(settings_.groundDetail);  // (Off, Sparse, Dense = 0, 1, 2)
+        o3.dustHaze = settings_.dustHaze;
+        o3.groundDust = settings_.groundDust;
+        o3.aerialHaze = settings_.aerialHaze;
+        o3.mapSurroundings = settings_.mapSurroundings;
+        o3.mapSurroundingsFull = settings_.mapSurroundingsFull;
+        o3.naturalGrade = naturalGradeWanted();
+        // Photo terrain / ambient occlusion (docs/3d-mode.md; the renderer applies them on a Reimagined terrain only
+        // and reads D2K_PHOTO_OFF / D2K_SSAO_OFF itself).
+        o3.photoTerrain = settings_.photoTerrain;
+        o3.ambientOcclusion = settings_.ambientOcclusion;
+        {  // Vehicle wrecks (docs/3d-mode.md "Vehicle wrecks"; D2K_WRECKS_OFF=1: off whatever the setting says)
+            static const bool wrecksOff = std::getenv("D2K_WRECKS_OFF") != nullptr;
+            o3.vehicleWrecks = settings_.vehicleWrecks && !wrecksOff;
+        }
+        o3.dropInPlacement = models3d_ && models3d_->active() && settings_.buildingPlacement == Settings::BuildingPlacement::DropIn;
         o3.packAnchors = packAnchors_.empty() ? nullptr : &packAnchors_;  // building sprites from the pack
         o3.snapCamera = snapCamera_;
         snapCamera_ = false;
@@ -2806,6 +3337,14 @@ void Session::render(Ui& ui) {
         }
         view3d()->constrainPose(camYaw_, camTilt_);
         view3d()->setVehicleMotion(vm);
+        view3d()->setSmoothDrive(drive);
+        view3d()->setTickPhase(smooth ? float(tickAccumulator_) : 0.0f);
+        // Building placement: Drop-in (render/building_dropin.hpp): the models fall, land and unfold.
+        // Assemble (render/building_assemble.hpp): they are built up from the ground part by part.
+        if (models3d_) {
+            models3d_->setDropIn(settings_.buildingPlacement == Settings::BuildingPlacement::DropIn);
+            models3d_->setAssemble(settings_.buildingPlacement == Settings::BuildingPlacement::Assemble);
+        }
         const render3d::CameraPose pose{cam_.x + viewW / (2 * cam_.zoom), cam_.y + viewH / (2 * cam_.zoom), cam_.zoom, camYaw_,
                                         camTilt_};
         {  // time of day / lighting: the ground rectangle the 3D view sees (about twice the 2D one)
@@ -2828,24 +3367,51 @@ void Session::render(Ui& ui) {
                 }
             }
             if (prepareLighting(world, true, view)) {
+                // Realistic grade: the Modern day's warm cast held back (the graded ground is paler, not oranger).
+                if (naturalGradeWanted()) render::calmDayCast(light_);
                 o3.light = &light_;
                 o3.lamps = sceneLights_ && light_.lamps > 0 ? sceneLights_.get() : nullptr;
                 o3.bloom = bloom_.get();
             }
+            // Aerial haze (Reimagined; docs/3d-mode.md "Aerial haze"): its gentle day bloom on the brightest sand, also
+            // with the Classic lighting (the renderer picks the strength; not on the lite profile).
+            if (settings_.reimagined && settings_.aerialHaze && !o3.bloom && settings_.deviceProfile != "lite") {
+                if (!bloom_) bloom_ = std::make_unique<render::Bloom>(r_);
+                o3.bloom = bloom_.get();
+            }
             o3.hdr = hdrIfOn();
+            // Realistic grade without the HDR scene: the tone map's shader grades the 8-bit picture.
+            if (o3.naturalGrade && !o3.hdr) {
+                if (!hdr_) hdr_ = std::make_unique<render::Hdr>(r_);
+                o3.gradePass = hdr_->available() ? hdr_.get() : nullptr;
+            }
         }
         if (render::Effects* fx = mapRenderer_->effects()) {  // Modern effects, drawn in world space
             // Emitters cull to a ground rectangle: the 3D view sees about twice the 2D one.
             const render::Camera wide{pose.cx - viewW / cam_.zoom, pose.cy - viewH / cam_.zoom, cam_.zoom * 0.5f};
             mapRenderer_->setEffectClock(double(world.gameTicks()) + tickAccumulator_);
             fx->setDetail(effectDetail());
+            fx->setIntensity(static_cast<render::FxIntensity>(settings_.effectsIntensity));  // (same order: Clean, Balanced, Cinematic)
             fx->setCardTilt(camTilt_);  // effects on building art stand on the cards (render3d)
             fx->setAnchors(view3d());   // ... or leave the models' anchors (refinery flues)
             fx->setVehicleAnimation(vm != nullptr);
+            fx->recordEvents(settings_.reimagined);  // the cinematic particles (render3d/cinematic_fx.*)
+            {  // Aircraft crashes (with the vehicle wrecks: docs/3d-mode.md "Aircraft crashes")
+                static const bool wrecksOff = std::getenv("D2K_WRECKS_OFF") != nullptr;
+                fx->airCrashes(settings_.reimagined && settings_.vehicleWrecks && !wrecksOff && models3d_ && models3d_->active());
+            }
+            fx->setDropInDust(!settings_.reimagined);  // Reimagined: the cinematic particles raise the landing dust
+            const bool modelsOn = models3d_ && models3d_->active();
+            fx->setDropIn(modelsOn && models3d_->dropIn() ? models3d_.get() : nullptr);        // landing dust
+            fx->setAssembly(modelsOn && models3d_->assemble() ? models3d_.get() : nullptr);  // outline, dust, sparks
             render::FrameProbe::Scope ps("fxUpdate3d");
             mapRenderer_->updateEffects(world, wide, viewW, viewH);
+            fx->airCrashes(false);
             fx->setCardTilt(-1);
             fx->setAnchors(nullptr);
+            fx->setDropIn(nullptr);
+            fx->setAssembly(nullptr);
+            playDropInSounds(world, *fx);
             o3.effects = fx;
             o3.shakeX = fx->shakeX();
             o3.shakeY = fx->shakeY();
@@ -2924,6 +3490,7 @@ void Session::render(Ui& ui) {
         if (render::Effects* fx = mapRenderer_->effects()) {
             fx->setAnchors(mapRenderer_->packAnchors);
             fx->setDetail(effectDetail());
+            fx->setIntensity(static_cast<render::FxIntensity>(settings_.effectsIntensity));  // (same order: Clean, Balanced, Cinematic)
             fx->setVehicleAnimation(vm != nullptr);
         }
         mapRenderer_->vehicleMotion = vm;
@@ -2937,6 +3504,21 @@ void Session::render(Ui& ui) {
         mapRenderer_->vehicleMotion = nullptr;
         if (render::Effects* fx = mapRenderer_->effects()) fx->setAnchors(nullptr);
         mapRenderer_->packAnchors = nullptr;
+    }
+    if (static const char* logPath = std::getenv("D2K_DRIVE_LOG"); logPath && *logPath) {
+        // Debug (Smooth driving): per frame the drawn position / body / turret facing of side 0's
+        // first units (t = game ticks + the fraction into the next one).
+        static std::FILE* f = std::fopen(logPath, "w");
+        const render::Effects* fx = mapRenderer_ ? mapRenderer_->effects() : nullptr;
+        const game::Side& sd = world.sides()[0];
+        int n = 0;
+        for (int i = sd.firstUnit; i >= 0 && f && n < 4; i = sd.nextObject(i), ++n) {
+            const game::Unit& u = sd.units[std::size_t(i)];
+            const render::Effects::UnitVisual* v = fx ? fx->unitVisual(0, i) : nullptr;
+            std::fprintf(f, "%.4f,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d\n", double(world.gameTicks()) + tickAccumulator_, i,
+                         double(u.posX) / 65536.0, double(u.posY) / 65536.0, v ? double(v->facing) : double(u.facing),
+                         v ? double(v->turret) : double(u.facingTurret), u.facing, u.facingTurret, int(u.posSteps));
+        }
     }
     if (smooth) motion_.restore(world);
     if (!mapRenderer_->classicSelection && !peek) {  // Enhanced / 3D order markers (Original: puffs in MapRenderer)
@@ -3141,6 +3723,7 @@ Session::CursorChoice Session::cursorAt(float x, float y) {
     q.ctrl = (mod & SDL_KMOD_CTRL) != 0;
     q.shift = (mod & SDL_KMOD_SHIFT) != 0;
     q.alt = (mod & SDL_KMOD_ALT) != 0;
+    q.attackMove = attackMoveActive();
     float mx = x, my = y;
     if (classic) {
         q.overBattlefield = classic_->inBattlefield(x, y);
@@ -3201,6 +3784,7 @@ void Session::drawEndPrompt(Ui& ui) {
 
 void Session::openCheats(bool fromPause) {
     if (!cheatMenu_) cheatMenu_ = std::make_unique<CheatMenu>(data_->templates, &data_->colours);
+    cheatMenu_->setViewFlags(&mapRenderer_->showMarkers, &mapRenderer_->showShroud);
     cheatMenu_->open(*world_, playerSide_);
     cheatMenu_->setTicksPerSecond(settings_.ticksPerSecond());
     cheatsFromPause_ = fromPause;
@@ -3238,34 +3822,49 @@ void Session::drawPauseMenu(Ui& ui) {
     ui.fill(SDL_FRect{0, 0, float(outW_), float(outH_)}, Colour{0, 0, 0, 150});
     if (pauseOptions_) { drawPauseOptions(ui); return; }
     if (pauseSlots_) { drawPauseSlots(ui); return; }
+    if (pauseBriefing_) { drawPauseBriefing(ui); return; }
     const float s = Ui::bodyScaleFor(outW_, outH_);
     ui.textScale = Ui::labelScaleFor(outW_, outH_);
-    const int kRows = settings_.cheats ? 8 : 7;
-    const float w = 360 * s, gap = 10 * s;
-    const float bh = std::min(44 * s, (outH_ - 150 * s - (kRows - 1) * gap) / kRows);
+    const bool briefing = hasBriefing();  // campaign / custom missions (not skirmish: INGAME_SKIRMISH)
+    const int kRows = 7 + (settings_.cheats ? 1 : 0) + (briefing ? 1 : 0);
+    const float gap = 10 * s;
+    // Short windows (phones in landscape): Resume across, the other buttons in two columns, so
+    // they stay touch-sized instead of shrinking to thin strips.
+    const bool twoCols = (outH_ - 150 * s - (kRows - 1) * gap) / kRows < 32 * s && outW_ >= 560 * s;
+    const int lines = twoCols ? 1 + kRows / 2 : kRows;
+    const float w = twoCols ? std::min(620 * s, outW_ - 20.0f) : 360 * s;
+    const float top = twoCols ? 80 * s : 110 * s;
+    const float bh = std::min(44 * s, (outH_ - top - 40 * s - (lines - 1) * gap) / lines);
     const std::string title = data_->start.title.empty() ? data_->start.map : data_->start.title;
-    const float h = 110 * s + kRows * bh + (kRows - 1) * gap + 24 * s;
+    const float h = top + lines * bh + (lines - 1) * gap + 24 * s;
     const SDL_FRect box{std::round(outW_ / 2.0f - w / 2), std::round(outH_ / 2.0f - h / 2), w, h};
     ui.panel(box);
     const float ts = ui.textScale + 1;
     ui.text(render::tr("PAUSED"), box.x + w / 2, box.y + 18 * s, theme::kTitle, ts, Align::Centre);
     ui.text(ui.ellipsize(title, w - 30 * s, s), box.x + w / 2, box.y + 22 * s + ui.textHeight(ts) + 6 * s, theme::kDim, s,
             Align::Centre);
-    float y = box.y + 110 * s;
+    float y = box.y + top;
     const SDL_FRect b{box.x + 24 * s, y, w - 48 * s, bh};
-    auto row = [&](int i) { return SDL_FRect{b.x, y + i * (bh + gap), b.w, bh}; };
+    auto row = [&](int i) {
+        if (!twoCols || i == 0) return SDL_FRect{b.x, y + i * (bh + gap), b.w, bh};
+        const float cw = (b.w - gap) / 2;
+        return SDL_FRect{b.x + ((i - 1) % 2) * (cw + gap), y + (1 + (i - 1) / 2) * (bh + gap), cw, bh};
+    };
     if (ui.takeBack()) { setPaused(false); return; }
     if (ui.button(row(0), render::tr("Resume"), ButtonStyle::Primary)) setPaused(false);
     if (ui.button(row(1), render::tr("Options"))) { pauseOptions_ = true; ui.resetFocus(0); }
+    // The original's in-game menu has a Briefing button (INGAME -> RECAP; not in INGAME_SKIRMISH).
+    const int o = briefing ? 1 : 0;
+    if (briefing && ui.button(row(2), render::tr("Mission briefing"))) { openBriefing(); ui.resetFocus(0); }
     // The original's in-game menu offers Save / Load as well (UISaveGame FUN_00474e20).
     const bool canSave = world_->gameEndState() == game::GameEnd::None && !savesDir().empty();
-    if (ui.button(row(2), render::tr("Save game"), ButtonStyle::Normal, canSave)) { openSlots(true); ui.resetFocus(0); }
-    if (ui.button(row(3), render::tr("Load game"))) { openSlots(false); ui.resetFocus(0); }
-    if (ui.button(row(4), render::tr("Restart mission"))) restart();
-    if (ui.button(row(5), render::tr("Quit to main menu"))) result_ = SessionResult::QuitToMenu;
-    if (ui.button(row(6), render::tr("Quit game"))) result_ = SessionResult::QuitApp;
+    if (ui.button(row(2 + o), render::tr("Save game"), ButtonStyle::Normal, canSave)) { openSlots(true); ui.resetFocus(0); }
+    if (ui.button(row(3 + o), render::tr("Load game"))) { openSlots(false); ui.resetFocus(0); }
+    if (ui.button(row(4 + o), render::tr("Restart mission"))) restart();
+    if (ui.button(row(5 + o), render::tr("Quit to main menu"))) result_ = SessionResult::QuitToMenu;
+    if (ui.button(row(6 + o), render::tr("Quit game"))) result_ = SessionResult::QuitApp;
     if (settings_.cheats &&
-        ui.button(row(7), render::tr("Cheats"), ButtonStyle::Subtle, world_->gameEndState() == game::GameEnd::None))
+        ui.button(row(7 + o), render::tr("Cheats"), ButtonStyle::Subtle, world_->gameEndState() == game::GameEnd::None))
         openCheats(true);
 }
 
@@ -3325,7 +3924,7 @@ void Session::drawPauseSlots(Ui& ui) {
                      (activated >= 0 && canAct);
     if (back || ui.takeBack()) {
         pauseSlots_ = 0;
-        ui.resetFocus(saving ? 2 : 3);
+        ui.resetFocus((saving ? 2 : 3) + (hasBriefing() ? 1 : 0));
         return;
     }
     if (!act) return;
@@ -3340,6 +3939,59 @@ void Session::drawPauseSlots(Ui& ui) {
     } else {
         loadSlot_ = slotSel_;
         result_ = SessionResult::LoadGame;
+    }
+}
+
+void Session::openBriefing() {
+    pauseBriefing_ = true;
+    pauseOptions_ = false;
+    pauseSlots_ = 0;
+    briefingScroll_ = 0;
+}
+
+// Mission briefing page of the Enhanced pause menu (the original's RECAP page, in our style):
+// the mission title, the briefing text (wrapped, scrolls by wheel / drag / scroll bar / Up-Down).
+void Session::drawPauseBriefing(Ui& ui) {
+    buildBriefing();
+    const float s = Ui::bodyScaleFor(outW_, outH_);
+    ui.textScale = Ui::labelScaleFor(outW_, outH_);
+    ui.bodyScale = ui.textScale;
+    const float w = std::min(680 * s, outW_ - 20.0f), bh = 40 * s, pad = 20 * s;
+    const float h = std::min(560 * s, outH_ - 20.0f);
+    const SDL_FRect box{std::round(outW_ / 2.0f - w / 2), std::round(outH_ / 2.0f - h / 2), w, h};
+    ui.panel(box);
+    const float ts = ui.textScale + 1;
+    ui.text(render::tr("MISSION BRIEFING"), box.x + w / 2, box.y + 14 * s, theme::kAccent, ui.textScale, Align::Centre);
+    float y = box.y + 14 * s + ui.textHeight(ui.textScale) + 6 * s;
+    const std::string title = uiUtf8(data_->start.title.empty() ? data_->start.map : data_->start.title);
+    ui.text(ui.ellipsize(title, w - 2 * pad, ts), box.x + w / 2, y, theme::kTitle, ts, Align::Centre);
+    y += ui.textHeight(ts) + 4 * s;
+    if (!briefingHeading_.empty() && title.find(briefingHeading_) == std::string::npos) {
+        ui.text(ui.ellipsize(briefingHeading_, w - 2 * pad, ui.textScale), box.x + w / 2, y, theme::kDim, ui.textScale,
+                Align::Centre);
+        y += ui.textHeight(ui.textScale) + 4 * s;
+    }
+    y += 6 * s;
+    ui.fill({box.x + pad, y, w - 2 * pad, 1}, Colour{theme::kEdge.r, theme::kEdge.g, theme::kEdge.b, 180});
+    y += 10 * s;
+    const float bottom = box.y + h - bh - 2 * pad;
+    const SDL_FRect view{box.x + pad, y, w - 2 * pad - 10 * s, std::max(20.f, bottom - y)};
+    const std::string txt = briefingText_.empty() ? std::string(render::tr("(No briefing text.)")) : briefingText_;
+    const float scale = ui.bodyScale;
+    const float textH = ui.wrapped(txt, {view.x, view.y, view.w, 1e6f}, theme::kText, scale, 0, false) + 6 * s;
+    briefingScroll_ += float(ui.vertical()) * (ui.textHeight(scale) + 2) * 2;  // Up / Down (Back is the only widget)
+    // (wheel, drag / flick, scroll bar via the scroll area; Ui::wrapped clips to the view itself)
+    ui.beginScroll(view, briefingScroll_, textH, std::max(4.0f, 5 * s));
+    ui.wrapped(txt, view, theme::kText, scale, briefingScroll_);
+    ui.endScroll();
+    const SDL_FRect back{box.x + w / 2 - 100 * s, box.y + h - bh - pad, 200 * s, bh};
+    if (briefingScroll_ + view.h < textH - 1 && box.x + w - pad - ui.textWidth(render::tr("(scroll for more)"), ui.textScale) >
+                                                    back.x + back.w + 8 * s)
+        ui.text(render::tr("(scroll for more)"), box.x + w - pad, back.y + (bh - ui.textHeight(ui.textScale)) / 2,
+                theme::kDim, ui.textScale, Align::Right);
+    if (ui.button(back, render::tr("Back"), ButtonStyle::Primary) || ui.takeBack()) {
+        pauseBriefing_ = false;
+        ui.resetFocus(2);
     }
 }
 

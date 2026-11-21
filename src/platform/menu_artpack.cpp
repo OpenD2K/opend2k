@@ -23,6 +23,8 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <tuple>
+#include <vector>
 
 namespace d2k::platform {
 
@@ -57,6 +59,53 @@ InstalledArtPack installedCached(const std::string& name) {
     return cached;
 }
 
+// ArtPackDownloader::missingFor3d (touches the file system): cached like installedCached. Without a
+// manifest only the main pack is known.
+std::vector<std::string> missing3dCached(const ArtPackDownloader::Status& s) {
+    static std::vector<std::string> cached;
+    static std::string key;
+    static int gen = -1;
+    static Uint64 at = 0;
+    if (gPreviewInstalled >= 0) {
+        std::vector<std::string> r;
+        if (gPreviewInstalled == 0) r.push_back(s.haveManifest ? s.manifest.name : std::string(kArtPackName));
+        if (s.haveManifest)
+            for (const auto& e : s.manifest.extras)
+                if (e.for3d) r.push_back(e.name);
+        return r;
+    }
+    const Uint64 now = SDL_GetTicks();
+    const std::string k = s.haveManifest ? s.manifest.name + "/" + s.manifest.sha256 + "/" + std::to_string(s.manifest.extras.size()) : "";
+    if (k != key || gen != render::ArtPack::generation() || now - at > 2000) {
+        if (s.haveManifest) {
+            cached = ArtPackDownloader::missingFor3d(s.manifest);
+        } else {
+            cached.clear();
+            if (!ArtPackDownloader::installed(kArtPackName).installed) cached.push_back(kArtPackName);
+        }
+        key = k;
+        gen = render::ArtPack::generation();
+        at = now;
+    }
+    return cached;
+}
+
+// "Reimagined models, Photo terrain" - the titles of the extras among `names`.
+std::string extraTitles(const ArtPackDownloader::Status& s, const std::vector<std::string>& names) {
+    std::string t;
+    if (!s.haveManifest) return t;
+    for (const auto& e : s.manifest.extras)
+        if (std::find(names.begin(), names.end(), e.name) != names.end()) t += (t.empty() ? "" : ", ") + e.title;
+    return t;
+}
+
+// The download's progress line names the pack when more than one is queued (or it is an extra).
+std::string currentPrefix(const ArtPackDownloader::Status& s) {
+    if (s.currentTitle.empty() || (s.queueLen <= 1 && s.haveManifest && s.current == s.manifest.name)) return {};
+    return (s.queueLen > 1 ? "[" + std::to_string(s.queuePos) + "/" + std::to_string(s.queueLen) + "] " : std::string()) +
+           s.currentTitle + " - ";
+}
+
 bool updateAvailable(const ArtPackDownloader::Status& s, const InstalledArtPack& inst) {
     return s.haveManifest && ArtPackDownloader::isUpdate(s.manifest, inst);
 }
@@ -64,6 +113,7 @@ bool updateAvailable(const ArtPackDownloader::Status& s, const InstalledArtPack&
 std::string licenceLabel(const std::string& l) {
     if (l == "cc-by-sa-4.0") return "CC BY-SA 4.0";
     if (l == "gpl-3.0-or-later") return "GPL-3.0-or-later";
+    if (l == "cc0-1.0") return "CC0";
     return l;
 }
 
@@ -110,7 +160,7 @@ void Menu::applyInstalledArtPack() {
     SDL_Log("Art pack %s selected (art%s)", name.c_str(), inst.hasModels ? " + 3D models" : "");
     // 3D picked on the welcome page: now it can be used.
     if (welcomeWants3d_ && inst.hasModels && Settings::modelPackInstalled()) {
-        settings_.applyPreset(Settings::GraphicsPreset::ThreeD);
+        settings_.applyPreset(static_cast<Settings::GraphicsPreset>(welcomeWanted3d_));
         welcomeWants3d_ = false;
     }
     wantSave = true;
@@ -131,7 +181,10 @@ bool Menu::artPackPromptWanted() const {
     if (artPackPromptLater_) return false;
     const auto s = ArtPackDownloader::instance().status();
     if (s.state == State::Done) return false;
-    return !installedCached(s.haveManifest ? s.manifest.name : kArtPackName).installed;
+    if (!installedCached(s.haveManifest ? s.manifest.name : kArtPackName).installed) return true;
+    // The 3D (Reimagined) tab: the manifest's 3D extras (Reimagined models, photo terrain, ground
+    // clutter) that are still missing - the look the release trailer shows.
+    return graphicsTab_ == static_cast<int>(Settings::GraphicsPreset::ThreeD) && s.haveManifest && !missing3dCached(s).empty();
 }
 
 float Menu::artPackPrompt(float x, float y, float w) {
@@ -143,8 +196,13 @@ float Menu::artPackPrompt(float x, float y, float w) {
     ui_.fill(box, Colour{60, 40, 20, 200});
     ui_.outline(box, theme::kAccent);
     const float ts = ui_.textScale * 0.9f;
-    std::string line = tr("OpenD2K 3D art pack");
-    if (s.haveManifest) line += ", " + formatBytes(s.manifest.size);
+    // On the Reimagined tab: the main pack (if missing) + the missing 3D extras, as one download.
+    const bool reimaginedTab = graphicsTab_ == static_cast<int>(Settings::GraphicsPreset::ThreeD);
+    const bool mainMissing = !installedCached(s.haveManifest ? s.manifest.name : kArtPackName).installed;
+    const std::vector<std::string> want = reimaginedTab ? missing3dCached(s) : std::vector<std::string>{};
+    const std::string extras = extraTitles(s, want);
+    std::string line = tr(mainMissing ? "OpenD2K 3D art pack" : "3D Reimagined extras");
+    if (s.haveManifest) line += ", " + formatBytes(reimaginedTab ? ArtPackDownloader::sizeOf(s.manifest, want) : s.manifest.size);
     {
         Ui::BoldScope bold(ui_);
         const SDL_FRect t = st_.r(x + 6, y + 4, 0, 0);
@@ -152,12 +210,17 @@ float Menu::artPackPrompt(float x, float y, float w) {
     }
     const bool busy = dl.busy() && s.state != State::Checking;
     const SDL_FRect t2 = st_.r(x + 6, y + 21, 0, 0);
-    ui_.text(ui_.ellipsize(busy ? std::string(tr("Downloading...")) : std::string(tr("Redesigned 3D models and sprites")),
+    std::string sub = mainMissing ? std::string(tr("Redesigned 3D models and sprites")) : extras;
+    if (mainMissing && !extras.empty()) sub += ", " + extras;
+    ui_.text(ui_.ellipsize(busy ? std::string(tr("Downloading...")) : sub,
                            st_.r(0, 0, w - 190, 0).w, ts * 0.9f),
              t2.x, t2.y, theme::kDim, ts * 0.9f);
     const float bw = 84, bh = 22, by = y + (h - bh) / 2;
     if (ui_.button(st_.r(x + w - 2 * bw - 12, by, bw, bh), tr(busy ? "Show" : "Download"), ButtonStyle::Primary)) {
-        if (!busy) dl.download();  // the player asked for it
+        if (!busy) {  // the player asked for it
+            if (reimaginedTab) dl.download({kArtPack3dSet});
+            else dl.download();
+        }
         artPackBack_ = "graphics";
         open(MenuPage::ArtPack);
     }
@@ -173,13 +236,43 @@ bool Menu::openArtPackPreview(const std::string& name) {
     m.size = 612'400'000;
     m.licence = "cc-by-sa-4.0";
     m.sha256 = std::string(64, '0');
+    for (const auto& [n, t, sz] : {std::tuple{"models-reimagined", "3D Reimagined models", 355'000'000ull},
+                                   std::tuple{"photo-terrain", "Photo terrain", 78'000'000ull},
+                                   std::tuple{"ground-clutter", "Ground clutter", 5'500'000ull}}) {
+        formats::ArtPackManifest e;
+        e.name = n;
+        e.title = t;
+        e.version = "0.0.3";
+        e.size = sz;
+        e.sha256 = m.sha256;
+        e.for3d = e.isExtra = true;
+        m.extras.push_back(e);
+    }
+    {
+        formats::ArtPackManifest e;
+        e.name = "ru-ai-voices";
+        e.title = "Russian AI voices";
+        e.description = "Russian voices created with AI, similar to the original (unofficial fan work). Russian text needs your own Russian translation, else the text stays English.";
+        e.version = "0.0.3";
+        e.size = 4'900'000;
+        e.licence = "cc-by-sa-4.0";
+        e.sha256 = m.sha256;
+        e.isExtra = true;
+        e.install = formats::kInstallAiVoices;
+        m.extras.push_back(e);
+    }
     auto& dl = ArtPackDownloader::instance();
-    if (name == "artpack-live" || name == "artpack-live-download") {
+    const std::string getPrefix = "artpack-live-get-";
+    if (name == "artpack-live" || name == "artpack-live-download" || name == "artpack-live-download3d" ||
+        name.rfind(getPrefix, 0) == 0) {
         // The real state (end-to-end tests with --artpack-manifest and --frames N); -download
-        // starts the download as if the button had been pressed.
+        // starts the download as if the button had been pressed, -download3d as "Get all for 3D",
+        // -get-<name> as one pack's own Download button (artpack-live-get-ru-ai-voices).
         artPackBack_.clear();
         open(MenuPage::ArtPack);
         if (name == "artpack-live-download") dl.download();
+        if (name == "artpack-live-download3d") dl.download({kArtPack3dSet});
+        if (name.rfind(getPrefix, 0) == 0) dl.download({name.substr(getPrefix.size())});
         return true;
     }
     gPreviewInstalled = 0;
@@ -286,16 +379,16 @@ MenuResult Menu::pageArtPack() {
         y += 20;
         std::string msg;
         if (s.state == State::Downloading) {
-            msg = render::trf("Downloading: %s of %s", formatBytes(s.done).c_str(), formatBytes(s.total).c_str());
+            msg = currentPrefix(s) + render::trf("Downloading: %s of %s", formatBytes(s.done).c_str(), formatBytes(s.total).c_str());
             if (s.bytesPerSec > 1) {
                 char sp[32];
                 std::snprintf(sp, sizeof sp, "%.1f MB/s", s.bytesPerSec / 1e6);
                 msg += "  (" + std::string(sp) + ")";
             }
         } else {
-            msg = tr(s.state == State::Verifying ? "Checking the download..." : "Installing...");
+            msg = currentPrefix(s) + tr(s.state == State::Verifying ? "Checking the download..." : "Installing...");
         }
-        textAt(msg, y, theme::kText, small);
+        textAt(ui_.ellipsize(msg, st_.r(0, 0, w, 0).w, small), y, theme::kText, small);
         y += lineH + 4;
         if (ui_.button(st_.r(x, y, 130, bh), tr("Cancel"))) dl.cancel();
         y += bh + 8;
@@ -312,12 +405,20 @@ MenuResult Menu::pageArtPack() {
             y += ui_.textHeight(small * 0.95f) / st_.s + 4;
         };
         if (s.state == State::Done) {
+            // What the last download installed: the main pack selects itself; an extra alone (e.g. the
+            // Russian AI voices) says where it is used.
+            const bool mainDone = s.installedNames.empty() || (s.haveManifest && std::find(s.installedNames.begin(), s.installedNames.end(),
+                                                                                           s.manifest.name) != s.installedNames.end());
+            const bool voicesDone = s.haveManifest && std::any_of(s.installedNames.begin(), s.installedNames.end(), [&](const std::string& n) {
+                                        const formats::ArtPackManifest* e = s.manifest.item(n);
+                                        return e && e->install == formats::kInstallAiVoices;
+                                    });
             const bool models = ArtPackDownloader::installed(settings_.artPack).hasModels;
-            y += ui_.wrapped(tr(models ? "Installed. The redesigned art and the 3D models are selected (Options > Graphics)."
-                                       : "Installed. The redesigned art is selected (Options > Graphics)."),
-                             st_.r(x, y, w, 36), Colour{150, 220, 120, 255}, small) /
-                     st_.s +
-                 6;
+            std::string msg = !mainDone ? std::string(tr("Installed."))
+                              : tr(models ? "Installed. The redesigned art and the 3D models are selected (Options > Graphics)."
+                                          : "Installed. The redesigned art is selected (Options > Graphics).");
+            if (voicesDone) msg += std::string(" ") + tr("Russian AI voices: Options > Language > Русский (AI).");
+            y += ui_.wrapped(msg, st_.r(x, y, w, 36), Colour{150, 220, 120, 255}, small) / st_.s + 6;
         } else if (s.state == State::Failed || s.state == State::CheckFailed) {
             const std::string what = tr(s.state == State::Failed ? "Download failed" : "Could not check for the latest version");
             y += ui_.wrapped(what + ": " + uiUtf8(s.error), st_.r(x, y, w, 36), theme::kBad, small) / st_.s + 2;
@@ -350,12 +451,57 @@ MenuResult Menu::pageArtPack() {
             if (ui_.button(st_.r(bx, y, std::min(200.f, x + w - bx), bh), tr("Open download page"))) openPage();
         y += bh + 8;
     }
+    // The extras (0.0.3+): one row each - title, size, installed / update, its own Download - and
+    // "Get all for 3D" for what the 3D Reimagined look still lacks (the main pack included). The 3D ones
+    // first; others (the Russian AI voices) below them, and then the header says just "Extras" (the
+    // page has no room for a second header: rows are 18 high from 4 extras on).
+    std::string hoverDesc;  // a hovered extra's description, shown in place of the folder line below
+    if (s.haveManifest && !s.manifest.extras.empty() && !s.manualOnly) {
+        const std::vector<std::string> missing = missing3dCached(s);
+        const bool anyOther = std::any_of(s.manifest.extras.begin(), s.manifest.extras.end(), [](const auto& e) { return !e.for3d; });
+        const float rowH = s.manifest.extras.size() >= 4 ? 18.f : 20.f;
+        {
+            Ui::BoldScope bold(ui_);
+            textAt(tr(anyOther ? "Extras" : "Extras for 3D (Reimagined)"), y, theme::kAccent, small);
+        }
+        if (!missing.empty()) {
+            const std::string all = std::string(tr("Get all for 3D")) + " (" + formatBytes(ArtPackDownloader::sizeOf(s.manifest, missing)) + ")";
+            if (ui_.button(st_.r(x + w - 170, y - 2, 170, 18), all, ButtonStyle::Primary, true, 0.85f)) dl.download({kArtPack3dSet});
+        }
+        y += 20;
+        auto row = [&](const formats::ArtPackManifest& e) {
+            const InstalledArtPack ei = gPreviewInstalled >= 0 ? InstalledArtPack{} : ArtPackDownloader::installed(e);
+            const bool upd = ArtPackDownloader::isUpdate(e, ei);
+            std::string what = e.title + ", " + formatBytes(e.size);
+            if (!e.licence.empty()) what += ", " + licenceLabel(e.licence);
+            textAt(ui_.ellipsize(what, st_.r(0, 0, w - 190, 0).w, small), y + 2, theme::kText, small);
+            if (const SDL_FRect hr = st_.r(x, y, w - 90, rowH); !e.description.empty() && ui_.mouseX() >= hr.x && ui_.mouseX() < hr.x + hr.w &&
+                                                                  ui_.mouseY() >= hr.y && ui_.mouseY() < hr.y + hr.h)
+                hoverDesc = tr(e.description);
+            const bool current = busy && s.current == e.name;
+            const std::string state = current ? std::string(tr("downloading..."))
+                                      : upd   ? render::trf("update %s available", ("v" + e.version).c_str())
+                                      : ei.installed ? (ei.version.empty() ? std::string(tr("installed")) : "v" + ei.version)
+                                                     : std::string(tr("not installed"));
+            textAt(state, y + 2, ei.installed && !upd ? Colour{150, 220, 120, 255} : theme::kDim, small, x + w - 186);
+            if ((!ei.installed || upd) && !current &&
+                ui_.button(st_.r(x + w - 84, y, 84, rowH - 2), tr(upd ? "Update" : "Download"), ButtonStyle::Normal, true, 0.85f))
+                dl.download({e.name});
+            y += rowH;
+        };
+        for (const formats::ArtPackManifest& e : s.manifest.extras)
+            if (e.for3d) row(e);
+        for (const formats::ArtPackManifest& e : s.manifest.extras)
+            if (!e.for3d) row(e);
+        y += 4;
+    }
     // Settings + where it goes.
     ui_.toggle(st_.r(x, y, w, 20), tr("Check for updates when Options opens"), settings_.artPackUpdateCheck);
     y += 26;
     const std::string dir = render::ArtPack::userDir();
-    y += ui_.wrapped(std::string(tr("Downloaded from")) + " github.com/OpenD2K/opend2k. " + tr("Installed in") + ": " + uiUtf8(dir),
-                     st_.r(x, y, w, 30), theme::kDim, small * 0.95f) /
+    y += ui_.wrapped(!hoverDesc.empty() ? hoverDesc
+                                        : std::string(tr("Downloaded from")) + " github.com/OpenD2K/opend2k. " + tr("Installed in") + ": " + uiUtf8(dir),
+                     st_.r(x, y, w, 30), hoverDesc.empty() ? theme::kDim : theme::kText, small * 0.95f) /
          st_.s;
     if (ui_.button(st_.r(100, 377, 110, 22), tr("Back")) || ui_.takeBack())
         open(artPackBack_ == "graphics"  ? MenuPage::Graphics
@@ -468,6 +614,29 @@ std::string artOfferText(const ArtPackDownloader::Status& s) {
 
 }  // namespace
 
+// The welcome page's Download: the main pack, plus the 3D Reimagined extras when the player chose
+// the 3D (Reimagined) look (kArtPack3dSet: whatever of it is still missing).
+bool Menu::welcomeWantsReimagined() const {
+    using GP = Settings::GraphicsPreset;
+    return welcomeWants3d_ ? welcomeWanted3d_ == static_cast<int>(GP::ThreeD) : settings_.activePreset() == GP::ThreeD;
+}
+
+void Menu::welcomeDownload() {
+    auto& dl = ArtPackDownloader::instance();
+    if (welcomeWantsReimagined()) dl.download({kArtPack3dSet});
+    else dl.download();
+}
+
+std::string Menu::welcomeDownloadSize(const ArtPackDownloader::Status& s) const {
+    if (!s.haveManifest) return tr("about 600 MB");
+    if (welcomeWantsReimagined()) {
+        std::vector<std::string> want = missing3dCached(s);
+        if (std::find(want.begin(), want.end(), s.manifest.name) == want.end()) want.push_back(s.manifest.name);
+        return formatBytes(ArtPackDownloader::sizeOf(s.manifest, want));
+    }
+    return formatBytes(s.manifest.size);
+}
+
 MenuResult Menu::pageWelcome() {
     using GP = Settings::GraphicsPreset;
     MenuResult res;
@@ -501,19 +670,22 @@ MenuResult Menu::pageWelcome() {
                  ui_.textHeight(small), theme::kDim, small, Align::Right);
         y += ui_.textHeight(ui_.textScale) / st_.s + 4;
     }
-    // Three cards: picture, name, what it is.
+    // Four cards (the presets; owner 2026-11-18): picture, name, what it is.
+    constexpr int kCards = 4;
     const GP active = settings_.activePreset();
     const bool phone = phoneUi();  // the phone's larger text: taller buttons
-    const float gap = 10, cw = (w0 - 2 * gap) / 3;
-    static const char* const kNames[] = {"Original", "Enhanced", "3D"};
-    static const char* const kBadge[] = {"1998", "2D", "3D"};
-    const char* lines[3] = {
+    const float gap = 10, cw = (w0 - (kCards - 1) * gap) / kCards;
+    static const char* const kNames[] = {"Original", "Enhanced", "3D", "3D Classic"};
+    static const char* const kBadge[] = {"1998", "2D", "3D", "3D"};
+    const char* lines[kCards] = {
         "The 1998 game, exactly: the original pixels, sidebar, shroud and effects.",
         installed ? "Modern 2D: redesigned units and buildings, designed terrain, lighting, modern effects and the modern panel."
                   : "Modern 2D: designed terrain, lighting, modern effects and the modern panel, with the original 1998 unit "
                     "and building sprites.",
         can3d ? "A 2.5D battlefield: 3D models, 3D terrain with sun shadows, modern effects."
-              : "A 2.5D battlefield with 3D models. Needs the art pack."};
+              : "A 2.5D battlefield with 3D models. Needs the art pack.",
+        can3d ? "The original 1998 tiles on the 3D battlefield, with 3D models."
+              : "The original 1998 tiles in 3D. Needs the art pack."};
     // As tall as the longest description needs (languages and the phone font differ), so the boxes
     // below get the rest.
     float textH = 0;
@@ -535,16 +707,17 @@ MenuResult Menu::pageWelcome() {
                           2 + measure(tr("A PS1 disc image also works: Options > Game data folder."), cutW - 16, small * 0.9f) + rowH;
     const float ph = std::clamp(360 - y - 8 - std::max(artNeed, cutNeed) - cardTextH, cw * 5 / 16, cw * 9 / 16);
     const float cardH = ph + cardTextH;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < kCards; ++i) {
         const float cx = x0 + i * (cw + gap);
         const SDL_FRect card = st_.r(cx, y, cw, cardH);
-        const bool disabled = i == 2 && !can3d;
-        const bool selected = disabled ? welcomeWants3d_ : static_cast<int>(active) == i && !welcomeWants3d_;
+        const bool disabled = Settings::isThreeDPreset(static_cast<GP>(i)) && !can3d;
+        const bool selected = disabled ? welcomeWants3d_ && welcomeWanted3d_ == i : static_cast<int>(active) == i && !welcomeWants3d_;
         bool hot = false;
         ui_.fill(card, selected ? Colour{70, 48, 24, 230} : Colour{26, 18, 11, 200});
         if (ui_.hotspot(card, &hot)) {
             if (disabled) {
-                welcomeWants3d_ = !welcomeWants3d_;  // switched on once the pack is installed
+                welcomeWants3d_ = !(welcomeWants3d_ && welcomeWanted3d_ == i);  // switched on once the pack is installed
+                welcomeWanted3d_ = i;
             } else {
                 welcomeWants3d_ = false;
                 settings_.applyPreset(static_cast<GP>(i));
@@ -583,7 +756,7 @@ MenuResult Menu::pageWelcome() {
     ui_.outline(box, theme::kAccent);
     const float bx = x0 + 8, bw = artW - 16;
     float by = y + 5;
-    const std::string size = s.haveManifest ? formatBytes(s.manifest.size) : std::string(tr("about 600 MB"));
+    const std::string size = welcomeDownloadSize(s);
     auto heading = [&](const std::string& t, Colour c) {
         Ui::BoldScope bold(ui_);
         const SDL_FRect r = st_.r(bx, by, 0, 0);
@@ -621,7 +794,7 @@ MenuResult Menu::pageWelcome() {
         } else if (ui_.button(st_.r(btnX, btnY, btnW, btnH),
                               std::string(tr(s.state == State::Failed ? "Retry" : "Download")) + (phone ? std::string() : " (" + size + ")"), ButtonStyle::Primary,
                               true, 0.85f)) {
-            dl.download();  // the player asked for it
+            welcomeDownload();  // the player asked for it
         }
     }
     welcomeCutscenes(res, x0 + artW + gapB, y, w0 - artW - gapB, boxH);
@@ -904,15 +1077,17 @@ MenuResult Menu::pageWelcomePhone(bool installed, bool can3d) {
     if (welcomeStep_ == 0) {
         ui_.text(tr("Choose your look"), L, top, theme::kAccent, label);
         top += ui_.textHeight(label) + std::round(6 * d);
-        // Three cards: picture, name (+ Chosen), one short line.
+        // Four cards (the presets): picture, name (+ Chosen), one short line.
+        constexpr int kCards = 4;
         const GP active = settings_.activePreset();
-        static const char* const kNames[] = {"Original", "Enhanced", "3D"};
-        static const char* const kBadge[] = {"1998", "2D", "3D"};
-        const char* lines[3] = {"The 1998 game, exactly as it was.",
-                                installed ? "Modern 2D with redesigned units and buildings."
-                                          : "Modern 2D terrain and effects, the original unit sprites.",
-                                "A 2.5D battlefield with 3D models and sun shadows."};
-        const float cw = std::floor((W - 2 * gap) / 3), pad = std::round(8 * d);
+        static const char* const kNames[] = {"Original", "Enhanced", "3D", "3D Classic"};
+        static const char* const kBadge[] = {"1998", "2D", "3D", "3D"};
+        const char* lines[kCards] = {"The 1998 game, exactly as it was.",
+                                     installed ? "Modern 2D with redesigned units and buildings."
+                                               : "Modern 2D terrain and effects, the original unit sprites.",
+                                     "A 2.5D battlefield with 3D models and sun shadows.",
+                                     "The original 1998 tiles in 3D."};
+        const float cw = std::floor((W - (kCards - 1) * gap) / kCards), pad = std::round(8 * d);
         float descH = 0;
         for (const char* l : lines) descH = std::max(descH, ui_.wrapped(tr(l), {0, 0, cw - 2 * pad, 10000}, theme::kText, body, 0, false));
         const float textH = std::round(4 * d) + ui_.textHeight(label) + std::round(2 * d) + descH + pad;
@@ -920,16 +1095,17 @@ MenuResult Menu::pageWelcomePhone(bool installed, bool can3d) {
         const float picH = std::max(24 * d, std::min(avail - pad - textH, (cw - 2 * pad) * 0.625f));
         const float cardH = pad + picH + textH;
         const float cy = top + std::max(0.f, std::round((avail - cardH) / 2));
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < kCards; ++i) {
             const float cx = L + i * (cw + gap);
             const SDL_FRect card{cx, cy, cw, cardH};
-            const bool disabled = i == 2 && !can3d;
-            const bool selected = disabled ? welcomeWants3d_ : static_cast<int>(active) == i && !welcomeWants3d_;
+            const bool disabled = Settings::isThreeDPreset(static_cast<GP>(i)) && !can3d;
+            const bool selected = disabled ? welcomeWants3d_ && welcomeWanted3d_ == i : static_cast<int>(active) == i && !welcomeWants3d_;
             bool hot = false;
             ui_.fill(card, selected ? Colour{70, 48, 24, 235} : Colour{26, 18, 11, 215});
             if (ui_.hotspot(card, &hot)) {
                 if (disabled) {
-                    welcomeWants3d_ = !welcomeWants3d_;  // switched on once the pack is installed
+                    welcomeWants3d_ = !(welcomeWants3d_ && welcomeWanted3d_ == i);  // switched on once the pack is installed
+                    welcomeWanted3d_ = i;
                 } else {
                     welcomeWants3d_ = false;
                     settings_.applyPreset(static_cast<GP>(i));
@@ -975,7 +1151,7 @@ MenuResult Menu::pageWelcomePhone(bool installed, bool can3d) {
     // Step 2: the art pack (what it adds and Download / the progress / installed) and the cutscenes,
     // in two equal columns; the content scrolls when a language needs more than the screen.
     const float colW = std::floor((W - gap) / 2), pad = std::round(10 * d), sg = std::round(8 * d);
-    const std::string size = s.haveManifest ? formatBytes(s.manifest.size) : std::string(tr("about 600 MB"));
+    const std::string size = welcomeDownloadSize(s);
     auto artBox = [&](const SDL_FRect& r, bool draw) -> float {
         const float x = r.x + pad, w = r.w - 2 * pad;
         if (draw) {
@@ -1035,7 +1211,7 @@ MenuResult Menu::pageWelcomePhone(bool installed, bool can3d) {
             } else {
                 std::string b = std::string(tr(s.state == State::Failed ? "Retry" : "Download")) + " (" + size + ")";
                 if (ui_.textWidth(b, label) > w - 16 * d) b = tr(s.state == State::Failed ? "Retry" : "Download");
-                if (ui_.button({x, btnY, w, bh}, b, ButtonStyle::Primary)) dl.download();  // the player asked for it
+                if (ui_.button({x, btnY, w, bh}, b, ButtonStyle::Primary)) welcomeDownload();  // the player asked for it
             }
         }
         return y + sg + bh + pad - r.y;

@@ -50,6 +50,20 @@ struct DisplayAdjust {
     static DisplayAdjust fromSettings(int brightness, int contrast, int gamma, int saturation);
 };
 
+// The Reimagined "Realistic grade" (docs/3d-mode.md "Realistic grade"; Settings::naturalGrade): the colour grade
+// of the 3D picture, after the tone map and before the display adjustments (tonemap_fs naturalGrade). All 0 =
+// off (the picture unchanged).
+struct Grade {
+    float desaturate = 0;  // share of the saturation taken away (0.28 = -28 %)
+    float toe = 0;         // the filmic toe's knee (linear light): the darks below about it sink
+    float cool = 0;        // 0..1: the shadows a little cooler
+    float lift = 0;        // the highlights lifted by this share
+    bool on() const { return desaturate > 0; }
+    // The grade of the setting. day = the share of daylight in the frame (1 = day .. 0 = night: the
+    // night's own blue grade keeps its colour, only the toe stays).
+    static Grade natural(float day = 1.0f);
+};
+
 class Hdr {
 public:
     explicit Hdr(SDL_Renderer* r);
@@ -67,8 +81,9 @@ public:
     // `bloom` (Bloom::compute; may be null) x bloomStrength added. tonemap false = no shoulder,
     // just clamped at SDR white (Classic lighting in a float scene: the picture from before).
     // Returns false (nothing drawn) when unavailable.
+    // grade: the Reimagined colour grade of the result (off by default: nothing changes).
     bool compose(SDL_Texture* scene, int srcW, int srcH, SDL_Texture* bloom, float bloomStrength, const SDL_FRect& dst,
-                 bool tonemap);
+                 bool tonemap, const Grade& grade = {});
     // Draws the frame's canvas (sRGB-coded values; EDR: extended above 1) to `dst` of the current
     // target with the display adjustments: linearOut (EDR, the float backbuffer) = as linear light,
     // else sRGB-coded (an SDR backbuffer). False when unavailable.

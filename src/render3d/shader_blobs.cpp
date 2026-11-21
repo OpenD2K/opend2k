@@ -1,7 +1,11 @@
 #include "render3d/shader_blobs.hpp"
 
+#include "render3d/cinematic_msl.hpp"
+#include "render3d/clutter_msl.hpp"
+#include "render3d/model_pbr_msl.hpp"
 #include "render3d/models_msl.hpp"
 #include "render3d/shaders_msl.hpp"
+#include "render3d/ssao_msl.hpp"
 #include "render3d/terrain_v2_msl.hpp"
 #include "render3d/terrain_v3_msl.hpp"
 
@@ -51,8 +55,14 @@ const char* terrain3Msl() {
     static const std::string src = [] {
         const char* head = msl::kTerrain2;
         const char* cut = std::strstr(head, msl::kTerrain2Main);
-        return std::string(head, cut ? std::size_t(cut - head) : std::strlen(head)) + msl::kTerrain3Body;
+        return std::string(head, cut ? std::size_t(cut - head) : std::strlen(head)) + msl::kTerrain3Body + msl::kTerrain3Main;
     }();
+    return src.c_str();
+}
+
+// model_pbr_fs = the model pass's source (structs, helpers, light block) + the PBR fragment function.
+const char* modelPbrMsl() {
+    static const std::string src = std::string(msl::kModel) + msl::kModelPbr;
     return src.c_str();
 }
 
@@ -72,6 +82,15 @@ const Entry& entryFor(ShaderId id) {
         D2K_SHADER(depth_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, msl::kDepth),
         D2K_SHADER(terrain3_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, terrain3Msl()),
         D2K_SHADER(tonemap_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, msl::kTonemap),
+        D2K_SHADER(fx_vs, SDL_GPU_SHADERSTAGE_VERTEX, msl::kCinematic),
+        D2K_SHADER(fx_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, msl::kCinematic),
+        D2K_SHADER(fxc_vs, SDL_GPU_SHADERSTAGE_VERTEX, msl::kCinematic),
+        D2K_SHADER(fxc_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, msl::kCinematic),
+        D2K_SHADER(model_pbr_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, modelPbrMsl()),
+        D2K_SHADER(clutter_vs, SDL_GPU_SHADERSTAGE_VERTEX, msl::kClutter),
+        D2K_SHADER(clutter_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, msl::kClutter),
+        D2K_SHADER(ssao_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, msl::kSsao),
+        D2K_SHADER(ssaoblur_fs, SDL_GPU_SHADERSTAGE_FRAGMENT, msl::kSsao),
     };
     return kEntries[static_cast<int>(id)];
 }

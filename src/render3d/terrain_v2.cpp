@@ -5,11 +5,13 @@
 #include "render/tileset.hpp"
 #include "render3d/gpu.hpp"
 #include "render3d/model_gltf.hpp"
+#include "render3d/photo_terrain.hpp"
 #include "render3d/shader_blobs.hpp"
 #include "render3d/terrain.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iterator>
 #include <cstring>
@@ -107,6 +109,8 @@ struct FaithU {
     float slab[4], seamLight[4], seamDark[4];
     float detailSun[4];    // xyz = the sun of the level ground's fine detail, w = 1 / its flat-ground light
     float reliefLight[4];  // ambient, diffuse, 1 / flat-ground light of the broken rock (lit by sunDir), w unused
+    float reim[4][4];      // "Reimagined" (docs/3d-mode.md): see terrain_v3_msl.hpp F3U::reim
+    float photo[9][4];     // "Photo terrain" (docs/3d-mode.md): see terrain_v3_msl.hpp F3U::photo
 };
 enum { kFGuide, kFLevel0, kFCragTex = kFLevel0 + 5, kFRoughTex, kFShade, kFFace, kFSlab, kFSeamLight, kFSeamDark, kFMapRows };
 
@@ -114,6 +118,12 @@ enum { kFGuide, kFLevel0, kFCragTex = kFLevel0 + 5, kFRoughTex, kFShade, kFFace,
 // (Concrete looks the same with or without a building on it: owner, 2026-11-11 - an earlier
 // version drew the slabs under buildings paler, like the original's skirt tiles.)
 constexpr int kConcreteTileIds[3] = {0x28B, 0x29F, 0x2B3};
+
+// Ground occlusion (Realistic grade): what stands on a cell - 2 a building's solid cell, 1 a wall, 0 nothing.
+std::uint8_t occOf(std::uint32_t flags) {
+    namespace cf = game::cell_flags;
+    return (flags & cf::kBuilding) ? 2 : (flags & cf::kWall) ? 1 : 0;
+}
 
 float hash2(int x, int y, int salt) {
     std::uint32_t h = std::uint32_t(x) * 0x8da6b343u ^ std::uint32_t(y) * 0xd8163841u ^ std::uint32_t(salt) * 0xcb1ab31fu;
@@ -213,6 +223,16 @@ std::unique_ptr<DesignedTerrain> DesignedTerrain::create(SDL_GPUDevice* dev, SDL
     return p;
 }
 
+DesignedTerrain::DesignedTerrain(SDL_GPUDevice* dev) : dev_(dev) {}
+
+bool DesignedTerrain::ensurePhoto() {
+    if (!photo_ && !photoTried_) {
+        photoTried_ = true;
+        photo_ = PhotoTerrain::create(dev_, aniso_);
+    }
+    return photo_ != nullptr;
+}
+
 DesignedTerrain::~DesignedTerrain() {
     for (SDL_GPUBuffer* b : {viewVB_, shadowVB_})
         if (b) SDL_ReleaseGPUBuffer(dev_, b);
@@ -220,11 +240,13 @@ DesignedTerrain::~DesignedTerrain() {
         if (t) SDL_ReleaseGPUTexture(dev_, t);
     if (faithPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, faithPipe_);
     if (guideSampler_) SDL_ReleaseGPUSampler(dev_, guideSampler_);
+    if (guideMirror_) SDL_ReleaseGPUSampler(dev_, guideMirror_);
     for (SDL_GPUBuffer* b : {rockVB_, instVB_})
         if (b) SDL_ReleaseGPUBuffer(dev_, b);
     if (terrainPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, terrainPipe_);
     if (rockPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, rockPipe_);
     if (rockDepthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, rockDepthPipe_);
+    if (rockViewDepthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, rockViewDepthPipe_);
     if (matSampler_) SDL_ReleaseGPUSampler(dev_, matSampler_);
 }
 
@@ -345,7 +367,7 @@ bool DesignedTerrain::init(SDL_GPUTextureFormat color, SDL_GPUTextureFormat dept
     SDL_GPUShader* tvs = createShader(dev_, ShaderId::TerrainVs, 0, 1);
     SDL_GPUShader* tfs = createShader(dev_, ShaderId::Terrain2Fs, 7, 2, 1);
     SDL_GPUShader* rvs = createShader(dev_, ShaderId::RockVs, 0, 1);
-    SDL_GPUShader* rfs = createShader(dev_, ShaderId::RockFs, 3, 2, 1);
+    SDL_GPUShader* rfs = createShader(dev_, ShaderId::RockFs, 4, 2, 1);
     bool ok = tvs && tfs && rvs && rfs;
     SDL_GPUColorTargetDescription ctd{};
     ctd.format = color;
@@ -428,6 +450,13 @@ Vec3 DesignedTerrain::faithfulBakeSun() {
     return normalize(Vec3{std::sin(az) * std::cos(e), std::sin(e), -std::cos(az) * std::cos(e)});
 }
 
+// Reimagined: the faithful side (a little more from the south), 30 degrees up - a 70 px cliff casts a
+// ~120 px shadow onto the sand.
+Vec3 DesignedTerrain::reimaginedSun3D() {
+    const float e = radians(30.0f), az = radians(232.0f);
+    return normalize(Vec3{std::sin(az) * std::cos(e), std::sin(e), -std::cos(az) * std::cos(e)});
+}
+
 // The sun that casts the faithful bake's shadows: the same side, 42 degrees up - a cliff's shadow
 // then lies 8 - 16 px over the sand to its north-east, as in the original tiles (the mesh's
 // crests are a little lower than the relief they stand for).
@@ -436,7 +465,7 @@ Vec3 DesignedTerrain::faithfulBakeShadowSun() {
     return normalize(Vec3{std::sin(az) * std::cos(e), std::sin(e), -std::cos(az) * std::cos(e)});
 }
 
-const TerrainGuide* DesignedTerrain::prepareGuide(const game::World& w, const render::TileAtlas* atlas) {
+const TerrainGuide* DesignedTerrain::prepareGuide(const game::World& w, const render::TileAtlas* atlas, bool reimagined) {
     guide_.clear();
     if (style_ != TerrainStyle::Faithful) return nullptr;
     TerrainGuide::Params p;
@@ -444,6 +473,7 @@ const TerrainGuide* DesignedTerrain::prepareGuide(const game::World& w, const re
         p.faceSouth = 12.0f;
         p.faceNorth = 8.0f;
         p.faceEastWest = 9.0f;
+        p.reimagined = reimagined;
     } else {  // the original's south faces are 16 - 24 px wide; a ridge keeps a lit top band beside one
         p.faceSouth = 20.0f;
         p.faceNorth = 5.0f;
@@ -462,7 +492,7 @@ bool DesignedTerrain::ensureFaithPipeline() {
     if (faithPipe_) return true;
     if (faithPipeFailed_) return false;
     SDL_GPUShader* vs = createShader(dev_, ShaderId::TerrainVs, 0, 1);
-    SDL_GPUShader* fs = createShader(dev_, ShaderId::Terrain3Fs, 8, 3, 1);
+    SDL_GPUShader* fs = createShader(dev_, ShaderId::Terrain3Fs, 13, 3, 1);
     if (vs && fs) {
         SDL_GPUColorTargetDescription ctd{};
         ctd.format = colorFormat_;
@@ -498,6 +528,8 @@ bool DesignedTerrain::ensureFaithPipeline() {
         si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
         si.max_lod = 16;
         guideSampler_ = SDL_CreateGPUSampler(dev_, &si);
+        si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_MIRRORED_REPEAT;
+        guideMirror_ = SDL_CreateGPUSampler(dev_, &si);
     }
     if (!faithPipe_ || !guideSampler_) {
         SDL_Log("3D terrain: Designed (faithful) is not available here - using the Designed layout");
@@ -514,6 +546,7 @@ void DesignedTerrain::build(const game::World& w, const Terrain& t, const std::v
     const auto& kinds = t.cellKinds();
     cellMat_.assign(std::size_t(cw_) * ch_, kSand);
     concreteSig_.assign(cellMat_.size(), 0);
+    occSig_.assign(cellMat_.size(), 0);
     spice_.assign(cellMat_.size(), 0);
     const bool faith = faithfulActive();
     for (int y = 0; y < ch_; ++y)
@@ -531,7 +564,9 @@ void DesignedTerrain::build(const game::World& w, const Terrain& t, const std::v
             cellMat_[i] = m;
             concreteSig_[i] = c.flags & cf::kConcrete;
             spice_[i] = std::uint8_t(std::min(7, c.spice()) * 255 / 7);
+            occSig_[i] = groundOcc_ ? occOf(c.flags) : 0;
         }
+    occAll_ = false;
     computeTints(w, tileRgb);
     if (faith) faithfulLook(tileRgb);
     splatA_.assign(std::size_t(cw_) * kSplatRes * std::size_t(ch_) * kSplatRes, 0);
@@ -580,10 +615,51 @@ void DesignedTerrain::build(const game::World& w, const Terrain& t, const std::v
     splatDirty_ = spiceDirty_ = instDirty_ = true;
 }
 
+bool DesignedTerrain::setGroundOcclusion(bool on) {
+    if (on == groundOcc_) return false;
+    groundOcc_ = on;
+    occAll_ = true;
+    return true;
+}
+
+void DesignedTerrain::reimaginedSand(bool graded, float out[3]) const {
+    const float* c = colour_[kSand];
+    const float L = 0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2];
+    // (terrain3_fs reimagine: the saturation kept and the tint of the sand.)
+    static constexpr float kVivid[3] = {1.08f, 0.98f, 0.83f}, kGraded[3] = {1.0f, 0.95f, 0.845f};
+    const float keep = graded ? 0.32f : 0.47f;
+    for (int k = 0; k < 3; ++k) out[k] = (L + (c[k] - L) * keep) * (graded ? kGraded[k] : kVivid[k]) / 255.0f;
+}
+
 void DesignedTerrain::update(const game::World& w, std::vector<int>* changed) {
     namespace cf = game::cell_flags;
     if (w.width() != cw_ || w.height() != ch_) return;
     int x0 = cw_, y0 = ch_, x1 = -1, y1 = -1;
+    // The changed cells' box, and their box inside each block of kBlock x kBlock cells (changes far apart - two
+    // bases building at once - rebuild their own blocks, not the whole rectangle between them).
+    constexpr int kBlock = 8;
+    const int bw = (cw_ + kBlock - 1) / kBlock, bh = (ch_ + kBlock - 1) / kBlock;
+    bool blocksUsed = false;
+    auto touch = [&](int x, int y) {
+        x0 = std::min(x0, x);
+        y0 = std::min(y0, y);
+        x1 = std::max(x1, x);
+        y1 = std::max(y1, y);
+        if (!blocksUsed) {
+            blockBox_.assign(std::size_t(bw) * bh * 4, -1);
+            blocksUsed = true;
+        }
+        int* b = &blockBox_[(std::size_t(y / kBlock) * bw + std::size_t(x / kBlock)) * 4];
+        if (b[2] < 0) {
+            b[0] = b[2] = x;
+            b[1] = b[3] = y;
+        } else {
+            b[0] = std::min(b[0], x);
+            b[1] = std::min(b[1], y);
+            b[2] = std::max(b[2], x);
+            b[3] = std::max(b[3], y);
+        }
+    };
     for (int y = 0; y < ch_; ++y)
         for (int x = 0; x < cw_; ++x) {
             const std::size_t i = std::size_t(y) * cw_ + x;
@@ -600,15 +676,36 @@ void DesignedTerrain::update(const game::World& w, std::vector<int>* changed) {
                 if (sig) cellMat_[i] = kConcrete;
                 else if (cellMat_[i] == kConcrete) cellMat_[i] = kRock;
                 if (changed) changed->push_back(int(i));
-                x0 = std::min(x0, x);
-                y0 = std::min(y0, y);
-                x1 = std::max(x1, x);
-                y1 = std::max(y1, y);
+                touch(x, y);
+            }
+            // Ground occlusion (Realistic grade): a building / wall placed or gone.
+            const std::uint8_t occ = groundOcc_ ? occOf(c.flags) : 0;
+            if (occ != occSig_[i]) {
+                occSig_[i] = occ;
+                touch(x, y);
             }
         }
-    if (x1 >= 0) {  // concrete laid / destroyed: only that part of the splat
-        buildSplat(x0, y0, x1, y1);
+    bool whole = false;
+    if (occAll_) {  // ground occlusion switched: the whole splat
+        occAll_ = false;
+        whole = true;
+        x0 = y0 = 0;
+        x1 = cw_ - 1;
+        y1 = ch_ - 1;
+    }
+    if (x1 >= 0) {  // concrete laid / destroyed, a building placed / gone: only that part of the splat
+        const Uint64 t0 = SDL_GetTicksNS();
+        if (whole || !blocksUsed || (x1 - x0 < 12 && y1 - y0 < 12)) {
+            buildSplat(x0, y0, x1, y1);
+        } else {
+            for (std::size_t b = 0; b < blockBox_.size(); b += 4)
+                if (blockBox_[b + 2] >= 0) buildSplat(blockBox_[b], blockBox_[b + 1], blockBox_[b + 2], blockBox_[b + 3]);
+        }
         splatDirty_ = true;
+        // (D2K_SPLAT_LOG=1: what a rebuild costs - the ground occlusion adds building changes to them.)
+        static const bool log = std::getenv("D2K_SPLAT_LOG") != nullptr;
+        if (log)
+            SDL_Log("3D terrain: splat rebuilt for cells %d,%d..%d,%d in %.2f ms", x0, y0, x1, y1, double(SDL_GetTicksNS() - t0) / 1e6);
     }
 }
 
@@ -730,6 +827,7 @@ void DesignedTerrain::computeTints(const game::World& w, const std::vector<float
     SDL_Log("3D terrain: colour lock sand %.0f,%.0f,%.0f rock %.0f,%.0f,%.0f cliff %.0f,%.0f,%.0f spice %.0f,%.0f,%.0f",
             target[kSand][0], target[kSand][1], target[kSand][2], target[kRock][0], target[kRock][1], target[kRock][2],
             target[kCliff][0], target[kCliff][1], target[kCliff][2], target[kSpice][0], target[kSpice][1], target[kSpice][2]);
+    std::memcpy(colour_, target, sizeof colour_);
     for (int m = 0; m < kMaterials; ++m) {
         for (int k = 0; k < 3; ++k) tint_[m][k] = std::clamp(target[m][k] / std::max(texMean_[m][k], 1.0f), 0.15f, 4.0f);
         tint_[m][3] = kMaterialScale[m];
@@ -755,8 +853,11 @@ void DesignedTerrain::buildSplat(int rx0, int ry0, int rx1, int ry1) {
     const int px0 = std::max(0, rx0 - 2), py0 = std::max(0, ry0 - 2), px1 = std::min(cw_ - 1, rx1 + 2), py1 = std::min(ch_ - 1, ry1 + 2);
     const int LW = (px1 - px0 + 1) * kSplatRes, LH = (py1 - py0 + 1) * kSplatRes;
     const int ox = px0 * kSplatRes, oy = py0 * kSplatRes;
-    std::vector<float> ch[6];
-    for (auto& c : ch) c.assign(std::size_t(LW) * LH, 0.0f);
+    // (+ with ground occlusion, "Realistic grade": 6 = the buildings' / walls' cells, 7 = the concrete again -
+    // both blurred below into B.b / B.a.)
+    const bool occ = groundOcc_ && occSig_.size() == cellMat_.size();
+    std::vector<float> ch[8];
+    for (int ci = 0; ci < (occ ? 8 : 6); ++ci) ch[ci].assign(std::size_t(LW) * LH, 0.0f);
     for (int ly = 0; ly < LH; ++ly)
         for (int lx = 0; lx < LW; ++lx) {
             const float u = (float(lx + ox) + 0.5f) / kSplatRes, v = (float(ly + oy) + 0.5f) / kSplatRes;
@@ -771,14 +872,20 @@ void DesignedTerrain::buildSplat(int rx0, int ry0, int rx1, int ry1) {
             else if (m == kConcrete) m = cellMat_[std::size_t(uy) * cw_ + ux];
             const int c = kChan[m];
             if (c >= 0) ch[c][std::size_t(ly) * LW + lx] = 1.0f;
+            if (occ) {
+                const std::uint8_t o = occSig_[std::size_t(uy) * cw_ + ux];
+                ch[6][std::size_t(ly) * LW + lx] = o == 2 ? 1.0f : o == 1 ? 0.7f : 0.0f;
+                ch[7][std::size_t(ly) * LW + lx] = m == kConcrete ? 1.0f : 0.0f;
+            }
         }
     // Soft edges: separable box blurs (radius 2 texels = a quarter cell; twice). Concrete stays
     // binary: bilinear filtering of it crosses 0.5 exactly on the cell edges, and terrain2_fs
     // thresholds it there for a crisp slab border (no blur bleeding into the rock / sand).
     std::vector<float> tmp(std::size_t(LW) * LH);
     constexpr int R = 2;
-    for (int ci = 0; ci < 5; ++ci)
+    for (int ci = 0; ci < (occ ? 8 : 5); ++ci)
         for (int pass = 0; pass < 2; ++pass) {
+            if (ci == 5) break;  // (the concrete stays binary: not blurred)
             auto& c = ch[ci];
             for (int y = 0; y < LH; ++y)
                 for (int x = 0; x < LW; ++x) {
@@ -803,6 +910,7 @@ void DesignedTerrain::buildSplat(int rx0, int ry0, int rx1, int ry1) {
             const std::size_t l = std::size_t(y - oy) * LW + std::size_t(x - ox), g = std::size_t(y) * W + x;
             splatA_[g] = q(ch[0][l]) | (q(ch[1][l]) << 8) | (q(ch[2][l]) << 16) | (q(ch[3][l]) << 24);
             splatB_[g] = q(ch[4][l]) | (q(ch[5][l]) << 8);
+            if (occ) splatB_[g] |= (q(ch[6][l]) << 16) | (q(ch[7][l]) << 24);
             if (cliffCells) {
                 // Faithful: A.a = the cells no vehicle can use (binary per cell, unwarped and
                 // unblurred like the concrete: the cliff look ends exactly at their borders).
@@ -1230,8 +1338,20 @@ void DesignedTerrain::prepare(SDL_GPUCommandBuffer* cmd) {
     splatDirty_ = spiceDirty_ = instDirty_ = guideDirty_ = false;
 }
 
+float DesignedTerrain::surroundFog2(const Frame& f) {
+    return f.bake ? 2.0f : f.surround > 0 ? (f.shroudOn ? 3.0f : 2.0f) : f.shroudOn ? 1.0f : 0.0f;
+}
+
 int DesignedTerrain::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, SDL_GPUBuffer* vb, SDL_GPUBuffer* ib,
-                          std::uint32_t indexCount, const Frame& f, std::uint32_t firstIndex, const RockSet* rocks) {
+                          std::uint32_t indexCount, const Frame& f0, std::uint32_t firstIndex, const RockSet* rocks) {
+    // Reimagined (round 2): more contrast - less sky light, more sun (sunlit level ground keeps its
+    // brightness: the light is normalised by the flat-ground light), so cast shadows read deep.
+    Frame fr = f0;
+    if (fr.reimagined) {
+        fr.ambient = 0.42f;
+        fr.diffuse = 0.98f;
+    }
+    const Frame& f = fr;
     {  // dynamic point lights (fragment uniform buffer 1 of terrain2_fs / rock_fs)
         static PointLightsU none{};
         SDL_PushGPUFragmentUniformData(cmd, 1, f.lights ? f.lights : &none, sizeof(PointLightsU));
@@ -1244,7 +1364,7 @@ int DesignedTerrain::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, SD
     auto common = [&](float* sunDir, float* light, float* fogColor, float* fog, float* fog2) {
         const float s[4] = {f.sun.x, f.sun.y, f.sun.z, 0}, l[4] = {f.ambient, f.diffuse, flat, f.darkest},
                     fc[4] = {f.fogColor[0], f.fogColor[1], f.fogColor[2], 1}, fo[4] = {f.eye.x, f.eye.y, f.eye.z, f.fogStart},
-                    f2[4] = {f.fogEnd, f.mapW, f.mapH, f.bake ? 2.0f : f.shroudOn ? 1.0f : 0.0f};
+                    f2[4] = {f.fogEnd, f.mapW, f.mapH, surroundFog2(f)};
         std::memcpy(sunDir, s, sizeof s);
         std::memcpy(light, l, sizeof l);
         std::memcpy(fogColor, fc, sizeof fc);
@@ -1274,12 +1394,25 @@ int DesignedTerrain::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, SD
         SDL_BindGPUVertexBuffers(pass, 0, &vbb, 1);
         SDL_GPUBufferBinding ibb{ib, 0};
         SDL_BindGPUIndexBuffer(pass, &ibb, SDL_GPU_INDEXELEMENTSIZE_32BIT);
-        SDL_GPUTextureSamplerBinding sb[8] = {{albedoArr_, matSampler_}, {normalArr_, matSampler_},
-                                              {splatATex_, f.linearClamp}, {splatBTex_, f.linearClamp},
-                                              {spiceTex_, f.linearClamp}, {f.shroud, f.linearClamp},
-                                              {f.shadowMap, f.shadowSampler}, {guideTex_, guideSampler_}};
+        // The world beyond the map: the map's layout textures through mirror samplers (the same texels inside
+        // the map; across the edge the land beyond continues them), the far texture in slot 8.
+        const bool mirror = faith && f.surround > 0 && f.linearMirror && guideMirror_;
+        SDL_GPUSampler* lay = mirror ? f.linearMirror : f.linearClamp;
+        // Photo terrain (slots 9 - 11: the scans' arrays; the old arrays stand in, unread, without it) and the
+        // screen-space ambient occlusion (slot 12; a stand-in, unread, when off).
+        const bool photo = faith && f.reimagined && f.photo && photo_;
+        SDL_GPUSampler* ssaoSamp = f.ssao && f.ssaoSampler ? f.ssaoSampler : f.linearClamp;
+        SDL_GPUTextureSamplerBinding sb[13] = {{albedoArr_, matSampler_}, {normalArr_, matSampler_},
+                                               {splatATex_, lay}, {splatBTex_, lay},
+                                               {spiceTex_, lay}, {f.shroud, f.linearClamp},
+                                               {f.shadowMap, f.shadowSampler}, {guideTex_, mirror ? guideMirror_ : guideSampler_},
+                                               {f.surround == 2 && f.surroundFar ? f.surroundFar : splatATex_, f.linearClamp},
+                                               {photo ? photo_->albedo() : albedoArr_, photo ? photo_->sampler() : matSampler_},
+                                               {photo ? photo_->normal() : normalArr_, photo ? photo_->sampler() : matSampler_},
+                                               {photo ? photo_->orh() : albedoArr_, photo ? photo_->sampler() : matSampler_},
+                                               {f.ssao && f.ssaoSampler ? f.ssao : splatATex_, ssaoSamp}};
         if (faith) {
-            FaithU u3;
+            FaithU u3{};
             static_assert(sizeof faithU_ == kFMapRows * 4 * sizeof(float) && sizeof faithU_ <= sizeof(FaithU));
             std::memcpy(&u3, faithU_, sizeof faithU_);
             const Vec3 ds = f.detailSun.y > 0 ? f.detailSun : f.sun;
@@ -1288,30 +1421,69 @@ int DesignedTerrain::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, SD
             const float rlU[4] = {ra, rd, 1.0f / (ra + rd * f.sun.y), 0};
             std::memcpy(u3.detailSun, dsU, sizeof dsU);
             std::memcpy(u3.reliefLight, rlU, sizeof rlU);
+            if (f.reimagined) {  // docs/3d-mode.md "Reimagined"
+                // [3]: the shadow map's world px per texel (its x extent is 2 / |row 0| of lightVP, an
+                // orthographic view; shadow[1] = 1 / texels across), the penumbra growth, sandstone cliffs.
+                const Mat4& L = f.lightVP;
+                const float rx = std::sqrt(L.m[0] * L.m[0] + L.m[4] * L.m[4] + L.m[8] * L.m[8]);
+                const float texW = rx > 0 ? 2.0f / rx * f.shadow[1] : 1.0f;
+                const bool ring = f.surround == 2 && f.surroundFar && mirror;
+                // (Realistic grade: the spice's orange glow mostly gone - rust does not shine; [3].w switches the
+                // graded palette, the ground occlusion and the sand over the slabs' edges.)
+                const bool ng = f.naturalGrade;
+                const float r[4][4] = {{1.0f, ng ? 0.07f : 0.22f, 1.0f, 1.0f},
+                                       {0.8f, 0.6f, 1.0f, 0.55f},
+                                       {f.time, ring ? f.surroundMargin : 0.0f, 1.6f, ring ? 2.0f : f.surround == 1 ? 1.0f : 0.0f},
+                                       {texW, 0.03f, 1.0f, ng ? 1.0f : 0.0f}};
+                std::memcpy(u3.reim, r, sizeof r);
+                if (photo) {  // docs/3d-mode.md "Photo terrain"; D2K_PHOTO_LOOK="share,normal,sheen" (tuning)
+                    static const struct Look {
+                        float share = 1.0f, normal = 0.85f, sheen = 0.5f;
+                        Look() {
+                            if (const char* e = std::getenv("D2K_PHOTO_LOOK")) std::sscanf(e, "%f,%f,%f", &share, &normal, &sheen);
+                        }
+                    } look;
+                    const float p0[4] = {1.0f, look.share, look.normal, look.sheen};
+                    std::memcpy(u3.photo[0], p0, sizeof p0);
+                    for (int i = 0; i < PhotoTerrain::kLayers; ++i) std::memcpy(u3.photo[2 + i], photo_->layerU(i), 4 * sizeof(float));
+                }
+            }
             SDL_PushGPUFragmentUniformData(cmd, 2, &u3, sizeof u3);
         }
-        SDL_BindGPUFragmentSamplers(pass, 0, sb, faith ? 8 : 7);
+        SDL_BindGPUFragmentSamplers(pass, 0, sb, faith ? 13 : 7);
         SDL_DrawGPUIndexedPrimitives(pass, indexCount, 1, firstIndex, 0, 0);
         ++calls;
     }
     SDL_GPUBuffer* ivb = rocks ? rocks->vb : instVB_;
     const std::uint32_t* ifirst = rocks ? rocks->first : instFirst_;
     const std::uint32_t* icount = rocks ? rocks->count : instCount_;
-    if (!inst_.empty() && ivb && rockVB_) {
+    if (!inst_.empty() && ivb && rockVB_ && f.surround != 2) {
         SDL_BindGPUGraphicsPipeline(pass, rockPipe_);
         bindLightGrid(pass, f.lightGrid, lightFallback_, dev_);
         SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof vu);
         RockFU fu{};
         common(fu.sunDir, fu.light, fu.fogColor, fu.fog, fu.fog2);
-        for (int r = 0; r < kRockTypes; ++r) std::memcpy(fu.tint[r], rockTint_[r], sizeof rockTint_[r]);
+        for (int r = 0; r < kRockTypes; ++r) {
+            std::memcpy(fu.tint[r], rockTint_[r], sizeof rockTint_[r]);
+            if (f.reimagined) {  // the reimagined palette (terrain3_fs reimagine): the stones greyer, a warm tan
+                const float m = (fu.tint[r][0] + fu.tint[r][1] + fu.tint[r][2]) / 3.0f;
+                static constexpr float kTan[3] = {1.05f, 0.98f, 0.86f}, kTanGraded[3] = {1.03f, 0.985f, 0.9f};
+                if (f.naturalGrade)  // the graded palette: greyer still, a touch darker than the paler ground
+                    for (int k = 0; k < 3; ++k) fu.tint[r][k] = (m + (fu.tint[r][k] - m) * 0.36f) * kTanGraded[k] * 1.06f;
+                else
+                    for (int k = 0; k < 3; ++k) fu.tint[r][k] = (m + (fu.tint[r][k] - m) * 0.45f) * kTan[k] * 1.15f;
+            }
+        }
         std::memcpy(fu.lightVP, f.lightVP.m, sizeof fu.lightVP);
         std::memcpy(fu.shadow, f.shadow, sizeof fu.shadow);
         SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof fu);
         SDL_GPUBufferBinding vbs[2] = {{rockVB_, 0}, {ivb, 0}};
         SDL_BindGPUVertexBuffers(pass, 0, vbs, 2);
-        SDL_GPUTextureSamplerBinding sb[3] = {{rockArr_, matSampler_}, {f.shroud, f.linearClamp},
-                                              {f.shadowMap, f.shadowSampler}};
-        SDL_BindGPUFragmentSamplers(pass, 0, sb, 3);
+        SDL_GPUTextureSamplerBinding sb[4] = {{rockArr_, matSampler_}, {f.shroud, f.linearClamp},
+                                              {f.shadowMap, f.shadowSampler},
+                                              {f.ssao && f.ssaoSampler ? f.ssao : splatATex_,
+                                               f.ssao && f.ssaoSampler ? f.ssaoSampler : f.linearClamp}};
+        SDL_BindGPUFragmentSamplers(pass, 0, sb, 4);
         for (int r = 0; r < kRockTypes; ++r) {
             if (icount[r] == 0 || rockCount_[r] == 0) continue;
             SDL_DrawGPUPrimitives(pass, rockCount_[r], icount[r], rockFirst_[r], ifirst[r]);
@@ -1322,7 +1494,7 @@ int DesignedTerrain::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, SD
 }
 
 int DesignedTerrain::drawShadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const Mat4& lightVP,
-                                SDL_GPUTextureFormat fmt, const RockSet* rocks) {
+                                SDL_GPUTextureFormat fmt, const RockSet* rocks, bool depthBias) {
     SDL_GPUBuffer* ivb = rocks ? rocks->vb : instVB_;
     const std::uint32_t* ifirst = rocks ? rocks->first : instFirst_;
     const std::uint32_t* icount = rocks ? rocks->count : instCount_;
@@ -1357,6 +1529,10 @@ int DesignedTerrain::drawShadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* c
             pi.target_info.depth_stencil_format = fmt;
             pi.target_info.has_depth_stencil_target = true;
             rockDepthPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+            pi.rasterizer_state.enable_depth_bias = false;
+            pi.rasterizer_state.depth_bias_constant_factor = 0;
+            pi.rasterizer_state.depth_bias_slope_factor = 0;
+            rockViewDepthPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
         }
         for (SDL_GPUShader* s2 : {vs, fs})
             if (s2) SDL_ReleaseGPUShader(dev_, s2);
@@ -1367,7 +1543,7 @@ int DesignedTerrain::drawShadow(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* c
         }
     }
     if (!rockDepthPipe_) return 0;
-    SDL_BindGPUGraphicsPipeline(pass, rockDepthPipe_);
+    SDL_BindGPUGraphicsPipeline(pass, !depthBias && rockViewDepthPipe_ ? rockViewDepthPipe_ : rockDepthPipe_);
     TerrainVU vu;
     std::memcpy(vu.viewProj, lightVP.m, sizeof vu.viewProj);
     SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof vu);

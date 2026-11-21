@@ -296,6 +296,96 @@ bool runSaveTest(const GameData& g) {
     return r.ok;
 }
 
+// "Unit movement: Modern" (not original; game/modern_move.cpp) part of --simtest: a group of the
+// player's vehicles crosses the map, a battle with every armed unit runs with consistent cell
+// occupancy, and a Modern save / load round trip stays identical.
+bool runModernTest(const GameData& g) {
+    using namespace d2k::game;
+    const int side = g.playerSide;
+    auto make = [&]() {
+        auto w = std::make_unique<World>(g.map, g.mission, g.tileAtr, g.tileData, rulesOf(g), side);
+        w->setModernMovement(true);
+        return w;
+    };
+    bool ok = true;
+    {
+        auto wp = make();
+        World& w = *wp;
+        std::vector<int> group;
+        const Side& me = w.sides()[side];
+        for (int i = me.firstUnit; i != -1 && group.size() < 10; i = me.nextObject(i))
+            if (w.isModernVehicle(me.units[i]) && me.units[i].state == UnitState::Idle) group.push_back(i);
+        if (!group.empty()) {
+            // The farthest cell (up to 30 tiles) a flood fill of drivable cells reaches from the first one.
+            const Unit& u0 = me.units[group[0]];
+            const int sx = u0.blockFromX, sy = u0.blockFromY;
+            std::vector<int> dist(std::size_t(w.width()) * w.height(), -1);
+            std::vector<std::pair<int, int>> q{{sx, sy}};
+            dist[std::size_t(sy) * w.width() + sx] = 0;
+            int bx = sx, by = sy, best = 0;
+            for (std::size_t qi = 0; qi < q.size(); ++qi) {
+                const auto [x, y] = q[qi];
+                const int cheb = std::max(std::abs(x - sx), std::abs(y - sy));
+                if (cheb > best && cheb <= 30) best = cheb, bx = x, by = y;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = x + dx, ny = y + dy;
+                        if (!w.inBounds(nx, ny) || dist[std::size_t(ny) * w.width() + nx] >= 0) continue;
+                        const std::uint32_t f = w.cell(nx, ny).flags;
+                        if (!(f & cell_flags::kDriveOn) || (f & cell_flags::kBuilding)) continue;
+                        dist[std::size_t(ny) * w.width() + nx] = dist[std::size_t(y) * w.width() + x] + 1;
+                        q.push_back({nx, ny});
+                    }
+            }
+            for (int i : group) w.orderMove(side, i, bx, by);
+            int done = -1;
+            for (int t = 1; t <= 4000 && done < 0; ++t) {
+                w.tick();
+                bool all = true;
+                for (int i : group) {
+                    const Unit* u = w.unit(side, i);
+                    all = all && (!u || u->state != UnitState::Moving);
+                }
+                if (all) done = t;
+            }
+            int near = 0;
+            for (int i : group)
+                if (const Unit* u = w.unit(side, i); u && std::max(std::abs(u->blockFromX - bx), std::abs(u->blockFromY - by)) <= 4) ++near;
+            SDL_Log("simtest: modern: %zu vehicles %d,%d -> %d,%d (%d tiles): %s after %d ticks, %d within 4 tiles of the target",
+                    group.size(), sx, sy, bx, by, best, done > 0 ? "all stopped" : "STILL MOVING", done, near);
+            ok = ok && done > 0;
+        }
+    }
+    {
+        auto wp = make();
+        World& w = *wp;
+        orderBattle(w);
+        int bad = 0, deaths = 0;
+        std::vector<int> seen(std::size_t(w.width()) * w.height());
+        for (int t = 0; t < 3000; ++t) {
+            w.tick();
+            if (t % 10 != 0) continue;
+            std::fill(seen.begin(), seen.end(), 0);
+            for (int s = 0; s < kMaxSides; ++s)
+                for (int i = w.sides()[s].firstUnit; i != -1; i = w.sides()[s].nextObject(i)) {
+                    const Unit& u = w.sides()[s].units[i];
+                    if (u.state == UnitState::Dead) ++deaths;
+                    if (!w.isModernVehicle(u) || (u.flags & 0x400140) || u.state == UnitState::Dead) continue;
+                    const std::uint32_t f = w.cell(u.blockFromX, u.blockFromY).flags;
+                    if (!(f & cell_flags::kVehicle) || int(f & 7) != s) ++bad;
+                    if (++seen[std::size_t(u.blockFromY) * w.width() + u.blockFromX] > 1) ++bad;
+                }
+        }
+        SDL_Log("simtest: modern: battle 3000 ticks, %s cell occupancy (%d bad samples), %d dead-unit samples", bad ? "BROKEN" : "consistent",
+                bad, deaths);
+        ok = ok && bad == 0;
+    }
+    const RoundTripReport r = saveRoundTrip(make, 2000, 2000, [side](World& w, std::uint32_t step) { scriptedOrders(w, side, step); });
+    SDL_Log("simtest: modern: save/load round trip (2000 + 2000 ticks): %s%s - world %zu bytes, hash %016llx", r.ok ? "identical" : "FAILED: ",
+            r.error.c_str(), r.saveBytes, static_cast<unsigned long long>(r.hashAtEnd));
+    return ok && r.ok;
+}
+
 }  // namespace
 
 // Headless movement check (--simtest): build the World from the real map, pick a ground unit,
@@ -316,11 +406,14 @@ bool runMotionTest(const GameData& g) {
         a.tick();
         b.tick();
         for (const float alpha : {0.25f, 0.5f, 0.9f}) {
-            motion.apply(b, alpha);
+            // (with the Smooth camera ease of the drawn positions, and the picking pass after it)
+            motion.apply(b, alpha, 1.0f / 180.0f);
             for (int s = 0; s < kMaxSides; ++s)
                 for (int i = b.sides()[s].firstUnit; i != -1; i = b.sides()[s].nextObject(i))
                     moved += b.sides()[s].units[i].posX != a.sides()[s].units[i].posX;
             motion.restore(b);
+            motion.applyDrawn(b);
+            motion.restoreDrawn(b);
         }
         bool same = a.rng().seed() == b.rng().seed();
         for (int s = 0; s < kMaxSides && same; ++s) {
@@ -414,6 +507,7 @@ int runSimTest(const GameData& g) {
     if (!runProductionTest(g)) ++failures;
     if (!runMotionTest(g)) ++failures;
     if (!runSaveTest(g)) ++failures;
+    if (!runModernTest(g)) ++failures;  // not original: Modern movement
     return failures ? 1 : 0;
 }
 
@@ -920,6 +1014,20 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
             }
         return;
     }
+    // D2K_VFX_DEMO=carryall: a carryall reinforcement of one unit (D2K_VFX_DEMO_UNIT=name, default a
+    // harvester) for the player to the tile at tick 1 (the cheat reinforcement: the .MIS Reinforcement
+    // mechanism), entering from map edge D2K_VFX_DEMO_EDGE (0 N, 1 E, 2 S, 3 W; default the nearest) -
+    // the 3D flight-height check over cliffs (docs/3d-mode.md "Flyers").
+    if (demo == "carryall") {
+        if (t != 1) return;
+        const char* name = std::getenv("D2K_VFX_DEMO_UNIT") ? std::getenv("D2K_VFX_DEMO_UNIT") : "HARVESTER";
+        const int edge = std::getenv("D2K_VFX_DEMO_EDGE") ? std::atoi(std::getenv("D2K_VFX_DEMO_EDGE")) : -1;
+        if (const int type = unitType(name); type >= 0)
+            world.orderCheatReinforce(world.mySide(), {std::uint8_t(type)}, 0, cx / 32, cy / 32, edge);
+        else
+            SDL_Log("carryall demo: no unit type '%s'", name);
+        return;
+    }
     // D2K_VFX_DEMO=refinery: a refinery of the player with two loaded harvesters next to it (7 and
     // 3 blobs) told to dock at tick 3 (orderDockAtRefinery: the real states 13-16; one EX_REF per
     // unloaded blob, harvestUnloadDelay apart); the second docks when the first has left.
@@ -1113,6 +1221,333 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
     // (orderAttackBuilding: the real infiltrate + CaptureBuilding path). At tick 150 a third
     // building of that side is destroyed
     // (for the comparison: destruction vs capture).
+    // D2K_VFX_DEMO=tankfight (effects scale check: hits on real tanks, wrecks, a building's death): two armoured
+    // groups 7 tiles apart - the player's (combat tanks, a missile tank, a siege tank) and an unused side's
+    // (the same, Harkonnen) with its wind trap and barracks behind it - set on each other at tick 20 (attack the
+    // nearest); at tick 200 the wind trap is destroyed.
+    if (demo == "tankfight") {
+        const int me = world.mySide();
+        static int other = -1;
+        for (int s = 0; s < kMaxSides && other < 0; ++s)
+            if (s != me && s != ((me + 1) & 7) && world.sides()[s].firstBuilding < 0 && world.sides()[s].firstUnit < 0) other = s;
+        if (other < 0) return;
+        static int wt = -1;
+        const int bx = cx / 32, by = cy / 32;
+        if (t == 1) {
+            world.setDiplomacy(me, other, 1);
+            world.setDiplomacy(other, me, 1);
+            const char* mine[] = {"ATREIDES COMBAT TANK", "ATREIDES COMBAT TANK", "MISSILE TANK", "ATREIDES COMBAT TANK", "SIEGE TANK"};
+            const char* theirs[] = {"HARKONNEN COMBAT TANK", "HARKONNEN COMBAT TANK", "SIEGE TANK", "HARKONNEN COMBAT TANK", "MISSILE TANK"};
+            for (int k = 0; k < 5; ++k) {
+                if (const int ty = unitType(mine[k]); ty >= 0) world.addUnit(me, ty, bx - 4, by - 2 + k, bx - 4, by - 2 + k);
+                if (const int ty = unitType(theirs[k]); ty >= 0) world.addUnit(other, ty, bx + 3, by - 2 + k, bx + 3, by - 2 + k);
+            }
+            if (const int w = buildingType("HARKONNEN WIND TRAP"); w >= 0) wt = world.addBuilding(other, w, bx + 5, by - 4, false, true);
+            if (const int b = buildingType("HARKONNEN BARRACKS"); b >= 0) world.addBuilding(other, b, bx + 5, by + 1, false, true);
+        }
+        if (t == 20) orderBattle(world);
+        if (t > 20 && t % 60 == 0) orderBattle(world);  // the survivors pick new targets
+        if (t == 200 && wt >= 0)
+            if (Building* b = world.building(other, wt)) world.destroyBuilding(*b, false);
+        return;
+    }
+    // D2K_VFX_DEMO=bigfight (the effects intensity / readability check, docs/enhanced-graphics.md "Effects
+    // intensity"): the tank fight at scale - 32 tanks per side (mostly combat tanks, some missile and siege
+    // tanks) in two 4 x 8 blocks 10 tiles apart, set on each other at tick 20 (attack the nearest, survivors
+    // re-target every 60 ticks); a wind trap and a barracks behind the other side are destroyed at ticks 260 / 420.
+    if (demo == "bigfight") {
+        const int me = world.mySide();
+        static int other = -1;
+        for (int s = 0; s < kMaxSides && other < 0; ++s)
+            if (s != me && s != ((me + 1) & 7) && world.sides()[s].firstBuilding < 0 && world.sides()[s].firstUnit < 0) other = s;
+        if (other < 0) return;
+        static int wt = -1, br = -1;
+        const int bx = cx / 32, by = cy / 32;
+        if (t == 1) {
+            world.setDiplomacy(me, other, 1);
+            world.setDiplomacy(other, me, 1);
+            for (int r = 0; r < 8; ++r)
+                for (int c = 0; c < 4; ++c) {
+                    const int k = r * 4 + c;
+                    const char* mine = k % 8 == 3 ? "MISSILE TANK" : k % 8 == 6 ? "SIEGE TANK" : "ATREIDES COMBAT TANK";
+                    const char* theirs = k % 8 == 2 ? "SIEGE TANK" : k % 8 == 5 ? "MISSILE TANK" : "HARKONNEN COMBAT TANK";
+                    if (const int ty = unitType(mine); ty >= 0) world.addUnit(me, ty, bx - 8 + c, by - 4 + r, bx - 8 + c, by - 4 + r);
+                    if (const int ty = unitType(theirs); ty >= 0) world.addUnit(other, ty, bx + 5 + c, by - 4 + r, bx + 5 + c, by - 4 + r);
+                }
+            if (const int w = buildingType("HARKONNEN WIND TRAP"); w >= 0) wt = world.addBuilding(other, w, bx + 10, by - 6, false, true);
+            if (const int b = buildingType("HARKONNEN BARRACKS"); b >= 0) br = world.addBuilding(other, b, bx + 10, by + 2, false, true);
+        }
+        if (t == 20) orderBattle(world);
+        if (t > 20 && t % 60 == 0) orderBattle(world);
+        if (t == 260 && wt >= 0)
+            if (Building* b = world.building(other, wt)) world.destroyBuilding(*b, false);
+        if (t == 420 && br >= 0)
+            if (Building* b = world.building(other, br)) world.destroyBuilding(*b, false);
+        return;
+    }
+    // D2K_VFX_DEMO=single (effects intensity: a calm scene must look as before): single events in an empty area,
+    // well apart in time - a rocket onto the sand at tick 40, an 80 mm tank shell at tick 160, a howitzer shell at
+    // tick 280 and a parked enemy combat tank killed by one rocket at tick 400.
+    if (demo == "single") {
+        const int me = world.mySide();
+        static int other = -1, tank = -1;
+        for (int s = 0; s < kMaxSides && other < 0; ++s)
+            if (s != me && s != ((me + 1) & 7) && world.sides()[s].firstBuilding < 0 && world.sides()[s].firstUnit < 0) other = s;
+        if (other < 0) return;
+        const int bx = cx / 32, by = cy / 32;
+        if (t == 1) {
+            world.setDiplomacy(me, other, 1);
+            if (const int ty = unitType("HARKONNEN COMBAT TANK"); ty >= 0) tank = world.addUnit(other, ty, bx + 2, by + 2, bx + 2, by + 2);
+        }
+        auto shoot = [&](const char* name, int tx, int ty) {
+            if (const int w = weapon(name); w >= 0) world.addBullet(me, w, 0, -1, tx - 300, ty, tx, ty);
+        };
+        if (t == 40) shoot("ROCKET", cx - 64, cy);
+        if (t == 160) shoot("80MM GUN", cx - 64, cy);
+        if (t == 280) shoot("155MM HOWITZER", cx - 64, cy);
+        if (t == 400 && tank >= 0) {
+            Unit& u = world.sides()[other].units[tank];
+            if (u.alive) {
+                u.health = 1;
+                shoot("ROCKET", game::fixToPixel(u.posX), game::fixToPixel(u.posY));
+            }
+        }
+        return;
+    }
+    // D2K_VFX_DEMO=artillery (the artillery hit check): every 90 ticks, left to right, a row of 155 mm howitzer
+    // shells, a row of 80 mm tank shells and a row of rockets onto the ground (comparison), two grenadiers throwing
+    // at the ground, and a howitzer shell onto a parked enemy combat tank (kept alive: the hit on armour).
+    if (demo == "artillery") {
+        const int me = world.mySide();
+        static int other = -1, tank = -1;
+        for (int s = 0; s < kMaxSides && other < 0; ++s)
+            if (s != me && s != ((me + 1) & 7) && world.sides()[s].firstBuilding < 0 && world.sides()[s].firstUnit < 0) other = s;
+        if (other < 0) return;
+        const int bx = cx / 32, by = cy / 32;
+        if (t == 1) {
+            world.setDiplomacy(me, other, 1);
+            if (const int ty = unitType("HARKONNEN COMBAT TANK"); ty >= 0) tank = world.addUnit(other, ty, bx + 3, by + 3, bx + 3, by + 3);
+        }
+        if (tank >= 0) {
+            Unit& u = world.sides()[other].units[tank];
+            if (u.alive) u.health = std::max<std::int32_t>(u.health, 200);
+        }
+        static int gren[2] = {-1, -1};
+        if (t == 1)
+            for (int k = 0; k < 2; ++k)
+                if (const int ty = unitType("GRENADIER"); ty >= 0) gren[k] = world.addUnit(me, ty, bx - 6, by - 1 + k, bx - 6, by - 1 + k);
+        if (t % 90 == 30)
+            for (int k = 0; k < 2; ++k)
+                if (gren[k] >= 0 && world.sides()[me].units[gren[k]].alive) world.orderAttackTile(me, gren[k], bx - 3 + k, by - 1);
+        static const char* kRows[] = {"155MM HOWITZER", "", "80MM GUN", "ROCKET"};
+        if (t % 90 == 30)
+            for (int r = 0; r < int(std::size(kRows)); ++r)
+                if (const int w = *kRows[r] ? weapon(kRows[r]) : -1; w >= 0) {
+                    const int y = cy - 110 + r * 64;
+                    world.addBullet(me, w, 0, -1, cx - 330, y, cx - 40 + (r & 1) * 30, y);
+                }
+        if (t % 90 == 75 && tank >= 0)
+            if (const int w = weapon("155MM HOWITZER"); w >= 0) {
+                const Unit& u = world.sides()[other].units[tank];
+                const int tx = game::fixToPixel(u.posX), ty = game::fixToPixel(u.posY);
+                world.addBullet(me, w, 0, -1, tx - 290, ty, tx, ty);
+            }
+        return;
+    }
+    // D2K_VFX_DEMO=wrecks (the vehicle wrecks check, docs/3d-mode.md "Vehicle wrecks"): a row of parked vehicles of
+    // an unused side 2 tiles apart, west to east from 6 tiles west of the site - trike, quad, combat tank, siege
+    // tank, missile tank, harvester, MCV, Devastator - destroyed (the real DestroyUnit) at tick 40
+    // (D2K_VFX_DEMO_KILL=tick), all at once or, with D2K_VFX_DEMO_STAGGER=N, N ticks apart. D2K_VFX_DEMO_UNIT=NAME:
+    // that one vehicle on the site instead of the row. D2K_VFX_DEMO_DRIVE=N: N ticks after the (first) death a
+    // combat tank of the player 3 tiles west of the first wreck drives east through the wrecks' cells (a hulk is
+    // never an obstacle: it must be gone where the tank is).
+    if (demo == "wrecks") {
+        const int me = world.mySide();
+        static int other = -1, driver = -1;
+        static std::vector<int> row;
+        for (int s = 0; s < kMaxSides && other < 0; ++s)
+            if (s != me && s != ((me + 1) & 7) && world.sides()[s].firstBuilding < 0 && world.sides()[s].firstUnit < 0) other = s;
+        if (other < 0) return;
+        const int bx = cx / 32, by = cy / 32;
+        auto envInt = [](const char* name, int def) {
+            const char* e = std::getenv(name);
+            return e ? std::atoi(e) : def;
+        };
+        const int kill = envInt("D2K_VFX_DEMO_KILL", 40), stagger = envInt("D2K_VFX_DEMO_STAGGER", 0);
+        const int drive = envInt("D2K_VFX_DEMO_DRIVE", -1);
+        const char* one = std::getenv("D2K_VFX_DEMO_UNIT");
+        const int x0 = one ? bx : bx - 6;
+        if (t == 1) {
+            world.setDiplomacy(me, other, 1);
+            const char* names[] = {"TRIKE", "QUAD", "HARKONNEN COMBAT TANK", "SIEGE TANK", "MISSILE TANK", "HARVESTER", "MCV", "DEVASTATOR"};
+            if (one) {
+                if (const int ty = unitType(one); ty >= 0) row.push_back(world.addUnit(other, ty, bx, by, bx, by));
+            } else {
+                for (int k = 0; k < int(std::size(names)); ++k)
+                    if (const int ty = unitType(names[k]); ty >= 0) row.push_back(world.addUnit(other, ty, x0 + 2 * k, by, x0 + 2 * k, by));
+            }
+            if (drive >= 0)
+                if (const int ty = unitType("ATREIDES COMBAT TANK"); ty >= 0) driver = world.addUnit(me, ty, x0 - 3, by, x0 - 3, by);
+        }
+        for (int k = 0; k < int(row.size()); ++k)
+            if (int(t) == kill + k * stagger && row[std::size_t(k)] >= 0) {
+                Unit& u = world.sides()[other].units[std::size_t(row[std::size_t(k)])];
+                if (u.alive && u.state != UnitState::Dead) world.destroyUnit(u);
+            }
+        if (drive >= 0 && driver >= 0 && int(t) == kill + drive) world.orderMove(me, driver, x0 + 2 * int(row.size()) + 1, by);
+        return;
+    }
+    // D2K_VFX_DEMO=crash (the aircraft crash check, docs/3d-mode.md "Aircraft crashes"): flyers of the player shot
+    // down in flight (the real DestroyUnit) at tick 40 (D2K_VFX_DEMO_KILL=tick). D2K_VFX_DEMO_UNIT picks which:
+    // ORNITHOPTER (an air strike's ornithopter flying east, from 9 tiles west of the site), CARRYALL (a
+    // carryall carrying a harvester - D2K_VFX_DEMO_CARGO=NAME another unit - east from 4 tiles west of the site,
+    // as after a pickup: the cargo is a unit and dies with it), DELIVERY (a carryall reinforcement of that unit to the site, destroyed when it is
+    // within 5 tiles of it, not before the kill tick), EMPTY (a carryall without cargo); default ORNITHOPTER
+    // 3 tiles north of the site's row and CARRYALL 3 tiles south of it. D2K_VFX_DEMO_LOG=1 logs the deaths.
+    if (demo == "crash") {
+        const int me = world.mySide(), bx = cx / 32, by = cy / 32;
+        static int orni = -1, car = -1, cargoIdx = -1;
+        static bool delivery = false, done = false;
+        auto envInt = [](const char* name, int def) {
+            const char* e = std::getenv(name);
+            return e ? std::atoi(e) : def;
+        };
+        const int kill = envInt("D2K_VFX_DEMO_KILL", 40);
+        const char* one = std::getenv("D2K_VFX_DEMO_UNIT");
+        const std::string which = one ? one : "";
+        const char* cargoName = std::getenv("D2K_VFX_DEMO_CARGO") ? std::getenv("D2K_VFX_DEMO_CARGO") : "HARVESTER";
+        const bool log = std::getenv("D2K_VFX_DEMO_LOG") != nullptr;
+        auto fly = [&](const char* name, int sx, int sy) {
+            const int ty = unitType(name);
+            const int i = ty >= 0 ? world.addUnit(me, ty, sx, sy, bx + 12, sy) : -1;
+            if (i < 0) return -1;
+            Unit& o = world.sides()[me].units[std::size_t(i)];
+            o.facing = o.facingTurret = 8;  // east
+            return i;
+        };
+        if (t == 1) {
+            const int row = which.empty() ? 3 : 0;
+            if (which.empty() || which == "ORNITHOPTER") {
+                orni = fly("ORNITHOPTER", bx - 9, by - row);
+                if (orni >= 0) {  // (as Ornithopter_LaunchStrike sends it)
+                    Unit& o = world.sides()[me].units[std::size_t(orni)];
+                    o.byte29 = 0xc;
+                    o.flags |= 0x10800;
+                    world.unitAdjustState(o, UnitState::Moving);
+                }
+            }
+            if (which.empty() || which == "CARRYALL" || which == "EMPTY") {
+                car = fly("CARRYALL", bx - 4, by + row);
+                const int ct = which == "EMPTY" ? -1 : unitType(cargoName);
+                if (car >= 0 && ct >= 0) cargoIdx = world.addUnit(me, ct, bx - 4, by + row, bx - 4, by + row);
+                if (car >= 0) {
+                    Unit& c = world.sides()[me].units[std::size_t(car)];
+                    // (Flown by the demo below: an idle carryall goes about its side's pickups.)
+                    c.byte29 = 0xff;
+                    world.unitAdjustState(c, UnitState::State33);
+                    if (cargoIdx >= 0) {  // carried, as CarryAll pickup leaves the two (economy.cpp updateFlyingDown)
+                        Unit& v = world.sides()[me].units[std::size_t(cargoIdx)];
+                        std::uint32_t& cf = world.cell(v.blockFromX, v.blockFromY).flags;
+                        cf &= ~game::cell_flags::kVehicle;
+                        c.flags |= game::unit_flags::kCarried;
+                        c.enemyIndex = cargoIdx;
+                        v.flags |= game::unit_flags::kCarried;
+                        world.unitAdjustState(v, UnitState::Airlifted);
+                    }
+                }
+            }
+            if (which == "DELIVERY") {
+                delivery = true;
+                if (const int ct = unitType(cargoName); ct >= 0) world.orderCheatReinforce(me, {std::uint8_t(ct)}, 0, bx, by, -1);
+            }
+        }
+        if (!done && car >= 0 && int(t) < kill) {  // east at 3 px per tick (dragCargo takes its cargo along)
+            Unit& c = world.sides()[me].units[std::size_t(car)];
+            const int row = which.empty() ? 3 : 0;
+            c.posX = ((bx - 4) * 32 + 16 + 3 * int(t)) * 0x10000;
+            c.posY = ((by + row) * 32 + 16) * 0x10000;
+            c.posZ = 0x3c0000;
+            c.facing = c.facingTurret = 8;
+            c.blockFromX = c.blockToX = std::uint8_t(game::fixToPixel(c.posX) / 32);
+            c.blockFromY = c.blockToY = std::uint8_t(by + row);
+        }
+        if (done || int(t) < kill) return;
+        if (delivery) {
+            for (int i = world.sides()[me].firstUnit; i != -1 && !done; i = world.sides()[me].nextObject(i)) {
+                Unit& u = world.sides()[me].units[std::size_t(i)];
+                if (!u.alive || u.state == UnitState::Dead || !(u.flags & 0x20000000)) continue;
+                const int ux = game::fixToPixel(u.posX) / 32, uy = game::fixToPixel(u.posY) / 32;
+                if (std::abs(ux - bx) > 5 || std::abs(uy - by) > 5) continue;
+                if (log) SDL_Log("crash demo: t=%u delivery carryall destroyed at %d,%d z %d", t, ux, uy, u.posZ >> 16);
+                world.destroyUnit(u);
+                done = true;
+            }
+            return;
+        }
+        done = true;
+        for (const int i : {orni, car}) {
+            if (i < 0) continue;
+            Unit& u = world.sides()[me].units[std::size_t(i)];
+            if (!u.alive || u.state == UnitState::Dead) continue;
+            if (log)
+                SDL_Log("crash demo: t=%u unit %d (type %d) destroyed at px %d,%d z %d facing %d flags %x", t, i, int(u.type),
+                        game::fixToPixel(u.posX), game::fixToPixel(u.posY), u.posZ >> 16, int(u.facing), unsigned(u.flags));
+            world.destroyUnit(u);
+        }
+        return;
+    }
+    // D2K_VFX_DEMO=tankhit (the smoke-over-a-damaged-tank check): a parked enemy combat tank 2 tiles south-east
+    // of the site, held at ~40% health (smoking), hit by a rocket every 60 ticks from tick 20.
+    if (demo == "tankhit") {
+        const int me = world.mySide();
+        static int other = -1, tank = -1;
+        for (int s = 0; s < kMaxSides && other < 0; ++s)
+            if (s != me && s != ((me + 1) & 7) && world.sides()[s].firstBuilding < 0 && world.sides()[s].firstUnit < 0) other = s;
+        if (other < 0) return;
+        const int bx = cx / 32, by = cy / 32;
+        if (t == 1) {
+            world.setDiplomacy(me, other, 1);
+            if (const int ty = unitType("HARKONNEN COMBAT TANK"); ty >= 0) tank = world.addUnit(other, ty, bx + 2, by + 2, bx + 2, by + 2);
+        }
+        if (tank < 0) return;
+        Unit& u = world.sides()[other].units[tank];
+        if (!u.alive) return;
+        const std::int32_t hp40 = std::int32_t(world.unitTemplate(u).hitPoints) * 40 / 100;
+        if (t == 2 || u.health < hp40 * 3 / 4) u.health = hp40;
+        if (t % 60 == 20)
+            if (const int w = weapon("ROCKET"); w >= 0) {
+                const int tx = game::fixToPixel(u.posX), ty = game::fixToPixel(u.posY);
+                world.addBullet(me, w, 0, -1, tx - 200, ty, tx, ty);
+            }
+        return;
+    }
+    // D2K_VFX_DEMO=crush (crushed infantry vs the vehicle on top, docs/3d-models.md "Infantry"): a row of 5 enemy
+    // light infantry 3 tiles east of the site; at tick 10 a combat tank of the player 4 tiles west of them drives
+    // through the row (a move order 4 tiles past it). D2K_VFX_DEMO_LOG=1 logs the soldiers' deaths.
+    if (demo == "crush") {
+        const int me = world.mySide();
+        static int other = -1, tank = -1;
+        static std::vector<int> men;
+        for (int s = 0; s < kMaxSides && other < 0; ++s)
+            if (s != me && s != ((me + 1) & 7) && world.sides()[s].firstBuilding < 0 && world.sides()[s].firstUnit < 0) other = s;
+        if (other < 0) return;
+        const int bx = cx / 32, by = cy / 32;
+        if (t == 1) {
+            world.setDiplomacy(me, other, 1);
+            world.setDiplomacy(other, me, 1);
+            if (const int ty = unitType("LIGHT INF"); ty >= 0)
+                for (int k = 0; k < 5; ++k) men.push_back(world.addUnit(other, ty, bx + 3, by - 2 + k, bx + 3, by - 2 + k));
+            if (const int ty = unitType("HARKONNEN COMBAT TANK"); ty >= 0) tank = world.addUnit(me, ty, bx - 1, by, bx - 1, by);
+        }
+        if (t == 10 && tank >= 0) world.orderMove(me, tank, bx + 7, by);
+        if (std::getenv("D2K_VFX_DEMO_LOG"))
+            for (int i : men)
+                if (i >= 0 && world.sides()[other].units[i].alive && world.sides()[other].units[i].state == UnitState::Dead &&
+                    t % 3 == 0)
+                    SDL_Log("crush demo: t=%u soldier %d dead, anim %d frame %d", t, i, int(world.sides()[other].units[i].animType),
+                            int(world.sides()[other].units[i].animFrame));
+        return;
+    }
     if (demo == "capture") {
         const int me = world.mySide();
         static int other = -1;  // an unused side, picked once
@@ -1143,6 +1578,77 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
     }
     // D2K_VFX_DEMO=column: a vehicle column (side 0, one per row) that sets off east, stops, fires
     // at the ground ahead, drives a diagonal, turns about and back west - Vehicle animation / barrel tips check (period 400).
+    // D2K_VFX_DEMO=reimagined (docs/3d-models.md "Reimagined models": the model check and the fps scene): the
+    // player's Atreides construction yard, refinery and two wind traps west of the tile, and a block of
+    // D2K_VFX_DEMO_ROWS x 6 (default 6 x 6) Atreides combat tanks of the player east of them that drive a slow
+    // loop (east, south, west, north; every 100 ticks), turrets following - turning, driving and standing models.
+    if (demo == "reimagined") {
+        static std::vector<int> tanks;
+        // D2K_VFX_DEMO_SIDE=n: another side than the player's (e.g. the Atreides side 0 of H5V1, whose house colour
+        // is blue, while the mission goes on for the player).
+        static const int me = std::getenv("D2K_VFX_DEMO_SIDE") ? std::clamp(std::atoi(std::getenv("D2K_VFX_DEMO_SIDE")), 0, 7)
+                                                               : world.mySide();
+        // D2K_VFX_DEMO_ANCHOR="X Y": the scene at that tile whatever the camera (--at), for shots from several cameras.
+        static int ax0 = -1, ay0 = -1;
+        if (ax0 < 0) {
+            ax0 = cx / 32, ay0 = cy / 32;
+            if (const char* a = std::getenv("D2K_VFX_DEMO_ANCHOR")) std::sscanf(a, "%d %d", &ax0, &ay0);
+        }
+        const int bx = ax0, by = ay0;
+        static int rows = 6;
+        if (t == 1) {
+            if (const char* r = std::getenv("D2K_VFX_DEMO_ROWS")) rows = std::clamp(std::atoi(r), 1, 16);
+            if (const int ty = buildingType("ATREIDES CONSTRUCTION YARD"); ty >= 0) world.addBuilding(me, ty, bx - 9, by - 4, true, true);
+            if (const int ty = buildingType("ATREIDES REFINERY"); ty >= 0) world.addBuilding(me, ty, bx - 9, by, true, true);
+            // D2K_VFX_DEMO_HOUSE=HARKONNEN|ORDOS: that house's wind traps (the redesign checks, docs/3d-models.md).
+            const char* wh = std::getenv("D2K_VFX_DEMO_HOUSE");
+            if (const int ty = buildingType(((wh && *wh ? std::string(wh) : std::string("ATREIDES")) + " WIND TRAP").c_str()); ty >= 0) {
+                world.addBuilding(me, ty, bx - 5, by - 4, true, true);
+                world.addBuilding(me, ty, bx - 5, by, true, true);
+            }
+            // D2K_VFX_DEMO_BASE=full: every other Atreides building too (rows of 5 south-west of the block, 4 tiles
+            // apart) and one of each vehicle in a row south of the tanks - the Reimagined base overview / fps scene.
+            if (const char* base = std::getenv("D2K_VFX_DEMO_BASE"); base && std::string(base) == "full") {
+                int slot = 0;
+                for (int i = 0; i < int(T.bin.buildingCount); ++i) {
+                    const std::string n = T.bin.buildingNames[i];
+                    if (n.rfind("ATREIDES ", 0) != 0 || n == "ATREIDES WALL" || n == "ATREIDES CONSTRUCTION YARD" ||
+                        n == "ATREIDES REFINERY" || n == "ATREIDES WIND TRAP")
+                        continue;
+                    world.addBuilding(me, i, bx - 18 + (slot % 5) * 4, by + 8 + (slot / 5) * 4, true, true);
+                    ++slot;
+                }
+                const char* kVehicles[] = {"TRIKE", "QUAD", "MCV", "MISSILE TANK", "SIEGE TANK", "SONIC TANK", "HARVESTER"};
+                for (int k = 0; k < int(std::size(kVehicles)); ++k)
+                    if (const int ty = unitType(kVehicles[k]); ty >= 0) world.addUnit(me, ty, bx - 9 + k * 2, by + 5, bx - 9 + k * 2, by + 5);
+            }
+            if (const int ty = unitType("ATREIDES COMBAT TANK"); ty >= 0)
+                for (int r = 0; r < rows; ++r)
+                    for (int c = 0; c < 6; ++c)
+                        tanks.push_back(world.addUnit(me, ty, bx - 1 + c * 2, by - 4 + r * 2, bx - 1 + c * 2, by - 4 + r * 2));
+        }
+        // D2K_VFX_DEMO_WORK=1: the factories, barracks and palaces hold the producing flag (kAnimPermanent), as in
+        // allbuildings (the building life check: working stacks smoke, docs/3d-mode.md "Building life").
+        if (const char* wk = std::getenv("D2K_VFX_DEMO_WORK"); wk && wk[0] == '1') {
+            Side& sd = world.sides()[me];
+            for (int i = sd.firstBuilding; i >= 0; i = sd.nextObject(i)) {
+                Building& b = sd.buildings[std::size_t(i)];
+                const int sb = T.bin.buildings[b.type].specialBehavior;
+                if ((sb >= 7 || sb == 11) && sb != 13 && sb != 14 && sb != 15 && sb != 16 && sb != 17)
+                    b.flags |= game::building_flags::kAnimPermanent;
+            }
+        }
+        if (t > 1 && t % 100 == 0) {
+            static const int kStep[4][2] = {{2, 0}, {0, 2}, {-2, 0}, {0, -2}};
+            const int k = int((t / 100 - 1) % 4);
+            int dx = 0, dy = 0;
+            for (int j = 0; j <= k; ++j) dx += kStep[j][0], dy += kStep[j][1];
+            for (std::size_t i = 0; i < tanks.size(); ++i)
+                if (tanks[i] >= 0)
+                    world.orderMove(me, tanks[i], bx - 1 + int(i % 6) * 2 + dx, by - 4 + int(i / 6) * 2 + dy);
+        }
+        return;
+    }
     if (demo == "column") {
         static const char* kUnits[] = {"ATREIDES COMBAT TANK", "HARKONNEN COMBAT TANK", "ORDOS COMBAT TANK", "SIEGE TANK",
                                        "DEVASTATOR TANK", "MISSILE TANK", "QUAD", "TRIKE"};
@@ -1163,6 +1669,156 @@ void vfxDemoTick(game::World& world, int cx, int cy) {
             if (p == 110) world.orderAttackTile(0, ids[k], ax + 7, ay + k);
             if (p == 200) world.orderMove(0, ids[k], ax + 7, ay + k + 3);  // a diagonal: turning while driving
             if (p == 290) world.orderMove(0, ids[k], ax + 1, ay + k);      // turn about, back west
+        }
+        return;
+    }
+    // D2K_VFX_DEMO=march (Modern movement check, docs/modern-movement.md): ten combat tanks of the
+    // player in a 5 x 2 block west of a wall (side 0) with a 2-tile gap; beyond the gap a second wall
+    // they have to drive round (its south end) to reach the goal north-east of it. At tick 20 they are sent to a point past both (one group order), and
+    // back again whenever all of them stand still (or after 700 ticks): corners, a choke, spreading
+    // out at the goal. The same scene with --movement original shows the original movement.
+    if (demo == "march") {
+        static std::vector<int> ids;
+        static std::uint32_t sent = 0;
+        static int leg = 0;
+        const int me = world.mySide();
+        const int ax = cx / 32 - 10, ay = cy / 32 - 2;
+        if (ids.empty()) {
+            auto building = [&](const char* name) {
+                for (int i = 0; i < int(T.bin.buildingCount); ++i)
+                    if (std::string(T.bin.buildingNames[i]) == name) return i;
+                return -1;
+            };
+            if (const int wall = building("ATREIDES WALL"); wall >= 0) {
+                for (int y = -7; y <= 9; ++y)
+                    if (y != 1 && y != 2) world.addBuilding(0, wall, ax + 9, ay + y, false, true);
+                for (int y = -4; y <= 4; ++y) world.addBuilding(0, wall, ax + 13, ay + y, false, true);
+            }
+            int type = -1;
+            const char* house = me == 1 ? "HARKONNEN COMBAT TANK" : me == 2 ? "ORDOS COMBAT TANK" : "ATREIDES COMBAT TANK";
+            for (int i = 0; i < int(T.bin.unitCount); ++i)
+                if (std::string(T.bin.unitNames[i]) == house) type = i;
+            for (int k = 0; k < 10 && type >= 0; ++k) {
+                const int x = ax + (k % 5), y = ay - 3 + (k / 5) * 2;
+                ids.push_back(world.addUnit(me, type, x, y, x, y));
+            }
+            SDL_Log("march demo: 10 tanks at %d,%d (side %d), gap %d,%d..%d, goal %d,%d", ax, ay - 3, me, ax + 9, ay + 1, ay + 2,
+                    ax + 17, ay - 2);
+        }
+        bool still = true;
+        for (int id : ids)
+            if (const Unit* u = world.unit(me, id)) still = still && u->posSteps == 0 && u->state != UnitState::Moving;
+        if (const char* log = std::getenv("D2K_MARCH_LOG")) {  // per tick: tank, px, py, heading (65536ths), speed (16.16), state
+            static FILE* f = std::fopen(log, "w");
+            for (int k = 0; f && k < int(ids.size()); ++k)
+                if (const Unit* u = world.unit(me, ids[k]))
+                    std::fprintf(f, "%u,%d,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", t, k, u->posX / 65536.0, u->posY / 65536.0,
+                                 world.unitHeading(*u), u->mm.speed, int(u->state), u->targetX, u->targetY, u->mm.wpIndex, u->mm.wpCount,
+                                 u->mm.stall, u->mm.flags, u->blockFromX, u->blockFromY);
+            if (f) std::fflush(f);
+        }
+        if (t == 20 || (t > sent + 30 && (still || t > sent + 700))) {
+            const int tx = leg % 2 == 0 ? ax + 17 : ax + 2, ty = ay - 2;
+            for (int id : ids)
+                if (world.unit(me, id)) world.orderMove(me, id, tx, ty);
+            SDL_Log("march demo: tick %u: leg %d -> %d,%d", t, leg, tx, ty);
+            ++leg;
+            sent = t;
+        }
+        return;
+    }
+    // D2K_VFX_DEMO=harvestcycle (Modern movement check): a refinery of the player ~10 tiles from the
+    // nearest spice to the tile and one nearly full harvester on the spice: field -> refinery dock ->
+    // unload -> field.
+    if (demo == "harvestcycle") {
+        static bool placed = false;
+        if (placed) return;
+        placed = true;
+        const int me = world.mySide();
+        const int tx0 = cx / 32, ty0 = cy / 32;
+        int sx = -1, sy = -1;
+        for (int r = 0; r < 40 && sx < 0; ++r)
+            for (int dy = -r; dy <= r && sx < 0; ++dy)
+                for (int dx = -r; dx <= r && sx < 0; ++dx)
+                    if (std::max(std::abs(dx), std::abs(dy)) == r && world.inBounds(tx0 + dx, ty0 + dy) &&
+                        (world.cell(tx0 + dx, ty0 + dy).flags & cell_flags::kSpiceMask) >= 0x300000)
+                        sx = tx0 + dx, sy = ty0 + dy;
+        int ref = -1, harv = -1;
+        const int house = world.sides()[me].house;
+        for (int i = 0; i < int(T.bin.buildingCount); ++i)
+            if (T.bin.buildings[i].specialBehavior == building_behaviour::kRefinery && (ref < 0 || T.bin.buildings[i].ownerHouse == house))
+                ref = i;
+        for (int i = 0; i < int(T.bin.unitCount); ++i)
+            if (T.bin.units[i].specialBehavior == behaviour::kHarvester && harv < 0) harv = i;
+        if (sx < 0 || ref < 0 || harv < 0) {
+            SDL_Log("harvestcycle demo: no spice / refinery / harvester");
+            return;
+        }
+        // A 3 x 4 block of free drivable non-spice cells 8..12 tiles from the spice.
+        auto freeBlock = [&](int x0, int y0) {
+            for (int y = y0; y < y0 + 4; ++y)
+                for (int x = x0; x < x0 + 3; ++x) {
+                    if (!world.inBounds(x, y)) return false;
+                    const std::uint32_t f = world.cell(x, y).flags;
+                    if (!(f & cell_flags::kDriveOn) || (f & (cell_flags::kOccupied | cell_flags::kSpiceMask | cell_flags::kWall)))
+                        return false;
+                }
+            return true;
+        };
+        int bx = -1, by = -1;
+        for (int r = 8; r <= 14 && bx < 0; ++r)
+            for (int dy = -r; dy <= r && bx < 0; ++dy)
+                for (int dx = -r; dx <= r && bx < 0; ++dx)
+                    if (std::max(std::abs(dx), std::abs(dy)) == r && freeBlock(sx + dx, sy + dy)) bx = sx + dx, by = sy + dy;
+        if (bx < 0) {
+            SDL_Log("harvestcycle demo: no room for a refinery near the spice at %d,%d", sx, sy);
+            return;
+        }
+        const int b = world.addBuilding(me, ref, bx, by, true, true);
+        const int h = world.addUnit(me, harv, sx, sy, sx, sy);
+        if (Unit* hu = world.unit(me, h)) hu->byte29 = 6;  // nearly full: one load, then off to the refinery
+        SDL_Log("harvestcycle demo: refinery %d at %d,%d, harvester %d on spice %d,%d (side %d)", b, bx, by, h, sx, sy, me);
+        return;
+    }
+    // D2K_VFX_DEMO=route: a wall (side 0) across the middle and three combat tanks + a trike (side 0)
+    // shuttling between waypoints on either side of it, each sent on as soon as it stands on the
+    // last one - their routes trace round the wall's ends (90 / 45 degree corners inside one route,
+    // the original's stop-turn-go) and cross the open sand diagonally (staircases of 45 degree
+    // steps). Smooth driving check (render/smooth_drive.hpp).
+    if (demo == "route") {
+        static const char* kUnits[] = {"ATREIDES COMBAT TANK", "HARKONNEN COMBAT TANK", "ORDOS COMBAT TANK", "TRIKE"};
+        static const int kWays[][2][2] = {{{-3, 1}, {9, 4}}, {{-3, 3}, {9, 6}}, {{-3, 5}, {9, 1}}, {{-3, 7}, {9, 3}}};
+        static std::vector<int> ids, next;
+        static std::vector<std::uint32_t> ordered;
+        const int ax = cx / 32 - 3, ay = cy / 32 - 4;
+        if (ids.empty()) {
+            auto building = [&](const char* name) {
+                for (int i = 0; i < int(T.bin.buildingCount); ++i)
+                    if (std::string(T.bin.buildingNames[i]) == name) return i;
+                return -1;
+            };
+            if (const int wall = building("ATREIDES WALL"); wall >= 0)
+                for (int y = 1; y <= 7; ++y) world.addBuilding(0, wall, ax + 3, ay + y, false, true);
+            for (int k = 0; k < int(std::size(kUnits)); ++k) {
+                int type = -1;
+                for (int i = 0; i < int(T.bin.unitCount); ++i)
+                    if (std::string(T.bin.unitNames[i]) == kUnits[k]) type = i;
+                const int* p = kWays[k][0];
+                ids.push_back(type >= 0 ? world.addUnit(0, type, ax + p[0], ay + p[1], ax + p[0], ay + p[1]) : -1);
+                next.push_back(1);
+                ordered.push_back(0);
+            }
+        }
+        if (t < 10) return;
+        for (int k = 0; k < int(ids.size()); ++k) {
+            const Unit* u = ids[k] >= 0 ? world.unit(0, ids[k]) : nullptr;
+            if (!u || !u->alive || t < ordered[k] + 4 || u->posSteps != 0 || u->blockFromX != u->targetX ||
+                u->blockFromY != u->targetY)
+                continue;  // (an order runs at the start of the next tick)
+            const int* p = kWays[k][next[k] & 1];
+            world.orderMove(0, ids[k], ax + p[0], ay + p[1]);
+            ++next[k];
+            ordered[k] = t;
         }
         return;
     }

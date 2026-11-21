@@ -13,7 +13,7 @@ quality-of-life features, each behind a setting.
 > **You need your own copy of Dune 2000.** OpenD2K contains no game data. The free community
 > *Gruntmods Edition* installer works directly, on every platform — no Windows or Wine needed to unpack it.
 
-Current release: **0.0.2** — [download the latest release](https://github.com/OpenD2K/opend2k/releases/latest) · what changed: [CHANGELOG.md](CHANGELOG.md).
+Current release: **0.0.3** — [download the latest release](https://github.com/OpenD2K/opend2k/releases/latest) · what changed: [CHANGELOG.md](CHANGELOG.md).
 Downloads: [Releases](https://github.com/OpenD2K/opend2k/releases) · Bugs: [Issues](https://github.com/OpenD2K/opend2k/issues) ·
 Ideas and questions: [Discussions](https://github.com/OpenD2K/opend2k/discussions)
 
@@ -112,9 +112,24 @@ newer APK over the old one (settings, saves and the game data are kept).
 Both: [docs/ios.md](docs/ios.md). Game data: copy the Gruntmods installer `.exe` into *Files → On My iPad / iPhone →
 OpenD2K* (or drag it onto OpenD2K in Finder's device "Files" tab), then tap **Unpack** on the data page.
 
-Settings, saves and the unpacked game live in `~/Library/Application Support/d2k-mac/Dune 2000/` (macOS),
-`%APPDATA%\d2k-mac\Dune 2000\` (Windows), `~/.local/share/d2k-mac/Dune 2000/` (Linux) or the app's own storage
-(Android, iOS).
+### Where are my settings and saves?
+
+Settings (`settings.ini`), saved games (`saves`), the game data unpacked from the installer (`GameData`), imported
+cutscenes and the downloaded art pack all live in one folder outside the app. The easiest way to get there: open
+**Options → Data Folder** and click **Open data folder** (in the Enhanced menus the button is also at the bottom of
+**Options**); the folder's path is written next to the button. By hand:
+
+- **Windows**: press **Win+R**, paste `%APPDATA%\OpenD2K` and press Enter (or paste it into File Explorer's address
+  bar), then open `Dune 2000`. The real path is `C:\Users\<you>\AppData\Roaming\OpenD2K\Dune 2000`; `AppData` is
+  hidden in Explorer by default, which is why typing the path is easier. Portable builds keep everything in an
+  `OpenD2K Data` folder next to the game's `.exe` instead.
+- **Mac**: in Finder choose **Go → Go to Folder...**, paste `~/Library/Application Support/OpenD2K/Dune 2000` and
+  press Enter.
+- **Linux**: `~/.local/share/OpenD2K/Dune 2000` (or `$XDG_DATA_HOME/OpenD2K/Dune 2000`).
+- **Android, iOS**: the app's own storage (kept across updates).
+
+Version 0.0.2 used a folder named `d2k-mac` instead of `OpenD2K`; newer versions move it to the new place by
+themselves on the first start, so your settings and saves are kept.
 
 ### Updating
 
@@ -159,6 +174,7 @@ The original mouse scheme is the default (Options → Controls: Original / Moder
 | Right drag, arrow keys | scroll the map · mouse wheel: zoom |
 | Tab | (Enhanced / 3D) hold to see the original 1998 graphics |
 | Esc / P | pause menu |
+| **Attack-move** | hold **A** and click the ground (Original: left click · Modern: right click, or A then left click), also on the minimap: the selected units walk there and fight every enemy they meet on the way, then guard. Options → Attack-move (on in the Enhanced / 3D presets) |
 | **Factory rally point** | select one of your factories (barracks, factories, starport) with no units selected, then Alt + click on the ground (Original) or right click (Modern); new units drive there. The same click on the factory clears it. Options → Factory rally points |
 | **Production queue** (Extended, default) | unit icon: left click +1, Shift + left +10, **right click: build forever (∞)**, right click on ∞: stop, Ctrl + right click: one fewer. Options → Production queue: Original for the 1998 behaviour |
 | **3D camera** | Q / E rotate, Page Up / Down or Ctrl + wheel tilt, middle drag rotate + tilt, Home reset |

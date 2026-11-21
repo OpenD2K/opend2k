@@ -70,6 +70,8 @@ template <class T, class A> struct IsStdVector<std::vector<T, A>> : std::true_ty
 
 // Upper bound for element counts read from a file (cells of a 128x128 map are 16384).
 constexpr std::uint32_t kMaxElements = 1u << 20;
+constexpr std::uint32_t kModernTailMagic = 0x4E444F4D;  // "MODN"
+
 
 struct CountAr {
     std::size_t n = 0;
@@ -78,6 +80,10 @@ struct CountAr {
     template <class T, class F> constexpr void slots(std::vector<T>&, F) { ++n; }
     constexpr void poolLinks(std::vector<ObjectLink>&) { ++n; }
     constexpr void poolLinksTail(std::vector<ObjectLink>&) {}
+    template <class T> constexpr void optionalTail(std::vector<T>&, bool = false) {}
+    template <class T> constexpr void skip(T&) { ++n; }  // a member saved elsewhere (Unit::mm)
+    constexpr bool presentTail(bool) { return false; }
+    template <class T> constexpr void modernUnits(std::vector<T>&) {}
 };
 
 struct OutAr {
@@ -101,6 +107,19 @@ struct OutAr {
         w.u32(static_cast<std::uint32_t>(n));
         for (std::size_t i = 0; i < n; ++i) one(v[kObjectsPerSide + i]);
     }
+    // A list at the very end of the world section that is written only when it is not empty, so
+    // a game that never used it saves (and hashes) exactly as before (v9: attack-moves).
+    template <class T> void optionalTail(std::vector<T>& v, bool force = false) {
+        if (force || !v.empty()) one(v);
+    }
+    template <class T> void skip(T&) {}
+    // v10: the Modern movement tail (only in Modern games, after the attack-moves which are then
+    // always written): a marker, then per side the modern state of every live unit.
+    bool presentTail(bool on) {
+        if (on) w.u32(kModernTailMagic);
+        return on;
+    }
+    void modernUnits(std::vector<Unit>& v);
 };
 
 struct InAr {
@@ -119,6 +138,17 @@ struct InAr {
         v.resize(std::size_t(kObjectsPerSide) + n);
         for (std::uint32_t i = 0; i < n; ++i) one(v[kObjectsPerSide + i]);
     }
+    template <class T> void optionalTail(std::vector<T>& v, bool = false) {
+        v.clear();
+        if (!r.atEnd()) one(v);
+    }
+    template <class T> void skip(T&) {}
+    bool presentTail(bool) {
+        if (r.atEnd()) return false;
+        if (r.u32() != kModernTailMagic) throw SaveError("save game: bad modern movement section");
+        return true;
+    }
+    void modernUnits(std::vector<Unit>& v);
 };
 
 }  // namespace
@@ -138,6 +168,11 @@ struct SaveAccess {
            u.rememberX, u.rememberY, u.cellspotTo, u.cellspotFrom, u.facing, u.facingTurret, u.facingTurretTarget,
            u.refineryIndex, u.repairPadIndex, u.routeX, u.routeY, u.routeSteps, u.routeMode, u.routeTotalSteps,
            u.routeRetryDelay, u.routeBlocked, u.byte2E, u.oldSide, u.tag, u.prevSelected);
+        ar.skip(u.mm);  // Modern movement: the world section's modern tail (v10), only in Modern games
+    }
+    template <class Ar> static constexpr void io(Ar& ar, ModernMotion& m) {
+        ar(m.heading, m.speed, m.lastX, m.lastY, m.goalX, m.goalY, m.goalTileX, m.goalTileY, m.wpX, m.wpY, m.wpCount,
+           m.wpIndex, m.stall, m.repath, m.flags);
     }
     template <class Ar> static constexpr void io(Ar& ar, Building& b) {
         ar(b.alive, b.index, b.side, b.type, b.posX, b.posY, b.attackTileX, b.attackTileY, b.tileX, b.tileY, b.maxX,
@@ -202,6 +237,9 @@ struct SaveAccess {
     }
     template <class Ar> static constexpr void io(Ar& ar, RallyPoint& p) { ar(p.side, p.building, p.timeAdded, p.x, p.y); }
     template <class Ar> static constexpr void io(Ar& ar, RallyPending& p) { ar(p.side, p.unit, p.since, p.x, p.y); }
+    template <class Ar> static constexpr void io(Ar& ar, AttackMove& m) {
+        ar(m.side, m.unit, m.type, m.destX, m.destY, m.phase, m.leashX, m.leashY);
+    }
     template <class Ar> static constexpr void io(Ar& ar, Random& r) {
         std::uint32_t seed = r.seed();
         ar(seed);
@@ -259,6 +297,13 @@ struct SaveAccess {
         } else {
             w.unlimitedObjects_ = false;  // older saves: the original 1000-slot pools
         }
+        if (ar.version >= 9) ar.optionalTail(w.attackMoves_, w.modernMovement_);  // absent when empty (Original)
+        else w.attackMoves_.clear();
+        // v10: Modern movement (not original): present only in Modern games, so an Original
+        // game saves and hashes exactly as before.
+        w.modernMovement_ = ar.version >= 10 && ar.presentTail(w.modernMovement_);
+        if (w.modernMovement_)
+            for (Side& s : w.sides_) ar.modernUnits(s.units);
     }
 
     static void save(const World& cw, SaveWriter& out) {
@@ -370,6 +415,28 @@ template <class T, class F> void InAr::slots(std::vector<T>& v, F makeDefault) {
     }
 }
 
+void OutAr::modernUnits(std::vector<Unit>& v) {
+    std::uint32_t n = 0;
+    for (const Unit& u : v) n += u.alive ? 1 : 0;
+    w.u32(n);
+    for (Unit& u : v) {
+        if (!u.alive) continue;
+        w.u32(static_cast<std::uint32_t>(u.index));
+        one(u.mm);
+    }
+}
+
+void InAr::modernUnits(std::vector<Unit>& v) {
+    for (Unit& u : v) u.mm = ModernMotion{};
+    const std::uint32_t n = r.u32();
+    if (n > v.size()) throw SaveError("save game: bad modern unit count");
+    for (std::uint32_t k = 0; k < n; ++k) {
+        const std::uint32_t i = r.u32();
+        if (i >= v.size()) throw SaveError("save game: bad modern unit index");
+        one(v[i].mm);
+    }
+}
+
 // --- Compile-time completeness checks ---
 
 // Converts to any member type: T{AnyField{} x N} compiles iff T has at least N members.
@@ -397,6 +464,7 @@ template <class T> consteval std::size_t visitedFields() {
                   "savegame.cpp: io(" #T ") must list every member of " #T " (then bump kSaveVersion)")
 #endif
 D2K_SAVE_FIELDS(Unit);
+D2K_SAVE_FIELDS(ModernMotion);
 D2K_SAVE_FIELDS(Building);
 D2K_SAVE_FIELDS(Bullet);
 D2K_SAVE_FIELDS(Explosion);
@@ -419,6 +487,7 @@ D2K_SAVE_FIELDS(CheatState);
 D2K_SAVE_FIELDS(ScheduledReinforcement);
 D2K_SAVE_FIELDS(RallyPoint);
 D2K_SAVE_FIELDS(RallyPending);
+D2K_SAVE_FIELDS(AttackMove);
 D2K_SAVE_FIELDS(ExtVariable);
 D2K_SAVE_FIELDS(ExtMission);
 #undef D2K_SAVE_FIELDS
@@ -429,13 +498,13 @@ D2K_SAVE_FIELDS(ExtMission);
 #if defined(_LIBCPP_VERSION) && INTPTR_MAX == INT64_MAX
 #define D2K_SAVE_SIZE(T, n) \
     static_assert(sizeof(T) == (n), "savegame.cpp: " #T " changed - update its io() field list, then this size")
-D2K_SAVE_SIZE(Unit, 212);
+D2K_SAVE_SIZE(Unit, 280);  // (+68: mm, Modern movement; saved in the modern tail)
 D2K_SAVE_SIZE(Building, 112);
 D2K_SAVE_SIZE(Bullet, 92);
 D2K_SAVE_SIZE(Explosion, 56);
 D2K_SAVE_SIZE(Side, 5120);  // (links: a vector since v8)
 D2K_SAVE_SIZE(PathFinder, 24068);
-D2K_SAVE_SIZE(World, 131784);  // (+8: Rules::ext and Rules::unlimitedObjects, not saved - set by the loader; orderUnitLimit_: a UI setting, not saved)
+D2K_SAVE_SIZE(World, 131952);  // (Modern movement scratch: not saved; +8: Rules::ext and Rules::unlimitedObjects, not saved - set by the loader; orderUnitLimit_: a UI setting, not saved)
 #undef D2K_SAVE_SIZE
 #endif
 
@@ -468,6 +537,8 @@ void writeMeta(SaveWriter& w, const SaveMeta& m) {
     // Version 7.
     w.u8(static_cast<std::uint8_t>(m.kind));
     w.i32(m.missionNumber);
+    // Version 10.
+    w.u8(m.modernMovement ? 1 : 0);
 }
 
 SaveMeta readMeta(SaveReader& r, std::uint32_t version) {
@@ -506,6 +577,7 @@ SaveMeta readMeta(SaveReader& r, std::uint32_t version) {
         m.kind = static_cast<SaveKind>(kind);
         m.missionNumber = r.i32();
     }
+    if (version >= 10) m.modernMovement = r.u8() != 0;
     return m;
 }
 

@@ -34,6 +34,7 @@ namespace d2k::render {
 struct Camera;
 class Effects;
 class EffectAnchors;
+class DropInSource;
 
 struct Lamp {
     enum Kind : std::uint8_t { Pool, Cone };
@@ -101,6 +102,9 @@ public:
     void update(const game::World& w, const SceneLight& light, double time, const float view[4], bool showShroud,
                 const Effects* fx, const EffectAnchors* anchors, const std::vector<std::uint8_t>* redesigned = nullptr,
                 const std::vector<std::uint8_t>* redesignedUnits = nullptr);
+    // Drop-in build-up (render/building_dropin.hpp): a building dropping in gets its lamps only at
+    // the end of its unfold, fading in (nullptr = the build-up rules). Set before update().
+    void setDropIn(const DropInSource* s) { dropIn_ = s; }
     const std::vector<Lamp>& lamps() const { return lamps_; }
     const std::vector<Flare>& flares() const { return flares_; }
     bool empty() const { return lamps_.empty() && flares_.empty(); }
@@ -115,6 +119,7 @@ public:
     SDL_Texture* flareTexture() const { return flareTex_; }
 
 private:
+    const DropInSource* dropIn_ = nullptr;
     void buildTextures();
     void addVehicle(const game::World& w, int side, int index, float facing, float lampK, double time);
     void addFlyer(const game::World& w, int side, int index, float lampK, double time);

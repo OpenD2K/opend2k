@@ -41,6 +41,7 @@ Options parseArgs(int argc, char** argv) {
             else if (a == "--simtest") o.simtest = true;
             else if (a == "--ticks") o.ticks = std::stoi(next());
             else if (a == "--battle") o.battle = true;
+            else if (a == "--movement") o.movement = next() == "modern" ? 1 : 0;
             else if (a == "--vfx-demo") o.vfxDemo = true;
             else if (a == "--select") o.selectAll = true;
             else if (a == "--mute") o.mute = true;
@@ -61,6 +62,17 @@ Options parseArgs(int argc, char** argv) {
             else if (a == "--terrain3d") o.terrain3d = next();
             else if (a == "--terrain2d") o.terrain2d = next();
             else if (a == "--shadows3d") o.shadows3d = next();
+            else if (a == "--reimagined") o.reimagined = next();
+            else if (a == "--ground-detail") o.groundDetail = next();
+            else if (a == "--dust-haze") o.dustHaze = next();
+            else if (a == "--ground-dust") o.groundDust = next();
+            else if (a == "--aerial-haze") o.aerialHaze = next();
+            else if (a == "--map-surroundings") o.mapSurroundings = next();
+            else if (a == "--natural-grade") o.naturalGrade = next();
+            else if (a == "--vehicle-wrecks") o.vehicleWrecks = next();
+            else if (a == "--photo-terrain") o.photoTerrain = next();
+            else if (a == "--ambient-occlusion") o.ambientOcclusion = next();
+            else if (a == "--game-speed") o.gameSpeed = std::stoi(next());
             else if (a == "--time-of-day") o.timeOfDay = next();
             else if (a == "--skirmish-ai") o.skirmishAi = std::atoi(next().c_str());
             else if (a == "--lighting") o.lighting = next();
@@ -80,14 +92,33 @@ Options parseArgs(int argc, char** argv) {
                     o.graphics.clear();
                 }
             }
+            else if (a == "--graphics-preset") {
+                o.graphicsPreset = next();
+                if (o.graphicsPreset != "original" && o.graphicsPreset != "enhanced" && o.graphicsPreset != "3d" &&
+                    o.graphicsPreset != "3d-classic") {
+                    SDL_Log("--graphics-preset wants original, enhanced, 3d or 3d-classic, not '%s'", o.graphicsPreset.c_str());
+                    o.graphicsPreset.clear();
+                }
+            }
             else if (a == "--art-pack") o.artPack = next();
             else if (a == "--vehicle-animation") o.vehicleAnimation = next();
             else if (a == "--controls") o.controls = next();
+            else if (a == "--attack-move") o.attackMove = next();
+            else if (a == "--smooth-camera") o.smoothCamera = next();
+            else if (a == "--smooth-driving") o.smoothDriving = next();
+            else if (a == "--building-placement") o.buildingPlacement = next();
             else if (a == "--effects") {
                 o.effects = next();
                 if (o.effects != "classic" && o.effects != "modern") {
                     SDL_Log("--effects wants classic or modern, not '%s'", o.effects.c_str());
                     o.effects.clear();
+                }
+            }
+            else if (a == "--effects-intensity") {
+                o.effectsIntensity = next();
+                if (o.effectsIntensity != "clean" && o.effectsIntensity != "balanced" && o.effectsIntensity != "cinematic") {
+                    SDL_Log("--effects-intensity wants clean, balanced or cinematic, not '%s'", o.effectsIntensity.c_str());
+                    o.effectsIntensity.clear();
                 }
             }
             else if (a == "--panel-transparency") o.panelTransparency = next();

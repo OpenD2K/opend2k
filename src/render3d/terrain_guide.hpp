@@ -54,7 +54,14 @@ public:
         // original tiles): heightAt() - the mesh, which only casts the shadows there - is the
         // same relief at half the cliff height, so the shadows fall on the sand beyond the foot.
         bool topDown = false;
+        // "Reimagined" (docs/3d-mode.md "Reimagined", "Passable ground"; 3D only): the height channel holds the
+        // taller relief ENCODED for Terrain::reliefHeight(g, true) / the shader's macroH - the full Reimagined
+        // scale on cliff cells, while the ground units use stays continuous (no holes where the tiles' sand
+        // reaches into passable rock) and ramps at most kReimRamp. Off: the guide is exactly the plain one.
+        bool reimagined = false;
     };
+    // Reimagined: the steepest ramp of the ground on passable cells (px rise per px, ~19 degrees).
+    static constexpr float kReimRamp = 0.35f;
     // A boulder (on rock no vehicle can use that does not stand as a tall cliff: crumbling
     // cliff ends, rubble, outcrops, infantry-only rock): world px + size.
     struct Stone {

@@ -45,3 +45,37 @@ At run time every material (and every rock) is tinted so its mean colour matches
 map's own tiles of that class ("colour lock"): nothing derived from the original game data is stored.
 "Designed (faithful)" also reads the map's own tile pixels at run time for its layout (rock outlines, cliffs, tones:
 `src/render3d/terrain_guide.*`), in memory only - again nothing derived from the game data is stored or shipped.
+
+## Ground clutter pack (Reimagined; not in git)
+
+`artpacks/ground-clutter/clutter/` (docs/3d-mode.md "Ground clutter") is built by `tools/models/clutter_kit.py` from
+these Poly Haven scans (CC0 1.0, fetched by `tools/models/clutter_fetch.py`) plus procedural pieces / textures; the
+pack carries the same list in its own LICENSES.md.
+
+| Poly Haven asset | URL | Pieces |
+|---|---|---|
+| Namaqualand Stones 01 | https://polyhaven.com/a/namaqualand_stones_01 | pebble_a-e, gravel_a/b |
+| Namaqualand Rocks 01 | https://polyhaven.com/a/namaqualand_rocks_01 | boulder_a-d, slab_a/b, rubble_a/b |
+| Namaqualand Boulders 01 | https://polyhaven.com/a/namaqualand_boulders_01 | boulder_e/f |
+| Rock 07 | https://polyhaven.com/a/rock_07 | boulder_g |
+| Rock 09 | https://polyhaven.com/a/rock_09 | slab_c |
+| Stone 01 | https://polyhaven.com/a/stone_01 | boulder_h |
+| Dead Quiver Branch 01 | https://polyhaven.com/a/dead_quiver_branch_01 | deadwood_a |
+| Dead Quiver Branch 02 | https://polyhaven.com/a/dead_quiver_branch_02 | deadwood_b |
+| Dry Branches Medium 01 | https://polyhaven.com/a/dry_branches_medium_01 | deadwood_c |
+
+## Photo terrain pack (Reimagined; not in git)
+
+`artpacks/photo-terrain/` (docs/3d-mode.md "Photo terrain", docs/art-pipeline.md "Photo terrain pack") is built by
+`tools/fetch_photo_terrain.py` from these Poly Haven texture scans (CC0 1.0; the list with the maps used is
+`tools/photo_terrain_manifest.json`, and the pack carries its own LICENSES.md).
+
+| Poly Haven asset | URL | Layer |
+|---|---|---|
+| Sandy Gravel 02 | https://polyhaven.com/a/sandy_gravel_02 | sand |
+| Aerial Beach 01 | https://polyhaven.com/a/aerial_beach_01 | ripples |
+| Coast Sand 01 | https://polyhaven.com/a/coast_sand_01 | gravel |
+| Sandstone Cracks | https://polyhaven.com/a/sandstone_cracks | rock |
+| Rock Boulder Cracked | https://polyhaven.com/a/rock_boulder_cracked | rough |
+| Cliff Side | https://polyhaven.com/a/cliff_side | cliff |
+| Dirty Concrete | https://polyhaven.com/a/dirty_concrete | concrete |

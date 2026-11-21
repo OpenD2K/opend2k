@@ -67,20 +67,10 @@ int compareVersions(const std::string& a, const std::string& b) {
     return 0;
 }
 
-bool parseArtPackManifest(const std::string& json, const std::string& manifestUrl, ArtPackManifest& out,
-                          std::string& error) {
-    out = ArtPackManifest{};
-    Json root;
-    if (!json::parse(json, root, error)) return false;
-    if (root.kind != Json::Object) {
-        error = "the manifest is not a JSON object";
-        return false;
-    }
-    if (const Json* f = field(root, "format"); f && f->kind == Json::Number) out.format = int(f->num);
-    if (out.format != 1) {
-        error = "unsupported manifest format " + std::to_string(out.format) + " (a newer OpenD2K is needed)";
-        return false;
-    }
+namespace {
+
+// One pack entry (the manifest itself or one of its "extras"); false + error when unusable.
+bool parseItem(const Json& root, const std::string& manifestUrl, ArtPackManifest& out, std::string& error) {
     out.name = str(root, "name");
     out.title = str(root, "title");
     out.version = str(root, "version");
@@ -115,6 +105,48 @@ bool parseArtPackManifest(const std::string& json, const std::string& manifestUr
         error = "bad sha256";
     else if (out.urls.empty()) error = "no download URL";
     return error.empty();
+}
+
+}  // namespace
+
+const ArtPackManifest* ArtPackManifest::item(const std::string& n) const {
+    if (n == name) return this;
+    for (const ArtPackManifest& e : extras)
+        if (e.name == n) return &e;
+    return nullptr;
+}
+
+bool parseArtPackManifest(const std::string& json, const std::string& manifestUrl, ArtPackManifest& out,
+                          std::string& error) {
+    out = ArtPackManifest{};
+    Json root;
+    if (!json::parse(json, root, error)) return false;
+    if (root.kind != Json::Object) {
+        error = "the manifest is not a JSON object";
+        return false;
+    }
+    if (const Json* f = field(root, "format"); f && f->kind == Json::Number) out.format = int(f->num);
+    if (out.format != 1) {
+        error = "unsupported manifest format " + std::to_string(out.format) + " (a newer OpenD2K is needed)";
+        return false;
+    }
+    if (!parseItem(root, manifestUrl, out, error)) return false;
+    if (const Json* x = field(root, "extras"); x && x->kind == Json::Array)
+        for (const Json& e : x->arr) {
+            if (e.kind != Json::Object) continue;
+            ArtPackManifest item;
+            std::string why;
+            if (!parseItem(e, manifestUrl, item, why) || out.item(item.name)) continue;  // dropped: bad or a duplicate name
+            item.isExtra = true;
+            item.description = str(e, "description");
+            item.requires_ = str(e, "requires");
+            item.install = str(e, "install");
+            if (!item.install.empty() && item.install != kInstallAiVoices) continue;  // a kind this game does not know
+            if (const Json* f = field(e, "for3d"); f && f->kind == Json::Bool) item.for3d = f->b;
+            if (item.minEngine.empty()) item.minEngine = out.minEngine;
+            out.extras.push_back(std::move(item));
+        }
+    return true;
 }
 
 }  // namespace d2k::formats

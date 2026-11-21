@@ -505,6 +505,7 @@ void World::processOrder(const Order& o) {
     case Order::BuildingAttackBuilding:  // case 0xc (order 0x1f)
         processBuildingAttackOrder(o);
         return;
+    case Order::AttackMove: processAttackMoveOrder(o); return;  // not original (attack_move.cpp)
     default: break;
     }
     if (o.kind >= Order::CheatSetCredits) {  // not original (cheats.cpp)
@@ -517,6 +518,7 @@ void World::processOrder(const Order& o) {
     }
     Unit* u = unit(o.side, o.unitIndex);
     if (!u) return;
+    if (!attackMoves_.empty()) cancelAttackMove(o.side, o.unitIndex);  // a new order ends an attack-move
     if (o.kind == Order::DockRefinery) {  // case 4 (0x17): harvesters go to the given refinery
         if (unitCanTakeOrders(u, true) && unitTemplate(*u).specialBehavior == behaviour::kHarvester &&
             unitAdjustState(*u, UnitState::MovingToRefinery)) {
@@ -643,6 +645,7 @@ void World::processOrder(const Order& o) {
             u->oldState = UnitState::None;
             u->targetX = o.x;
             u->targetY = o.y;
+            if (modernMovement_ && isModernVehicle(*u)) formationBatch_.push_back({o.side, o.unitIndex, o.x, o.y});
         }
         // BlockFrom/BlockTo/pos_steps are untouched: a unit in mid-step finishes the step.
     } else {
@@ -681,9 +684,12 @@ void World::tick() {
     // queued orders right before ModelUpdate.
     const std::vector<Order> orders = std::move(orders_);
     orders_.clear();
+    if (modernMovement_) modernIndexVehicles();  // not original: Modern movement's cell index
     for (const auto& o : orders) processOrder(o);
+    if (!formationBatch_.empty()) applyModernFormations();  // not original: Modern group moves
     updateCheats();  // not original: free cheat deliveries waiting for a delivery slot
     updateRally();   // not original: units that left a factory with a rally point
+    updateAttackMoves();  // not original: attack-moving units engage / resume / guard
     modelUpdate();
     updateBuildingRepair();  // FUN_0044a9f0
     updatePower();           // FUN_0044aae0
@@ -748,6 +754,7 @@ void World::freeUnit(Side& side, Unit& u) {
     if (t.specialBehavior == behaviour::kHarvester) --side.harvesterCount;
     else if (t.specialBehavior == behaviour::kCarryall && !(u.flags & 0x800)) --side.carryallCount;
     if (t.specialBehavior == behaviour::kCarryall) --side.carryallsAlive;
+    if (!attackMoves_.empty()) cancelAttackMove(side.id, u.index);  // not original (attack_move.cpp)
     u.state = UnitState::None;
     --side.unitsExistPerType[u.type];
     side.freeObject(u.index);
@@ -1116,7 +1123,8 @@ void World::updateMovingAway(Unit& u) {
             u.rememberY = cy;
         }
         if (moveUnit(u)) {
-            if (u.flags & kBlockToMarked) unitAdjustState(u, UnitState::Moving);
+            // (Modern movement: under way = the move has started, like the original's reservation)
+            if ((u.flags & kBlockToMarked) || (isModernVehicle(u) && u.posSteps != 0)) unitAdjustState(u, UnitState::Moving);
             return;
         }
     } else {

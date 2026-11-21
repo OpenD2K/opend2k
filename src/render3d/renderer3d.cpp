@@ -16,6 +16,7 @@
 #include "render/tileset.hpp"
 #include "render/vehicle_motion.hpp"
 #include "render/weld_fx.hpp"
+#include "render3d/flight.hpp"
 #include "render3d/gpu.hpp"
 #include "render3d/shader_blobs.hpp"
 
@@ -31,7 +32,10 @@ namespace {
 constexpr std::uint32_t kInitialQuads = 8192;
 constexpr int kFrameDigitOne = 18;  // DATA.R16 group digits (17 + n, map_renderer.cpp): "1" = PRIMARY
 constexpr int kSpriteFloats = 19;  // pos3 anchor3 uv2 color4 params4 shadowPoint3
+constexpr float kHazeSpeed = 15.0f;    // Dust haze: world px per game second the veils drift
 constexpr float kShadowKeep = 0.12f;  // diffuse light kept in full sun shadow (shadow map)
+constexpr float kAerialCap = 0.5f;     // Aerial haze: the most of the haze colour far away (day)
+constexpr float kAerialBloom = 0.24f, kAerialBloomT = 0.8f;   // Aerial haze: day bloom strength / threshold
 
 struct TerrainVU {
     float viewProj[16];
@@ -97,6 +101,10 @@ SDL_GPUColorTargetBlendState blendFor(int pipe) {
         b.src_color_blendfactor = SDL_GPU_BLENDFACTOR_DST_COLOR;
         b.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
         break;
+    case 6:  // relief (track marks): dst * 2 * src - 0.5 leaves the ground as it is
+        b.src_color_blendfactor = SDL_GPU_BLENDFACTOR_DST_COLOR;
+        b.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_COLOR;
+        break;
     default:  // multiply (sprite shadow masks: white = no change, grey halves)
         b.src_color_blendfactor = SDL_GPU_BLENDFACTOR_DST_COLOR;
         b.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
@@ -150,18 +158,26 @@ Renderer3D::~Renderer3D() {
     rel(white_);
     rel(clearMask_);
     rel(ring_);
+    rel(blob_);
+    rel(trackTex_);
     rel(shadowTex_);
     relb(terrainVB_);
     relb(terrainIB_);
+    relb(surroundVB_);
+    relb(surroundIB_);
+    rel(surroundTex_);
+    if (linearMirror_) SDL_ReleaseGPUSampler(dev_, linearMirror_);
     relb(spriteVB_);
     relb(quadIB_);
     if (spriteTB_) SDL_ReleaseGPUTransferBuffer(dev_, spriteTB_);
     if (terrainPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, terrainPipe_);
     if (terrainDepthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, terrainDepthPipe_);
+    if (terrainViewDepthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, terrainViewDepthPipe_);
     if (shadowSampler_) SDL_ReleaseGPUSampler(dev_, shadowSampler_);
     for (auto* p : spritePipe_)
         if (p) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     if (linearClamp_) SDL_ReleaseGPUSampler(dev_, linearClamp_);
+    if (trackSampler_) SDL_ReleaseGPUSampler(dev_, trackSampler_);
     if (tileSampler_) SDL_ReleaseGPUSampler(dev_, tileSampler_);
     if (pointClamp_) SDL_ReleaseGPUSampler(dev_, pointClamp_);
 }
@@ -280,6 +296,9 @@ bool Renderer3D::init() {
     si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
     si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     linearClamp_ = SDL_CreateGPUSampler(dev_, &si);
+    si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_MIRRORED_REPEAT;
+    linearMirror_ = SDL_CreateGPUSampler(dev_, &si);  // the world beyond the map: the map's layout mirrored across its edge
+    si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
     si.max_lod = 16;
     // Anisotropic filtering (Quality::aniso): the tiles at a tilt stay sharp into the distance.
@@ -288,6 +307,11 @@ bool Renderer3D::init() {
     tileSampler_ = SDL_CreateGPUSampler(dev_, &si);
     si.enable_anisotropy = false;
     si.max_anisotropy = 0;
+    // Track marks: mipmapped (down to level 2: the texture's columns stay apart), repeating along the trail.
+    si.max_lod = 2.5f;
+    si.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    trackSampler_ = SDL_CreateGPUSampler(dev_, &si);
+    si.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     si.min_filter = si.mag_filter = SDL_GPU_FILTER_NEAREST;
     si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
     si.max_lod = 0;
@@ -308,7 +332,22 @@ bool Renderer3D::init() {
     white_ = tex2d(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 1, 1);
     clearMask_ = tex2d(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 1, 1);
     ring_ = tex2d(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 64, 64);
-    if (!white_ || !clearMask_ || !ring_) return false;
+    blob_ = tex2d(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 32, 32);
+    if (!white_ || !clearMask_ || !ring_ || !blob_) return false;
+    {
+        // Track marks relief (uploaded with the small textures).
+        const TrackTexture tt = buildTrackTexture();
+        SDL_GPUTextureCreateInfo ci{};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = Uint32(tt.w);
+        ci.height = Uint32(tt.h);
+        ci.layer_count_or_depth = 1;
+        ci.num_levels = Uint32(tt.levels.size());
+        trackTex_ = SDL_CreateGPUTexture(dev_, &ci);
+        trackTexW_ = tt.w;
+    }
 
     if (!initShadows()) return false;
     shroud_ = std::make_unique<render::SoftShroud>(r_, sprites_);
@@ -360,6 +399,10 @@ bool Renderer3D::initShadows() {
         pi.target_info.depth_stencil_format = shadowFmt_;
         pi.target_info.has_depth_stencil_target = true;
         terrainDepthPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+        pi.rasterizer_state.enable_depth_bias = false;  // seen from the camera (the ambient occlusion): exact
+        pi.rasterizer_state.depth_bias_constant_factor = 0;
+        pi.rasterizer_state.depth_bias_slope_factor = 0;
+        terrainViewDepthPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
     }
     for (SDL_GPUShader* s : {vs, fs})
         if (s) SDL_ReleaseGPUShader(dev_, s);
@@ -378,7 +421,9 @@ bool Renderer3D::initShadows() {
 // crawl. depthRange: world px from near to far (for the depth bias).
 Mat4 Renderer3D::fitLight(float mapW, float mapH, float& depthRange) const {
     const Vec3 L = sun_;
-    const float top = terrainTop_ + 64;
+    // (The world beyond the map casts and takes shadows too: the fit reaches over its ring.)
+    const float out = surroundOn_ ? Surround::margin() : 64.0f;
+    const float top = std::max(terrainTop_, surroundOn_ ? surround_.top() : 0.0f) + 64;
     Vec3 pts[16];
     int n = 0;
     const float W = float(cam_.viewW()), Hh = float(cam_.viewH());
@@ -388,8 +433,8 @@ Mat4 Renderer3D::fitLight(float mapW, float mapH, float& depthRange) const {
         cam_.ray(sxs[k], sys[k], o, d);
         for (float plane : {0.0f, top}) {
             Vec3 p = d.y < -1e-3f ? o + d * std::max(0.0f, (o.y - plane) / -d.y) : o + d * 20000.0f;
-            p.x = std::clamp(p.x, -64.0f, mapW + 64);
-            p.z = std::clamp(p.z, -64.0f, mapH + 64);
+            p.x = std::clamp(p.x, -out, mapW + out);
+            p.z = std::clamp(p.z, -out, mapH + out);
             p.y = plane;
             pts[n++] = p;
         }
@@ -405,7 +450,7 @@ Mat4 Renderer3D::fitLight(float mapW, float mapH, float& depthRange) const {
     }
     float zn = 1e30f, zf = -1e30f;
     for (int i = 0; i < 8; ++i) {
-        const Vec4 v = view * Vec4{(i & 1) ? mapW + 64 : -64.0f, (i & 2) ? top + 64 : -16.0f, (i & 4) ? mapH + 64 : -64.0f, 1};
+        const Vec4 v = view * Vec4{(i & 1) ? mapW + out : -out, (i & 2) ? top + 64 : -16.0f, (i & 4) ? mapH + out : -out, 1};
         zn = std::min(zn, -v.z);
         zf = std::max(zf, -v.z);
     }
@@ -812,36 +857,91 @@ void Renderer3D::decalTex(SDL_GPUTexture* t, float x0, float y0, float w, float 
     Inst in;
     in.tex = t;
     in.pipe = pipe;
-    for (int k = 0; k < 4; ++k) {
-        const float x = x0 + ((k & 1) ? w : 0), zz = y0 + ((k & 2) ? h : 0);
-        in.c[k] = Vec3{x, flatY >= 0 ? flatY : terrain_.height(x, zz) + 1.0f, zz};
-        in.s[k] = in.c[k] + Vec3{0, 1.5f, 0};
-        in.gx[k] = x;
-        in.gy[k] = zz;
-    }
     in.r = r;
     in.g = g;
     in.b = b;
     in.a = a;
+    if (flatY < 0) {
+        pushGroundInst(in, x0, y0, w, 0, 0, h, 1.0f);
+        return;
+    }
+    for (int k = 0; k < 4; ++k) {
+        const float x = x0 + ((k & 1) ? w : 0), zz = y0 + ((k & 2) ? h : 0);
+        in.c[k] = Vec3{x, flatY, zz};
+        in.s[k] = in.c[k] + Vec3{0, 1.5f, 0};
+        in.gx[k] = x;
+        in.gy[k] = zz;
+    }
     in.seq = int(insts_.size());
     insts_.push_back(in);
 }
 
+void Renderer3D::pushGroundInst(Inst& in, float ox, float oz, float ux, float uz, float vx, float vz, float lift, bool fade) {
+    constexpr int kMaxGrid = 8;
+    const float cell = std::max(8.0f, 2.0f * terrain_.step());
+    const float len = std::max(std::sqrt(ux * ux + uz * uz), std::sqrt(vx * vx + vz * vz));
+    static const bool grid = !std::getenv("D2K_MARK_GRID") || std::string(std::getenv("D2K_MARK_GRID")) != "0";  // 0: one quad
+    int n = grid ? std::clamp(int(std::ceil(len / cell)), 1, kMaxGrid) : 1;
+    float hgt[kMaxGrid + 1][kMaxGrid + 1], fd[kMaxGrid + 1][kMaxGrid + 1];
+    fade = fade && grid;
+    const float refY = fade ? terrain_.height(ox + 0.5f * (ux + vx), oz + 0.5f * (uz + vz)) : 0.0f;
+    auto at = [&](float s, float t, float& x, float& z) {
+        x = ox + ux * s + vx * t;
+        z = oz + uz * s + vz * t;
+    };
+    for (int j = 0; j <= n; ++j)
+        for (int i = 0; i <= n; ++i) {
+            float x, z;
+            at(float(i) / float(n), float(j) / float(n), x, z);
+            hgt[j][i] = terrain_.height(x, z) + lift;
+            fd[j][i] = fade ? terrain_.markFade(x, z, refY) : 1.0f;
+        }
+    if (n > 1) {
+        // Flat enough for the one quad of its corners (within half a pixel everywhere)?
+        float dev = 0;
+        for (int j = 0; j <= n; ++j)
+            for (int i = 0; i <= n; ++i) {
+                const float s = float(i) / float(n), t = float(j) / float(n);
+                const float p = (hgt[0][0] * (1 - s) + hgt[0][n] * s) * (1 - t) + (hgt[n][0] * (1 - s) + hgt[n][n] * s) * t;
+                dev = std::max(dev, std::abs(hgt[j][i] - p));
+                if (fd[j][i] < 0.99f) dev = 1e9f;  // a fade inside needs the grid too
+            }
+        if (dev < 0.5f) {
+            hgt[0][1] = hgt[0][n];
+            hgt[1][0] = hgt[n][0];
+            hgt[1][1] = hgt[n][n];
+            n = 1;
+        }
+    }
+    const float u0 = in.u0, v0 = in.v0, du = in.u1 - in.u0, dv = in.v1 - in.v0;
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i) {
+            for (int k = 0; k < 4; ++k) {
+                const int gi = i + (k & 1), gj = j + ((k & 2) ? 1 : 0);
+                float x, z;
+                at(float(gi) / float(n), float(gj) / float(n), x, z);
+                in.c[k] = Vec3{x, hgt[gj][gi], z};
+                in.s[k] = in.c[k] + Vec3{0, 1.5f, 0};
+                in.gx[k] = x;
+                in.gy[k] = z;
+                in.ka[k] = n > 1 ? fd[gj][gi] : 1.0f;
+            }
+            in.u0 = u0 + du * float(i) / float(n);
+            in.u1 = u0 + du * float(i + 1) / float(n);
+            in.v0 = v0 + dv * float(j) / float(n);
+            in.v1 = v0 + dv * float(j + 1) / float(n);
+            in.seq = int(insts_.size());
+            insts_.push_back(in);
+        }
+}
+
 void Renderer3D::groundQuad(SDL_GPUTexture* t, float cx, float cy, float hw, float hh, float angle, Pipe pipe, float r,
-                            float g, float b, float a, float u0, float v0, float u1, float v1) {
+                            float g, float b, float a, float u0, float v0, float u1, float v1, bool fade) {
     if (!t) return;
     const float ca = std::cos(angle), sa = std::sin(angle);
     Inst in;
     in.tex = t;
     in.pipe = pipe;
-    for (int k = 0; k < 4; ++k) {
-        const float lx = (k & 1) ? hw : -hw, ly = (k & 2) ? hh : -hh;
-        const float x = cx + lx * ca - ly * sa, zz = cy + lx * sa + ly * ca;
-        in.c[k] = Vec3{x, terrain_.height(x, zz) + 1.2f, zz};
-        in.s[k] = in.c[k] + Vec3{0, 1.5f, 0};
-        in.gx[k] = x;
-        in.gy[k] = zz;
-    }
     in.u0 = u0;
     in.v0 = v0;
     in.u1 = u1;
@@ -850,8 +950,60 @@ void Renderer3D::groundQuad(SDL_GPUTexture* t, float cx, float cy, float hw, flo
     in.g = g;
     in.b = b;
     in.a = a;
-    in.seq = int(insts_.size());
-    insts_.push_back(in);
+    // corner 0 at (-hw, -hh), s along +hw, t along +hh (turned by angle)
+    pushGroundInst(in, cx - hw * ca + hh * sa, cy - hw * sa - hh * ca, 2 * hw * ca, 2 * hw * sa, -2 * hh * sa, 2 * hh * ca, 1.2f, fade);
+}
+
+// Realistic grade (docs/3d-mode.md "Realistic grade"): the ground occlusion under units. Buildings and walls
+// are in the terrain's occlusion channel (DesignedTerrain::setGroundOcclusion, rebuilt only when they change);
+// units move every frame, so each ground unit gets one soft dark blot under its hull instead - a decal quad
+// turned with the unit, a little larger than the hull, on the terrain (no texture upload, no extra pass).
+// Not under flyers, carried or hidden units, sandworms, or anything cloaked / stealthed (it would give them away).
+void Renderer3D::addContactShadows(const game::World& w, const Options& o) {
+    if (!blob_) return;
+    constexpr std::size_t kTypes = formats::kMaxUnitTypes;
+    if (blobSize_.size() != kTypes * 2 || ++blobAge_ >= 240) {
+        blobSize_.assign(kTypes * 2, 0.0f);
+        blobAge_ = 0;
+    }
+    auto sizeOf = [&](int type, float& hw, float& hl) {
+        type = std::clamp(type, 0, int(kTypes) - 1);
+        float* s = &blobSize_[std::size_t(type) * 2];
+        if (s[0] <= 0) {
+            const auto& u = t_.bin.units[type];
+            if (u.isInfantry) {
+                s[0] = s[1] = 2.6f;
+            } else {
+                s[0] = 8.0f;
+                TrackContact c;
+                if (models_ && models_->active() && models_->unitTrackContact(type, c) && !c.bands.empty()) {
+                    float reach = 0;
+                    for (const auto& b : c.bands) reach = std::max(reach, std::abs(b.lateral) + b.halfWidth);
+                    s[0] = std::clamp(reach, 5.0f, 15.0f);
+                }
+                s[1] = s[0] * 1.3f;
+            }
+        }
+        hw = s[0];
+        hl = s[1];
+    };
+    for (const auto& side : w.sides())
+        for (int ui = side.firstUnit; ui >= 0; ui = side.nextObject(ui)) {
+            const auto& u = side.units[std::size_t(ui)];
+            if (!u.alive || (u.flags & 0x200140) || (u.flags & 0x4) || u.stealthTimer != 0) continue;
+            if (u.type < 0 || u.type >= int(kTypes) || t_.bin.units[u.type].specialBehavior == 5) continue;
+            const float gx = float(game::fixToPixel(u.posX)), gy = float(game::fixToPixel(u.posY));
+            if (pointHidden(gx, gy) || render::fxHideUnits()) continue;
+            float hw = 0, hl = 0;
+            sizeOf(u.type, hw, hl);
+            float facing = float(u.facing & 31);
+            if (const render::Effects::UnitVisual* vis = o.effects ? o.effects->unitVisual(u.side, u.index) : nullptr) facing = vis->facing;
+            const bool inf = t_.bin.units[u.type].isInfantry != 0;
+            // (With the screen-space ambient occlusion the hull's crease is drawn there: the blot only half as dark.)
+            const float k = ssaoWanted_ ? 0.55f : 1.0f;
+            groundQuad(blob_, gx, gy, hw * 1.55f, hl * 1.5f, facing * (kPi / 16.0f), kAlpha, 0.03f, 0.025f, 0.03f,
+                       (inf ? 0.3f : 0.42f) * k, 0, 0, 1, 1, false);
+        }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -897,23 +1049,10 @@ void Renderer3D::collect(const game::World& w, const Options& o) {
             const int j = (x + y) & 15;
             decal(sprite(frame, -1), false, float(x * 32 + decalJitterX_[j]), float(y * 32 + decalJitterY_[j]), kAlpha);
         }
-    // Tread marks (Modern effects) lie on the ground under everything else.
-    if (o.effects) {
-        const render::Effects& fx = *o.effects;
-        if (SDL_GPUTexture* at = tex(fx.atlasTexture())) {
-            float u0, v0, u1, v1;
-            render::Effects::texRect(render::Effects::kSoft, u0, v0, u1, v1);
-            const std::uint32_t c = render::Effects::treadColour();
-            const float cr = float(c & 0xFF) / 255, cg = float((c >> 8) & 0xFF) / 255, cb = float((c >> 16) & 0xFF) / 255;
-            for (const auto& t : fx.treads()) {
-                const float a = render::Effects::treadAlpha(t);
-                if (a <= 0.003f || pointHidden(t.x, t.y)) continue;
-                const float px = -std::sin(t.angle) * 5, py = std::cos(t.angle) * 5;
-                groundQuad(at, t.x + px, t.y + py, 2.6f, 1.5f, t.angle, kAlpha, cr, cg, cb, a, u0, v0, u1, v1);
-                groundQuad(at, t.x - px, t.y - py, 2.6f, 1.5f, t.angle, kAlpha, cr, cg, cb, a, u0, v0, u1, v1);
-            }
-        }
-    }
+    // Track marks (Modern effects) lie on the ground under everything else.
+    if (o.effects) addTrackMarks(*o.effects);
+    // Realistic grade: contact shadows under the ground units (over the track marks, under everything else).
+    if (gradeOn_) addContactShadows(w, o);
     // Building bases (pass A, 0x427d50).
     for (const auto& side : w.sides())
         for (int i = side.firstBuilding; i >= 0; i = side.nextObject(i)) {
@@ -990,7 +1129,7 @@ void Renderer3D::collect(const game::World& w, const Options& o) {
     for (const auto& side : w.sides())
         for (int ui = side.firstUnit; ui >= 0; ui = side.nextObject(ui)) {
             const auto& u = side.units[ui];
-            if (!u.alive || (u.flags & 0x200140)) continue;
+            if (!u.alive || (u.flags & 0x200140) || render::fxHideUnits()) continue;
             if (pointHidden(float(game::fixToPixel(u.posX)), float(game::fixToPixel(u.posY)))) continue;
             if (models_ && models_->active() && models_->hasUnitModel(u.type)) continue;  // drawn by the model pass
             addUnit(w, u, o);
@@ -1072,7 +1211,7 @@ void Renderer3D::collect(const game::World& w, const Options& o) {
         for (int ui = side.firstUnit; ui >= 0; ui = side.nextObject(ui)) {
             const auto& u = side.units[ui];
             if (!u.alive || !u.selected || (u.flags & 0x200000)) continue;
-            const float gx = float(game::fixToPixel(u.posX)), gy = float(game::fixToPixel(u.posY));
+            const float gx = float(u.posX) / 65536.0f, gy = float(u.posY) / 65536.0f;
             if (pointHidden(gx, gy)) continue;
             const float r = t_.bin.units[u.type].isInfantry ? 11.0f : 18.0f;
             decalTex(ring_, gx - r, gy - r, 2 * r, 2 * r, kAlpha, -1, cr, cg, cb, 0.95f);
@@ -1096,6 +1235,126 @@ void Renderer3D::collect(const game::World& w, const Options& o) {
 // height above the terrain (alpha / additive / light blending, depth tested like the sprites),
 // light glows as decals on the terrain (dst * (1 + light)). The particle state is the 2D
 // effect system's; only the projection differs.
+// Track marks (docs/3d-mode.md "Track marks"; render3d/track_marks.hpp): every trail of the Modern effects
+// as strips, one per track / tyre band of the vehicle (its model's running gear, else a table by name),
+// from node to node, so they bend with the drawn path; the relief is lit by this frame's sun.
+void Renderer3D::addTrackMarks(const render::Effects& fx) {
+    using Tread = render::Effects::Tread;
+    static const bool off = std::getenv("D2K_TRACKS_OFF") != nullptr;  // A/B checks: no track marks
+    if (off || !trackTex_ || trackTexW_ <= 0 || fx.treadSerial() == 0) return;
+    constexpr float kLife = 45.0f;     // s until a mark is gone (it starts fading after a quarter of that)
+    constexpr float kStrength = 0.9f;  // overall depth of the imprint
+    const std::uint32_t newest = fx.treadSerial();
+    const float cap = float(std::max<std::size_t>(1, fx.treadCapacity()));
+    auto fade = [&](const Tread& t) {
+        if (t.serial == 0 || t.age >= kLife) return 0.0f;
+        const float x = std::clamp((t.age - 0.25f * kLife) / (0.75f * kLife), 0.0f, 1.0f);
+        float a = 1 - x * x * (3 - 2 * x);
+        const float old = float(newest - t.serial) / cap;  // the ring is about to reuse its slot
+        if (old > 0.6f) a *= std::max(0.0f, (1 - old) / 0.4f);
+        if (t.prev == 0) a *= 0.3f;  // a trail's first node: it eases in
+        return a * t.depth;
+    };
+    // The bands per unit type (looked up once per frame: models can arrive late).
+    if (trackContacts_.size() != std::size_t(formats::kMaxUnitTypes)) trackContacts_.assign(formats::kMaxUnitTypes, TrackContact{});
+    trackContactSeen_.assign(formats::kMaxUnitTypes, 0);
+    auto contactOf = [&](int type) -> const TrackContact& {
+        type = std::clamp(type, 0, formats::kMaxUnitTypes - 1);
+        if (!trackContactSeen_[std::size_t(type)]) {
+            trackContactSeen_[std::size_t(type)] = 1;
+            TrackContact& c = trackContacts_[std::size_t(type)];
+            if (!(models_ && models_->unitTrackContact(type, c))) {
+                const char* nm = t_.bin.unitNames[type];
+                c = fallbackTrackContact(std::string_view(nm, strnlen(nm, sizeof t_.bin.unitNames[type])));
+            }
+            static const bool log = std::getenv("D2K_TRACK_LOG") != nullptr;  // the bands found per type (once)
+            static std::vector<std::uint8_t> logged(formats::kMaxUnitTypes, 0);
+            if (log && !logged[std::size_t(type)]) {
+                logged[std::size_t(type)] = 1;
+                std::string bands;
+                for (const auto& bd : c.bands) bands += " " + std::to_string(bd.lateral) + "/" + std::to_string(bd.halfWidth);
+                SDL_Log("3D track marks: %.*s pattern %d period %.1f depth %.2f bands%s", int(sizeof t_.bin.unitNames[type]),
+                        t_.bin.unitNames[type], int(c.pattern), double(c.period), double(c.depth), bands.c_str());
+            }
+        }
+        return trackContacts_[std::size_t(type)];
+    };
+    const Vec3 L = sun_;
+    const float margin = 96;
+    for (const Tread& n : fx.treads()) {
+        if (n.serial == 0 || n.prev == 0) continue;
+        const Tread* p = fx.treadBySerial(n.prev);
+        if (!p) continue;
+        const float an = fade(n) * kStrength, ap = fade(*p) * kStrength;
+        if (an < 0.004f && ap < 0.004f) continue;
+        if (std::hypot(n.x - p->x, n.y - p->y) > 24) continue;
+        if (pointHidden(n.x, n.y) && pointHidden(p->x, p->y)) continue;
+        {
+            const float mx = 0.5f * (n.x + p->x), my = 0.5f * (n.y + p->y);
+            float sx = 0, sy = 0;
+            if (!cam_.project(Vec3{mx, terrain_.height(mx, my), my}, sx, sy)) continue;
+            const float m = margin * cam_.pixelsPerUnit(std::max(1.0f, cam_.depthOf(Vec3{mx, 0, my}))) + 32;
+            if (sx < -m || sy < -m || sx > cam_.viewW() + m || sy > cam_.viewH() + m) continue;
+        }
+        const TrackContact& tc = contactOf(n.type);
+        const TrackPattern pat = n.spin ? kTrackScuff : tc.pattern;
+        float u0 = 0, u1 = 1;
+        trackColumnU(pat, trackTexW_, u0, u1);
+        const float cn = std::cos(n.angle), sn = std::sin(n.angle), cp = std::cos(p->angle), sp = std::sin(p->angle);
+        // A little wander per node (shared by the two strips through it): the lateral line and the width.
+        auto jit = [](std::uint32_t s, int k) {
+            std::uint32_t x = s * 2654435761u + std::uint32_t(k) * 40503u;
+            x ^= x >> 16, x *= 0x7FEB352Du, x ^= x >> 15, x *= 0x846CA68Bu, x ^= x >> 16;
+            return float(x & 0xFFFF) / 32767.5f - 1;
+        };
+        for (const TrackContact::Band& b : tc.bands) {
+            auto corners = [&](const Tread& t, float c, float s, float& lx, float& ly, float& rx, float& ry, float& lat) {
+                lat = b.lateral + 0.12f * b.halfWidth * jit(t.serial, 1);
+                const float hw = b.halfWidth * kTrackSpan * (1 + 0.06f * jit(t.serial, 2));
+                const float nx = -s, ny = c;  // right of the heading
+                lx = t.x + nx * (lat - hw), ly = t.y + ny * (lat - hw);
+                rx = t.x + nx * (lat + hw), ry = t.y + ny * (lat + hw);
+            };
+            float plx, ply, prx, pry, plat, nlx, nly, nrx, nry, nlat;
+            corners(*p, cp, sp, plx, ply, prx, pry, plat);
+            corners(n, cn, sn, nlx, nly, nrx, nry, nlat);
+            // The strip's own frame: u across (left -> right), v along (older -> newer).
+            float ux = (prx - plx) + (nrx - nlx), uy = (pry - ply) + (nry - nly);
+            float ul = std::hypot(ux, uy);
+            if (ul < 1e-4f) continue;
+            ux /= ul, uy /= ul;
+            float vx = 0.5f * (nlx + nrx - plx - prx), vy = 0.5f * (nly + nry - ply - pry);
+            const float vl = std::hypot(vx, vy);
+            if (vl > 0.3f) vx /= vl, vy /= vl;
+            else vx = uy, vy = -ux;
+            Inst in;
+            in.tex = trackTex_;
+            in.pipe = kRelief;
+            const float xs[4] = {plx, prx, nlx, nrx}, ys[4] = {ply, pry, nly, nry};
+            for (int k = 0; k < 4; ++k) {
+                in.c[k] = Vec3{xs[k], terrain_.height(xs[k], ys[k]) + 0.9f, ys[k]};
+                in.s[k] = in.c[k] + Vec3{0, 1.5f, 0};
+                in.gx[k] = xs[k];
+                in.gy[k] = ys[k];
+            }
+            in.u0 = u0;
+            in.u1 = u1;
+            in.v0 = (p->odo - plat * p->turn) / tc.period;
+            in.v1 = (n.odo - nlat * n.turn) / tc.period;
+            // The sun in the strip's frame (x across, y along, z up), in the vertex colour.
+            const float lx = L.x * ux + L.z * uy, ly = L.x * vx + L.z * vy;
+            in.r = 0.5f + 0.5f * lx;
+            in.g = 0.5f + 0.5f * ly;
+            in.b = 0.5f + 0.5f * L.y;
+            in.a = tc.depth;
+            in.ka[0] = in.ka[1] = ap;
+            in.ka[2] = in.ka[3] = an;
+            in.seq = int(insts_.size());
+            insts_.push_back(in);
+        }
+    }
+}
+
 void Renderer3D::addEffects(const render::Effects& fx) {
     SDL_GPUTexture* at = tex(fx.atlasTexture());
     if (!at) return;
@@ -1108,9 +1367,11 @@ void Renderer3D::addEffects(const render::Effects& fx) {
     };
     // (The light list is not drawn as glows here: buildPointLights hands it to the shaders.)
     const Vec3 R = cam_.right(), U = cam_.up();
+    const bool skipBlasts = cineActive_;
     auto one = [&](const FX::Particle& p) {
         float size = 0;
         std::uint32_t c = 0;
+        if (skipBlasts && (p.fx & FX::kFxBlast)) return;  // the cinematic particles draw these blasts
         if (!FX::particleLook(p, size, c)) return;
         if (pointHidden(p.x, p.y)) return;
         float r, g, b, a, u0, v0, u1, v1;
@@ -1137,6 +1398,7 @@ void Renderer3D::addEffects(const render::Effects& fx) {
         pushBillboard(at, base, -w * 0.5f, -h * 0.5f, w, h, rot, pipe, r, g, b, a, 0, 6, p.x - w * 0.5f,
                       p.y - p.z - h * 0.5f, false, u0, v0, u1, v1);
     };
+    if (FX::hideParticles()) return;  // D2K_FX_HIDE (measurements)
     for (const auto& p : fx.beams()) one(p);
     for (const auto& p : fx.particles()) one(p);
 }
@@ -1170,7 +1432,7 @@ void Renderer3D::buildPointLights(const Options& o, int viewW, int viewH, SDL_GP
         for (int i = 0; i < int(fxList->size()); ++i) {
             const auto& l = (*fxList)[std::size_t(i)];
             const float a = float(l.c >> 24) / 255.0f;
-            if (a < 0.02f || l.size < 2) continue;
+            if (a < 0.02f || l.size < 2 || (l.blast && cineActive_)) continue;  // the fireball glows light it
             const float gy = l.y + l.z;  // ground point under the source
             if (pointHidden(l.x, gy)) continue;
             const float cov = coverage(Vec3{l.x, terrain_.height(l.x, gy) + l.z, gy}, l.size * 0.5f);
@@ -1178,6 +1440,17 @@ void Renderer3D::buildPointLights(const Options& o, int viewW, int viewH, SDL_GP
             // Explosions and fire are brief and strong: they go before the lamps when the budget is short.
             lightCand_.push_back({4.0f * a * std::sqrt(cov) * l.size, 0, i});
         }
+    }
+    // The cinematic particles' fireballs (Reimagined): as brief and strong as the effect lights.
+    cineLights_.clear();
+    if (cineActive_) cine_->lights(cineLights_);
+    for (int i = 0; i < int(cineLights_.size()); ++i) {
+        const auto& l = cineLights_[std::size_t(i)];
+        if (pointHidden(l.x, l.y)) continue;
+        const float cov = coverage(Vec3{l.x, terrain_.height(l.x, l.y) + l.z, l.y}, l.radius);
+        if (cov <= 0) continue;
+        const float a = std::min(1.0f, std::max({l.r, l.g, l.b}));
+        lightCand_.push_back({4.0f * a * std::sqrt(cov) * l.radius * 2.0f, 2, i});
     }
     // Lamps of the time of day (render/scene_lights.*).
     static thread_local std::vector<render::Lamp> merged;
@@ -1258,7 +1531,17 @@ void Renderer3D::buildPointLights(const Options& o, int viewW, int viewH, SDL_GP
             continue;
         }
         GridLight g;
-        if (c.src == 0) {
+        if (c.src == 2) {
+            const auto& l = cineLights_[std::size_t(c.index)];
+            g.posRadius[0] = l.x;
+            g.posRadius[1] = terrain_.height(l.x, l.y) + l.z;
+            g.posRadius[2] = l.y;
+            g.posRadius[3] = l.radius;
+            g.color[0] = l.r;
+            g.color[1] = l.g;
+            g.color[2] = l.b;
+            g.boundSphere();
+        } else if (c.src == 0) {
             const auto& l = (*fxList)[std::size_t(c.index)];
             const float gy = l.y + l.z;
             const float lift = 8 + 0.06f * l.size;
@@ -1621,7 +1904,7 @@ void Renderer3D::addUnit(const game::World& w, const game::Unit& unit, const Opt
     const auto& u = t_.bin.units[unit.type];
     if (u.specialBehavior == 5) return;  // sandworms: no sprite (see MapRenderer::drawUnit)
     const int house = w.sides()[unit.side].house;
-    float gx = float(game::fixToPixel(unit.posX)), gy = float(game::fixToPixel(unit.posY));
+    float gx = float(unit.posX) / 65536.0f, gy = float(unit.posY) / 65536.0f;  // sub-pixel (tick interpolation)
     float z = float(game::fixToPixel(unit.posZ));
     // Vehicle animation: Modern - a sprite card bounces and recoils with the hull (no pitch / roll).
     float kickX = 0, kickY = 0;
@@ -1713,14 +1996,15 @@ void Renderer3D::addFlyers(const game::World& w) {
             if ((u.flags & 0x40) && !(u.flags & 0x20000))
                 if (const render::Sprite* sh = objectSprite(frameOf(u.type, u.animFrame, u.facing), side.house, "flyer", u.type, fn))
                     decal(sh, false, gx - sh->frame->x, gy - sh->frame->y, kAlpha, -1, 0.5f, 0, 0, 0, 0);
-            billboard(body, gx, gy, height(u.posZ), -float(body->frame->x), -float(body->frame->y), kAlpha);
+            const float lift = flyerLift(terrain_, u);  // above the flight ground (render3d/flight.hpp)
+            billboard(body, gx, gy, height(u.posZ) + lift, -float(body->frame->x), -float(body->frame->y), kAlpha);
             if (u.flags & 0x20000000) {
                 const auto& d = side.deliveries[std::size_t(u.lastMoved % 10)];
                 const int cargo = d.units[0];
                 if (cargo >= 0xfe) continue;
                 if (const render::Sprite* cs = objectSprite(frameOf(cargo, u.animFrame, u.facing - yawSteps_), side.house, "carried unit", cargo,
                                                             cargo < formats::kMaxUnitTypes ? t_.bin.unitNames[cargo] : ""))
-                    billboard(cs, gx, gy, height(u.posZ - 0xa0000), -float(cs->frame->x), -float(cs->frame->y), kAlpha, 1, 0, -0.5f);
+                    billboard(cs, gx, gy, height(u.posZ - 0xa0000) + lift, -float(cs->frame->x), -float(cs->frame->y), kAlpha, 1, 0, -0.5f);
             }
         }
 }
@@ -1734,6 +2018,14 @@ bool Renderer3D::ensureDesigned() {
     }
     return designed_ != nullptr;
 }
+
+namespace {
+// D2K_PHOTO_AB=1 / D2K_SSAO_AB=1 (measurement with D2K_GPU_TIMING=1, like D2K_CLUTTER_AB): the photo terrain / the
+// ambient occlusion on and off in alternate 30-frame blocks of one run, the GPU time logged per state.
+int gFeatAB = -1;  // 0 none, 1 photo terrain, 2 ambient occlusion
+int gFeatFrame = 0;
+bool gFeatOff = false;
+}  // namespace
 
 void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW, int viewH, float dt, const Options& o) {
     const Uint64 t0 = SDL_GetTicksNS();
@@ -1751,10 +2043,18 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
     rh_ = rh;
     SDL_SetTextureScaleMode(sceneSdl_, rw == viewW && rh == viewH ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR);
     bool snap = o.snapCamera;
+    bool spiceCheck = false;  // (the ~2.5 Hz spice check ran this frame)
     const bool designed = o.designedTerrain && ensureDesigned();
     const TerrainStyle style = designed && o.faithfulTerrain ? TerrainStyle::Faithful : TerrainStyle::Designed;
+    // Realistic grade (docs/3d-mode.md "Realistic grade"): on a Reimagined terrain with the setting. Its ground
+    // occlusion lives in the designed terrain's splat (built with the terrain; rebuilt when it is switched, then
+    // where buildings change).
+    static const bool gradeOff = std::getenv("D2K_GRADE_OFF") != nullptr;
+    const bool gradeWant = designed && o.reimagined && style == TerrainStyle::Faithful && o.naturalGrade && !gradeOff;
+    const bool occSwitched = designed && designed_->setGroundOcclusion(gradeWant);
     if (world_ != &w || !terrainBuilt_ || terrain_.cellsW() != w.width() || terrain_.cellsH() != w.height() ||
-        terrain_.designed() != designed || (designed && designed_->style() != style)) {
+        terrain_.designed() != designed || (designed && designed_->style() != style) ||
+        terrain_.reimagined() != (designed && o.reimagined && style == TerrainStyle::Faithful)) {
         world_ = &w;
         const std::vector<float> rgb = DesignedTerrain::tileMeans(atlas_);
         const Uint64 tb = SDL_GetTicksNS();
@@ -1762,21 +2062,27 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
         const TerrainGuide* guide = nullptr;
         if (designed) {
             designed_->setStyle(style);
-            guide = designed_->prepareGuide(w, atlas_);
+            guide = designed_->prepareGuide(w, atlas_, o.reimagined);
         }
         // The faithful terrain is lit from the south-west (like the original tiles and its 2D bake).
         baseSun_ = guide ? DesignedTerrain::faithfulSun3D() : Terrain::sunDirection();
+        // Reimagined (docs/3d-mode.md "Reimagined"): taller relief and a lower sun from the same side - long,
+        // readable cliff shadows over the sand.
+        terrain_.setReimagined(guide && o.reimagined);
+        if (guide && o.reimagined) baseSun_ = DesignedTerrain::reimaginedSun3D();
         sun_ = baseSun_;
         terrain_.setSun(baseSun_);  // the baked visibility (shadow map off) keeps the style's own sun
         terrain_.build(w, rgb, designed, guide);
         if (designed) designed_->build(w, terrain_, rgb);
         terrainTop_ = 0;
         for (const TerrainVertex& tv : terrain_.vertices()) terrainTop_ = std::max(terrainTop_, tv.y);
-        SDL_Log("3D: terrain (%s) %dx%d vertices in %.0f ms",
+        SDL_Log("3D: terrain (%s) %dx%d vertices, %zu triangles in %.0f ms",
                 !designed ? "original tiles" : guide ? "designed, faithful" : "designed", terrain_.gridW(), terrain_.gridH(),
-                double(SDL_GetTicksNS() - tb) / 1e6);
+                terrain_.indices().size() / 3, double(SDL_GetTicksNS() - tb) / 1e6);
         terrainBuilt_ = true;
         terrainDirty_ = true;
+        terrainRows_ = {-1, -1};
+        ++terrainGen_;
         tileMapCpu_.assign(std::size_t(w.width()) * w.height(), 0xFFFF);
         if (tileMap_) SDL_ReleaseGPUTexture(dev_, tileMap_);
         SDL_GPUTextureCreateInfo ci{};
@@ -1793,14 +2099,90 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
         snap = true;
     } else if (t0 - lastSpiceCheck_ > 400000000ull) {  // spice mounds: re-check ~2.5 times a second
         lastSpiceCheck_ = t0;
-        if (terrain_.refreshSpice(w)) terrainDirty_ = true;
+        spiceCheck = true;
+        const Uint64 ts = SDL_GetTicksNS();
+        if (terrain_.refreshSpice(w)) {
+            static const bool splatLog = std::getenv("D2K_SPLAT_LOG") != nullptr;
+            if (splatLog && terrain_.dirtyRows().first >= 0)
+                SDL_Log("3D: spice relief refreshed in %.2f ms (vertex rows %d..%d)", double(SDL_GetTicksNS() - ts) / 1e6,
+                        terrain_.dirtyRows().first, terrain_.dirtyRows().second);
+            // Reimagined spice relief: only the rows it changed are uploaded (unless something else changed too).
+            terrainRows_ = terrainDirty_ ? std::pair<int, int>{-1, -1} : terrain_.dirtyRows();
+            terrainDirty_ = true;
+        }
         if (designed) designed_->update(w);
     }
+    gradeOn_ = gradeWant && terrain_.reimagined();
+    // Photo terrain (docs/3d-mode.md "Photo terrain"): on a Reimagined terrain with the setting and the pack.
+    static const bool photoOff = std::getenv("D2K_PHOTO_OFF") != nullptr;
+    photoOn_ = designed && terrain_.reimagined() && o.photoTerrain && !photoOff && designed_->ensurePhoto();
+    // Ambient occlusion (docs/3d-mode.md "Ambient occlusion"): wanted on a Reimagined terrain with the setting.
+    static const bool ssaoOff = std::getenv("D2K_SSAO_OFF") != nullptr;
+    ssaoWanted_ = designed && terrain_.reimagined() && o.ambientOcclusion && !ssaoOff;
+    ssaoOn_ = false;  // (set where the occlusion is drawn, before the scene pass)
+    if (gFeatAB < 0) {
+        const char* p = std::getenv("D2K_PHOTO_AB");
+        const char* a = std::getenv("D2K_SSAO_AB");
+        gFeatAB = p && p[0] == '1' ? 1 : a && a[0] == '1' ? 2 : 0;
+    }
+    gFeatOff = gFeatAB && ((gFeatFrame++ / 30) & 1);
+    if (gFeatOff && gFeatAB == 1) photoOn_ = false;
+    if (gFeatOff && gFeatAB == 2) ssaoWanted_ = false;
+    if (occSwitched) designed_->update(w);  // (a no-op right after a build)
     // Buildings placed / removed: level the ground under them (Terrain::updateFoundations; every
     // frame, so a new building never stands on the old relief).
-    if (terrain_.updateFoundations(w)) {
+    const bool foundationsMoved = terrain_.updateFoundations(w);
+    if (foundationsMoved) {
         terrainDirty_ = true;
+        terrainRows_ = {-1, -1};
         for (const TerrainVertex& tv : terrain_.vertices()) terrainTop_ = std::max(terrainTop_, tv.y);
+    }
+    // The world beyond the map (docs/3d-mode.md; Reimagined): built once per terrain, its mirrored zone follows
+    // the map's heights (foundations).
+    {
+        static const bool surroundOff = std::getenv("D2K_SURROUND_OFF") != nullptr;
+        const bool want = designed && terrain_.reimagined() && o.mapSurroundings && !surroundOff;
+        if (!want) {
+            if (surround_.valid()) surround_.clear();
+            surroundGen_ = -1;
+        } else if (surroundGen_ != terrainGen_) {
+            const Uint64 tb = SDL_GetTicksNS();
+            surround_.build(terrain_);
+            surroundGen_ = terrainGen_;
+            surroundNew_ = true;
+            SDL_Log("3D: world beyond the map: %zu vertices, %zu triangles, far texture %dx%d in %.0f ms",
+                    surround_.vertices().size(), std::size_t(surround_.indexCount() / 3), surround_.texW(), surround_.texH(),
+                    double(SDL_GetTicksNS() - tb) / 1e6);
+        } else if (terrainDirty_ && surround_.refresh(terrain_)) {
+            surroundDirty_ = true;
+        }
+        surroundOn_ = want && surround_.valid();
+    }
+    // Reimagined ground clutter (docs/3d-mode.md "Ground clutter"): placed with the terrain, follows its foundations.
+    clutterOn_ = designed && terrain_.reimagined() && o.groundDetail > 0;
+    if (clutterOn_ && !clutter_ && !clutterFailed_) {
+        clutter_ = GroundClutter::create(dev_, colorFormat_, depthFormat_, samples_, quality_.aniso);
+        clutterFailed_ = clutter_ == nullptr;
+    }
+    clutterOn_ = clutterOn_ && clutter_;
+    if (clutterOn_ && (clutterGen_ != terrainGen_ || clutterDetail_ != o.groundDetail)) {
+        clutter_->build(w, terrain_, *designed_, o.groundDetail >= 2 ? 1.0f : 0.5f);
+        clutterGen_ = terrainGen_;
+        clutterDetail_ = o.groundDetail;
+        clutterBeyondGen_ = -2;
+    } else if (clutterOn_ && foundationsMoved) {
+        clutter_->refreshHeights(terrain_);
+    }
+    // The spice clumps (docs/3d-mode.md "Spice fields in 3D"): the chunks whose spice changed, on the spice check.
+    if (clutterOn_ && spiceCheck) clutter_->refreshSpice(w, terrain_);
+    if (clutterOn_) {  // its sparse scatter on the land beyond the map
+        const int want = surroundOn_ ? surroundGen_ : -1;
+        if (clutterBeyondGen_ != want) {
+            clutter_->placeBeyond(terrain_, surroundOn_ ? &surround_ : nullptr);
+            clutterBeyondGen_ = want;
+        } else if (surroundOn_ && surroundDirty_) {
+            clutter_->refreshBeyond(surround_);
+        }
     }
     // Tile indices (spice fields, concrete, rubble change tiles during play).
     const int tileCount = atlas_ ? atlas_->tileCount() : 0;
@@ -1842,13 +2224,74 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
             for (int i = 0; i < 3; ++i) fogRgb_[i] *= o.light->fog[i];
             lightsU_.setScene(o.light->sun, o.light->amb, tint, o.light->spec, o.light->sat);
         }
+        // Dust haze (Reimagined; docs/3d-mode.md "Dust haze"): wind-blown dust veils drifting with the cinematic
+        // particles' wind (CinematicFx::kWind*), by game time (frozen while paused, so screenshots repeat).
+        // Weaker at night (less direct light for a veil to dim).
+        static const bool hazeOff = std::getenv("D2K_HAZE_OFF") != nullptr;
+        if (o.reimagined && o.dustHaze && !hazeOff) {
+            const float wl = std::sqrt(CinematicFx::kWindX * CinematicFx::kWindX + CinematicFx::kWindZ * CinematicFx::kWindZ);
+            const float night = std::clamp(o.light && !o.light->identity ? o.light->lamps * 1.5f : 0.0f, 0.0f, 1.0f);
+            lightsU_.haze[0] = CinematicFx::kWindX / wl;
+            lightsU_.haze[1] = CinematicFx::kWindZ / wl;
+            lightsU_.haze[2] = float(std::fmod(double(w.gameTicks()) / 20.0 * double(kHazeSpeed), 1.0e6));
+            lightsU_.haze[3] = 1.0f - 0.5f * night;
+        }
+        // Realistic grade: the models a third darker (house colours stay), fine sand dust on them in the
+        // ground's colour (model_fs / model_pbr_fs: sandDustK).
+        if (gradeOn_) {
+            static const float albedoK = [] {  // D2K_GRADE_MODELS="albedo scale,dust" (tuning)
+                const char* e = std::getenv("D2K_GRADE_MODELS");
+                return e ? std::clamp(float(std::atof(e)), 0.3f, 1.0f) : 0.7f;
+            }();
+            static const float dustK = [] {
+                const char* e = std::getenv("D2K_GRADE_MODELS");
+                const char* c = e ? std::strchr(e, ',') : nullptr;
+                return c ? std::clamp(float(std::atof(c + 1)), 0.0f, 2.0f) : 1.0f;
+            }();
+            lightsU_.grade[0] = albedoK;
+            lightsU_.grade[1] = dustK;
+            float sand[3];
+            designed_->reimaginedSand(true, sand);
+            for (int k = 0; k < 3; ++k) lightsU_.dustColor[k] = sand[k] * 0.94f;
+        }
     }
+    // Aerial haze + its bloom (Reimagined; docs/3d-mode.md "Aerial haze").
+    static const bool aerialOff = std::getenv("D2K_AERIAL_OFF") != nullptr;
+    const bool aerial = o.reimagined && o.aerialHaze && !aerialOff;
     // Scene.
     newTextures_ = false;
     lamps_ = o.lamps;
+    // Cinematic particles (Reimagined + Modern effects; docs/3d-mode.md "Reimagined"). Known before collect():
+    // the Modern effects' blast sprites they redraw are skipped there (addEffects).
+    const bool cinematic = o.reimagined && o.effects;
+    if (cinematic && !cine_ && !cineFailed_) {
+        cine_ = CinematicFx::create(dev_, colorFormat_, depthFormat_, samples_);
+        cineFailed_ = cine_ == nullptr;
+    }
+    cineActive_ = cinematic && cine_;
+    buildingLifeOn_ = cinematic && models_ && models_->active() && !buildingLifeOff();
     {
         render::FrameProbe::Scope ps("3dCollect");
         collect(w, o);
+    }
+    const CinematicFx::Hidden cineHidden = [this](float x, float y) { return pointHidden(x, y); };
+    // Vehicle wrecks (docs/3d-mode.md "Vehicle wrecks"): this frame's deaths become hulks before the particles
+    // (which set them off and burn them) and the models (which draw them) look.
+    const bool wrecksOn = cineActive_ && o.vehicleWrecks && models_ && models_->active();
+    if (wrecksOn) wrecks_.update(*o.effects, w, terrain_, dt, cineHidden, [this](int type) { return models_->hasUnitModel(type); });
+    else if (wrecks_.any()) wrecks_.reset();
+    if (models_) models_->setWrecks(wrecksOn ? &wrecks_ : nullptr);
+    if (cine_) cine_->setWrecks(wrecksOn ? &wrecks_ : nullptr);
+    if (cine_) {
+        if (cinematic) {
+            render::FrameProbe::Scope ps("3dCinematic");
+            // Ground dust: trails + placement rings (Drop-in raises its own landing dust instead of the ring).
+            cine_->setGroundDust(o.groundDust, !o.dropInPlacement);
+            cine_->update(*o.effects, w, terrain_, dt, cineHidden);
+            if (buildingLifeOn_) buildingLifeFx(w, o);
+        } else if (cine_->count() > 0) {
+            cine_->reset();
+        }
     }
     SDL_GPUTexture* shroudTex = clearMask_;
     if (o.showShroud && shroud_) {
@@ -1880,7 +2323,7 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
             const Vec3& an = in.billboard ? in.anchor : c;
             const float vals[kSpriteFloats] = {c.x, c.y, c.z, an.x, an.y, an.z,
                                                (k & 1) ? in.u1 : in.u0, (k & 2) ? in.v1 : in.v0,
-                                               in.r, in.g, in.b, in.a,
+                                               in.r, in.g, in.b, in.a * in.ka[k],
                                                in.billboard ? 1.0f : 0.0f, in.flash, in.gx[k], in.gy[k],
                                                in.s[k].x, in.s[k].y, in.s[k].z};
             std::memcpy(v, vals, sizeof vals);
@@ -1919,6 +2362,20 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
     if (designed) {
         designed_->cullRocks(cam_.viewProj(), shadowPass ? &lightFit : nullptr);
         designed_->prepare(cmd);
+    }
+    // D2K_CLUTTER_AB=1 (measurement with D2K_GPU_TIMING=1): the clutter on and off in alternate 30-frame blocks of
+    // one run, the GPU time logged per state - the cost without the drift between runs.
+    static const bool clutterAB = [] {
+        const char* e = std::getenv("D2K_CLUTTER_AB");
+        return e && e[0] == '1';
+    }();
+    static int abFrame = 0;
+    const bool abOff = clutterAB && ((abFrame++ / 30) & 1);
+    if (abOff) clutterOn_ = false;
+    if (clutterOn_) {
+        render::FrameProbe::Scope ps("3dClutterCull");
+        clutter_->cull(w, terrain_, cam_.viewProj(), shadowPass ? &lightFit : nullptr, cam_.pixelsPerUnit(cam_.distance()));
+        clutter_->prepare(cmd);
     }
 
     // Uploads: one copy pass with temporary transfer buffers for the rare ones.
@@ -1965,13 +2422,44 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
                 ring[std::size_t(y) * 64 + x] = (std::uint32_t(a * 255) << 24) | 0x00FFFFFFu;
             }
         uploadTex(cp, ring.data(), 64 * 64 * 4, ring_, 64, 64);
+        // The contact shadow's blot: a flat core (the hull) with a soft falloff to nothing at the rim.
+        std::vector<std::uint32_t> blob(32 * 32);
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 32; ++x) {
+                const float dx = (x + 0.5f) / 16.0f - 1, dy = (y + 0.5f) / 16.0f - 1, r = std::sqrt(dx * dx + dy * dy);
+                const float t = std::clamp((1.0f - r) / 0.55f, 0.0f, 1.0f);
+                blob[std::size_t(y) * 32 + x] = (std::uint32_t(t * t * (3 - 2 * t) * 255) << 24) | 0x00FFFFFFu;
+            }
+        uploadTex(cp, blob.data(), 32 * 32 * 4, blob_, 32, 32);
+        if (trackTex_) {
+            const TrackTexture tt = buildTrackTexture();
+            for (std::size_t l = 0; l < tt.levels.size(); ++l) {
+                const int lw = tt.w >> l, lh = tt.h >> l;
+                const Uint32 size = Uint32(tt.levels[l].size() * 4);
+                SDL_GPUTransferBufferCreateInfo tbi{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, size, 0};
+                SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(dev_, &tbi);
+                if (!tb) break;
+                std::memcpy(SDL_MapGPUTransferBuffer(dev_, tb, false), tt.levels[l].data(), size);
+                SDL_UnmapGPUTransferBuffer(dev_, tb);
+                SDL_GPUTextureTransferInfo src{tb, 0, Uint32(lw), Uint32(lh)};
+                SDL_GPUTextureRegion reg{};
+                reg.texture = trackTex_;
+                reg.mip_level = Uint32(l);
+                reg.w = Uint32(lw);
+                reg.h = Uint32(lh);
+                reg.d = 1;
+                SDL_UploadToGPUTexture(cp, &src, &reg, false);
+                temps.push_back(tb);
+            }
+        }
     }
     if (terrainDirty_) {
         terrainDirty_ = false;
         const auto& tv = terrain_.vertices();
         const auto& ti = terrain_.indices();
         const Uint32 vbytes = Uint32(tv.size() * sizeof(TerrainVertex)), ibytes = Uint32(ti.size() * 4);
-        if (!terrainVB_ || terrainIndexCount_ != ti.size()) {
+        if (!terrainVB_ || terrainIndexCount_ != ti.size() || terrainIndexGen_ != terrain_.indexGen()) {
+            terrainIndexGen_ = terrain_.indexGen();
             if (terrainVB_) SDL_ReleaseGPUBuffer(dev_, terrainVB_);
             if (terrainIB_) SDL_ReleaseGPUBuffer(dev_, terrainIB_);
             SDL_GPUBufferCreateInfo bi{};
@@ -1983,8 +2471,60 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
             terrainIB_ = SDL_CreateGPUBuffer(dev_, &bi);
             if (terrainIB_) upload(cp, ti.data(), ibytes, terrainIB_);
             terrainIndexCount_ = std::uint32_t(ti.size());
+            terrainRows_ = {-1, -1};  // (a new buffer: all of it)
         }
-        if (terrainVB_) upload(cp, tv.data(), vbytes, terrainVB_);
+        if (terrainVB_) {
+            // (Only the spice relief changed: its vertex rows.)
+            const auto rows = terrainRows_;
+            terrainRows_ = {-1, -1};
+            if (rows.first >= 0 && rows.second >= rows.first && rows.second < terrain_.gridH()) {
+                const std::size_t row = std::size_t(terrain_.gridW()) * sizeof(TerrainVertex);
+                const Uint32 off = Uint32(std::size_t(rows.first) * row), size = Uint32(std::size_t(rows.second - rows.first + 1) * row);
+                SDL_GPUTransferBufferCreateInfo tbi{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, size, 0};
+                if (SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(dev_, &tbi)) {
+                    std::memcpy(SDL_MapGPUTransferBuffer(dev_, tb, false), reinterpret_cast<const std::uint8_t*>(tv.data()) + off, size);
+                    SDL_UnmapGPUTransferBuffer(dev_, tb);
+                    SDL_GPUTransferBufferLocation src{tb, 0};
+                    SDL_GPUBufferRegion reg{terrainVB_, off, size};
+                    SDL_UploadToGPUBuffer(cp, &src, &reg, false);
+                    temps.push_back(tb);
+                }
+            } else {
+                upload(cp, tv.data(), vbytes, terrainVB_);
+            }
+        }
+    }
+    if (surroundOn_ && (surroundNew_ || surroundDirty_)) {
+        const auto& sv = surround_.vertices();
+        const auto& si = surround_.indices();
+        if (surroundNew_) {
+            if (surroundVB_) SDL_ReleaseGPUBuffer(dev_, surroundVB_);
+            if (surroundIB_) SDL_ReleaseGPUBuffer(dev_, surroundIB_);
+            if (surroundTex_) SDL_ReleaseGPUTexture(dev_, surroundTex_);
+            SDL_GPUBufferCreateInfo bi{};
+            bi.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
+            bi.size = Uint32(sv.size() * sizeof(TerrainVertex));
+            surroundVB_ = SDL_CreateGPUBuffer(dev_, &bi);
+            bi.usage = SDL_GPU_BUFFERUSAGE_INDEX;
+            bi.size = Uint32(si.size() * 4);
+            surroundIB_ = SDL_CreateGPUBuffer(dev_, &bi);
+            SDL_GPUTextureCreateInfo ci{};
+            ci.type = SDL_GPU_TEXTURETYPE_2D;
+            ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+            ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+            ci.width = Uint32(surround_.texW());
+            ci.height = Uint32(surround_.texH());
+            ci.layer_count_or_depth = 1;
+            ci.num_levels = 1;
+            surroundTex_ = SDL_CreateGPUTexture(dev_, &ci);
+            if (surroundIB_) upload(cp, si.data(), Uint32(si.size() * 4), surroundIB_);
+            surround_.dropIndices();  // (si is gone: nothing below reads it)
+            if (surroundTex_)
+                uploadTex(cp, surround_.texels().data(), Uint32(surround_.texels().size() * 4), surroundTex_, surround_.texW(),
+                          surround_.texH());
+        }
+        if (surroundVB_) upload(cp, sv.data(), Uint32(sv.size() * sizeof(TerrainVertex)), surroundVB_);
+        surroundNew_ = surroundDirty_ = false;
     }
     if (tileMapDirty_ && tileMap_) {
         tileMapDirty_ = false;
@@ -2033,7 +2573,43 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
                               : SDL_GPU_LOADOP_DONT_CARE;
     dti.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
     const Mat4& vp = cam_.viewProj();
-    const float fogStart = cam_.distance() * 1.8f, fogEnd = cam_.distance() * 6.0f;
+    // (Reimagined: the haze starts nearer - aerial perspective over the far ground.)
+    float fogStart = cam_.distance() * (terrain_.reimagined() ? 1.35f : 1.8f), fogEnd = cam_.distance() * 6.0f;
+    // Aerial haze (Reimagined; docs/3d-mode.md "Aerial haze"): aerial perspective by view distance. The same fog
+    // term every lit shader applies, re-aimed: it starts just below the near edge of the view (0.8 x the camera
+    // distance; the default tilt's bottom edge is ~0.87, its top ~1.27), reaches its cap at 2 x, and is capped
+    // (PointLightsU::info.w / the particles' fog2.y = 1 - cap: the shaders scale the fog by it). In camera
+    // distances, so zooming keeps the look and tilting further shows more of it. Colour: a warm, pale desert sky
+    // tinted by the time of day; weaker at night.
+    float hazeCut = 0;
+    if (aerial) {
+        const float D = cam_.distance();
+        const float night = std::clamp(o.light && !o.light->identity ? o.light->lamps * 1.5f : 0.0f, 0.0f, 1.0f);
+        fogStart = D * 0.8f;
+        fogEnd = D * 2.0f;
+        hazeCut = 1.0f - kAerialCap * (1.0f - 0.55f * night);
+        const float sky[3] = {0.9f, 0.81f, 0.69f};
+        for (int i = 0; i < 3; ++i) {
+            const float sunC = o.light && !o.light->identity ? 0.5f + 0.5f * o.light->sun[i] : 1.0f;
+            fogRgb_[i] = sky[i] * sunC * (o.light && !o.light->identity ? o.light->fog[i] : 1.0f);
+        }
+    }
+    lightsU_.info[3] = hazeCut;
+    // The world beyond the map (docs/3d-mode.md "Shroud and the map edge"): the land out there at one fixed, dim
+    // fog level (never the exploration of the nearest edge cell), a vignette and the distance haze further out.
+    if (surroundOn_ && o.showShroud) {
+        // Default: only a band of that land shows, fading to full darkness ~4.5..11 cells out (the owner's choice,
+        // 2026-11-18); D2K_SURROUND_FULL=1 keeps the whole landscape to the horizon (a gentle vignette).
+        static const bool fullEnv = [] {
+            const char* e = std::getenv("D2K_SURROUND_FULL");
+            return e && e[0] == '1';
+        }();
+        const bool full = fullEnv || o.mapSurroundingsFull;
+        lightsU_.edge[0] = full ? 2.0f : 1.0f;
+        lightsU_.edge[1] = 0.5f;   // fog darkness: with the boundary tint (12 % darker) ~44 % of the lit land
+        lightsU_.edge[2] = full ? 0.22f : 1.0f;
+        lightsU_.edge[3] = 0.3f;   // distance haze share far out
+    }
     const float mapW = float(w.width() * 32), mapH = float(w.height() * 32);
     // Real 3D models (render3d/models.*): uploads now, meshes right after the terrain.
     ModelFrame mf;
@@ -2061,11 +2637,21 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
         // before prepare(): it collects the draws, and a building's emission strength needs these two
         mf.lamps = o.light && !o.light->identity ? o.light->lamps : 0.0f;
         mf.time = double(w.gameTicks()) / 20.0;
+        // Building life (docs/3d-mode.md "Building life"): part of Reimagined with Modern effects.
+        mf.buildingLife = buildingLifeOn_;
+        mf.frameDt = dt;
         render::FrameProbe::Scope ps("3dModelPrep");
         models_->prepare(dev_, cmd, mf);
     }
     // Sun shadow map (docs/3d-mode.md "Sun shadows"): a depth pass from the sun over the terrain,
     // the rocks and the models; everything drawn afterwards samples it.
+    // The terrain's index range (Terrain::drawRange): Reimagined draws its fine cliff faces only while a
+    // 4 px quad is more than ~6 screen px at the look-at point.
+    const std::pair<std::uint32_t, std::uint32_t> terrainRange =
+        terrain_.drawRange(cam_.pixelsPerUnit(cam_.distance()) < 1.5f);
+    const bool surroundDraw = surroundOn_ && surroundVB_ && surroundIB_ && surroundTex_;
+    const std::pair<std::uint32_t, std::uint32_t> surroundRange =
+        surround_.drawRange(cam_.pixelsPerUnit(cam_.distance()) < 1.5f);
     const Vec3 sunDir = sun_;
     float shadowU[4] = {0, 1.0f / float(kShadowSize), kShadowKeep, 0};
     Mat4 lightVP;
@@ -2094,9 +2680,18 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
             SDL_BindGPUVertexBuffers(sp, 0, &vb, 1);
             SDL_GPUBufferBinding ib{terrainIB_, 0};
             SDL_BindGPUIndexBuffer(sp, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
-            SDL_DrawGPUIndexedPrimitives(sp, terrainIndexCount_, 1, 0, 0, 0);
+            SDL_DrawGPUIndexedPrimitives(sp, terrainRange.second, 1, terrainRange.first, 0, 0);
             ++drawCalls_;
+            if (surroundDraw) {  // the land beyond the map casts shadows too (same pipeline, same vertex layout)
+                SDL_GPUBufferBinding svb{surroundVB_, 0};
+                SDL_BindGPUVertexBuffers(sp, 0, &svb, 1);
+                SDL_GPUBufferBinding sib{surroundIB_, 0};
+                SDL_BindGPUIndexBuffer(sp, &sib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+                SDL_DrawGPUIndexedPrimitives(sp, surroundRange.second, 1, surroundRange.first, 0, 0);
+                ++drawCalls_;
+            }
             if (designed) drawCalls_ += designed_->drawShadow(sp, cmd, lightVP, shadowFmt_, designed_->shadowRocks());
+            if (clutterOn_) drawCalls_ += clutter_->drawShadow(sp, cmd, lightVP, shadowFmt_);
             if (drawModels) drawCalls_ += models_->drawShadowDepth(sp, cmd, mf);
             SDL_EndGPURenderPass(sp);
         }
@@ -2107,9 +2702,124 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
     mf.shadowSampler = shadowSampler_;
     std::memcpy(mf.shadow, shadowU, sizeof shadowU);
     const bool shadowOn = shadowU[0] > 0.5f;
+    CinematicFx::Frame cf;
+    if (cine_ && cinematic) {
+        cf.viewProj = vp;
+        cf.eye = E;
+        cf.right = cam_.right();
+        cf.up = cam_.up();
+        cf.forward = cam_.forward();
+        cf.sun = sun_;
+        for (int i = 0; i < 3; ++i) {
+            const bool tod = o.light && !o.light->identity;
+            cf.sunCol[i] = 1.05f * (tod ? o.light->sun[i] : 1.0f) * std::max(0.0f, std::min(1.0f, sun_.y * 2.5f));
+            cf.ambCol[i] = 0.62f * (tod ? o.light->amb[i] : 1.0f);
+            cf.fogColor[i] = fogRgb_[i];
+        }
+        cf.fogStart = fogStart;
+        cf.fogEnd = fogEnd;
+        cf.hazeCut = hazeCut;
+        cf.projScale = cam_.pixelsPerUnit(1.0f);
+        // Effects intensity: the units (and the player's selected buildings) smoke turns see-through over.
+        auto& pins = cine_->unitPins();
+        pins.clear();
+        for (int si = 0; si < int(w.sides().size()) && si < game::kMaxSides; ++si) {
+            const game::Side& side = w.sides()[std::size_t(si)];
+            for (int i = side.firstUnit; i >= 0; i = side.nextObject(i)) {
+                const game::Unit& u = side.units[i];
+                if (!u.alive || u.type < 0 || (u.flags & 0x200000)) continue;
+                const float x = float(u.posX) / 65536.0f, y = float(u.posY) / 65536.0f;
+                if (pointHidden(x, y)) continue;
+                const bool inf = w.unitTemplate(u).isInfantry;
+                pins.push_back({Vec3{x, terrain_.height(x, y) + (inf ? 5.0f : 9.0f), y}, inf ? 8.0f : 18.0f,
+                                u.selected && si == o.playerSide});
+            }
+            if (si == o.playerSide)
+                for (int i = side.firstBuilding; i >= 0; i = side.nextObject(i)) {
+                    const game::Building& b = side.buildings[i];
+                    if (!b.alive || !b.selected || b.type < 0) continue;
+                    const auto& bt = w.buildingTemplate(b);
+                    const float bw = std::max(32.0f, float(bt.artWidth)), bh = std::max(32.0f, float(bt.artHeight));
+                    const float x = float(b.tileX * 32) + bw * 0.5f, y = float(b.tileY * 32) + bh * 0.5f;
+                    pins.push_back({Vec3{x, terrain_.height(x, y) + 16, y}, 0.45f * std::max(bw, bh), true});
+                }
+        }
+        cine_->prepare(cmd, cf, *o.effects, terrain_, cineHidden);
+        // D2K_FX_HALF=0: every particle at full resolution in the scene pass (comparison / measurement).
+        static const bool halfOff = [] {
+            const char* e = std::getenv("D2K_FX_HALF");
+            return e && e[0] == '0';
+        }();
+        cine_->setHalfActive(!halfOff && cine_->wantsHalf() && terrainDepthPipe_ && terrainVB_ && terrainIB_ &&
+                             cine_->ensureHalf(tw_, th_, shadowFmt_));
+    }
     buildPointLights(o, viewW, viewH, cmd, dt, snap);
     mf.lights = &lightsU_;
     mf.lightGrid = lightBuf_.buffer();
+    // Ambient occlusion (docs/3d-mode.md "Ambient occlusion"; render3d/ssao.*): a half-size depth of the scene
+    // from the camera (terrain, rocks, models through their depth-only pipelines), the occlusion from it and its
+    // blur; the scene pass's lit shaders then scale their sky light by it (PointLightsU::ssao).
+    for (float& v : lightsU_.ssao) v = 0;
+    if (ssaoWanted_ && terrainDepthPipe_ && terrainVB_ && terrainIB_) {
+        if (!ssao_) ssao_ = std::make_unique<Ssao>(dev_);
+        if (ssao_->ensure(tw_, th_, shadowFmt_)) {
+            SDL_GPUDepthStencilTargetInfo ad{};
+            ad.texture = ssao_->depth();
+            ad.clear_depth = 1;
+            ad.load_op = SDL_GPU_LOADOP_CLEAR;
+            ad.store_op = SDL_GPU_STOREOP_STORE;
+            ad.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+            ad.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+            if (SDL_GPURenderPass* ap = SDL_BeginGPURenderPass(cmd, nullptr, 0, &ad)) {
+                const SDL_GPUViewport av{0, 0, float(rw) * 0.5f, float(rh) * 0.5f, 0, 1};
+                SDL_SetGPUViewport(ap, &av);
+                SDL_BindGPUGraphicsPipeline(ap, terrainViewDepthPipe_ ? terrainViewDepthPipe_ : terrainDepthPipe_);
+                TerrainVU avu;
+                std::memcpy(avu.viewProj, vp.m, sizeof avu.viewProj);
+                SDL_PushGPUVertexUniformData(cmd, 0, &avu, sizeof avu);
+                SDL_GPUBufferBinding avb{terrainVB_, 0};
+                SDL_BindGPUVertexBuffers(ap, 0, &avb, 1);
+                SDL_GPUBufferBinding aib{terrainIB_, 0};
+                SDL_BindGPUIndexBuffer(ap, &aib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+                SDL_DrawGPUIndexedPrimitives(ap, terrainRange.second, 1, terrainRange.first, 0, 0);
+                ++drawCalls_;
+                if (designed) drawCalls_ += designed_->drawShadow(ap, cmd, vp, shadowFmt_, designed_->viewRocks(), false);
+                if (drawModels) {
+                    ModelFrame amf = mf;
+                    amf.lightViewProj = vp;
+                    amf.shadowFormat = shadowFmt_;
+                    amf.depthBias = false;  // seen from the camera: exact
+                    drawCalls_ += models_->drawShadowDepth(ap, cmd, amf);
+                }
+                SDL_EndGPURenderPass(ap);
+                Ssao::Params sp;
+                sp.tanY = float(cam_.viewH()) * 0.5f / cam_.pixelsPerUnit(1.0f);
+                sp.tanX = sp.tanY * float(cam_.viewW()) / float(std::max(1, cam_.viewH()));
+                sp.zNear = cam_.distance() * 0.05f;  // (Camera3D::rebuild's planes)
+                sp.zFar = cam_.farDepth();
+                sp.viewW = float(rw) * 0.5f;
+                sp.viewH = float(rh) * 0.5f;
+                static const struct Tune {  // D2K_SSAO="radius,strength,bias,share,reach" (tuning)
+                    float radius = 14.0f, strength = 4.5f, bias = 0.16f, share = 1.0f, reach = 48.0f;
+                    Tune() {
+                        if (const char* e = std::getenv("D2K_SSAO"))
+                            std::sscanf(e, "%f,%f,%f,%f,%f", &radius, &strength, &bias, &share, &reach);
+                    }
+                } tune;
+                sp.radius = tune.radius;
+                sp.reach = tune.reach;
+                sp.strength = tune.strength;
+                sp.bias = tune.bias;
+                ssao_->compute(cmd, sp);
+                ssaoOn_ = true;
+                lightsU_.ssao[0] = 0.5f / float(ssao_->width());
+                lightsU_.ssao[1] = 0.5f / float(ssao_->height());
+                lightsU_.ssao[2] = tune.share;
+                mf.ssao = ssao_->result();
+                mf.ssaoSampler = ssao_->sampler();
+            }
+        }
+    }
     SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &cti, 1, &dti);
     if (pass && (rw != tw_ || rh != th_)) {
         const SDL_GPUViewport vpt{0, 0, float(rw), float(rh), 0, 1};
@@ -2141,7 +2851,24 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
             if (shadowOn) df.darkest = kShadowKeep;
             df.lights = &lightsU_;
             df.lightGrid = lightBuf_.buffer();
-            drawCalls_ += designed_->draw(pass, cmd, terrainVB_, terrainIB_, terrainIndexCount_, df, 0, designed_->viewRocks());
+            df.reimagined = terrain_.reimagined();
+            df.naturalGrade = gradeOn_;
+            df.photo = photoOn_;
+            df.ssao = mf.ssao;
+            df.ssaoSampler = mf.ssaoSampler;
+            df.time = float(double(w.gameTicks()) / 20.0);
+            df.surround = surroundDraw ? 1 : 0;
+            df.linearMirror = linearMirror_;
+            drawCalls_ += designed_->draw(pass, cmd, terrainVB_, terrainIB_, terrainRange.second, df, terrainRange.first,
+                                          designed_->viewRocks());
+            if (surroundDraw) {  // the world beyond the map: the ring's mesh through the same shader
+                DesignedTerrain::Frame rf = df;
+                rf.surround = 2;
+                rf.surroundMargin = Surround::margin();
+                rf.surroundFar = surroundTex_;
+                drawCalls_ += designed_->draw(pass, cmd, surroundVB_, surroundIB_, surroundRange.second, rf, surroundRange.first);
+            }
+            if (clutterOn_) drawCalls_ += clutter_->draw(pass, cmd, df);
         } else if (terrainVB_ && terrainIB_ && tileArray_ && tileMap_) {
             SDL_BindGPUGraphicsPipeline(pass, terrainPipe_);
             bindLightGrid(pass, lightBuf_.buffer(), lightFallback_, dev_);
@@ -2193,12 +2920,15 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
                     bindLightGrid(pass, lightBuf_.buffer(), lightFallback_, dev_);
                     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                     SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
-                    const float mode = curPipe == kAlpha ? 0.0f : curPipe == kMul ? 2.0f : 1.0f;  // kLight / kEmit: unlit, as additive
+                    const float mode = curPipe == kAlpha    ? 0.0f
+                                       : curPipe == kMul    ? 2.0f
+                                       : curPipe == kRelief ? 3.0f
+                                                            : 1.0f;  // kLight / kEmit: unlit, as additive
                     SpriteFU sfu{{mode, o.showShroud ? 1.0f : 0.0f, mapW, mapH}, {fogRgb_[0], fogRgb_[1], fogRgb_[2], 1},
                                  {shadowU[0], shadowU[1], spriteFloor, shadowU[3]}};
                     SDL_PushGPUFragmentUniformData(cmd, 0, &sfu, sizeof sfu);
                 }
-                SDL_GPUTextureSamplerBinding sb[3] = {{in.tex, linearClamp_}, {shroudTex, linearClamp_},
+                SDL_GPUTextureSamplerBinding sb[3] = {{in.tex, in.pipe == kRelief ? trackSampler_ : linearClamp_}, {shroudTex, linearClamp_},
                                                       {shadowTex_, shadowSampler_}};
                 SDL_BindGPUFragmentSamplers(pass, 0, sb, 3);
                 SDL_DrawGPUIndexedPrimitives(pass, (j - i) * 6, 1, i * 6, 0, 0);
@@ -2206,7 +2936,54 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
                 i = j;
             }
         }
+        if (cine_ && cinematic) drawCalls_ += cine_->draw(pass, cmd, cf);
         SDL_EndGPURenderPass(pass);
+    }
+    // The cinematic particles' half-resolution pass (smoke, dust, fire: most of their pixels): a half-size depth
+    // of the scene (terrain, rocks, models through their depth-only pipelines from the camera), the puffs on a
+    // half-size colour target, then blended over the resolved scene (CinematicFx::composite).
+    if (pass && cine_ && cinematic && cine_->halfActiveThisFrame()) {
+        SDL_GPUColorTargetInfo hc{};
+        hc.texture = cine_->halfColor();
+        hc.clear_color = SDL_FColor{0, 0, 0, 0};
+        hc.load_op = SDL_GPU_LOADOP_CLEAR;
+        hc.store_op = SDL_GPU_STOREOP_STORE;
+        SDL_GPUDepthStencilTargetInfo hd{};
+        hd.texture = cine_->halfDepth();
+        hd.clear_depth = 1;
+        hd.load_op = SDL_GPU_LOADOP_CLEAR;
+        hd.store_op = SDL_GPU_STOREOP_DONT_CARE;
+        hd.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+        hd.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+        if (SDL_GPURenderPass* hp = SDL_BeginGPURenderPass(cmd, &hc, 1, &hd)) {
+            const SDL_GPUViewport hv{0, 0, float(rw) * 0.5f, float(rh) * 0.5f, 0, 1};
+            SDL_SetGPUViewport(hp, &hv);
+            SDL_BindGPUGraphicsPipeline(hp, terrainViewDepthPipe_ ? terrainViewDepthPipe_ : terrainDepthPipe_);  // exact camera depth (no shadow bias)
+            TerrainVU hvu;
+            std::memcpy(hvu.viewProj, vp.m, sizeof hvu.viewProj);
+            SDL_PushGPUVertexUniformData(cmd, 0, &hvu, sizeof hvu);
+            SDL_GPUBufferBinding hvb{terrainVB_, 0};
+            SDL_BindGPUVertexBuffers(hp, 0, &hvb, 1);
+            SDL_GPUBufferBinding hib{terrainIB_, 0};
+            SDL_BindGPUIndexBuffer(hp, &hib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+            SDL_DrawGPUIndexedPrimitives(hp, terrainIndexCount_, 1, 0, 0, 0);
+            ++drawCalls_;
+            if (designed) drawCalls_ += designed_->drawShadow(hp, cmd, vp, shadowFmt_, designed_->viewRocks(), false);
+            if (drawModels) {
+                // Only the models round the smoke (a margin for their size and for tall ones in front of it).
+                ModelFrame hmf = mf;
+                hmf.lightViewProj = vp;
+                hmf.shadowFormat = shadowFmt_;
+                const float* hb = cine_->halfBounds();
+                const float m = 96;
+                hmf.depthCull[0] = hb[0] - m, hmf.depthCull[1] = hb[1] - m, hmf.depthCull[2] = hb[2] + m, hmf.depthCull[3] = hb[3] + m;
+                hmf.depthBias = false;  // seen from the camera: exact (the bias let smoke behind a tank show on its sides)
+                drawCalls_ += models_->drawShadowDepth(hp, cmd, hmf);
+            }
+            drawCalls_ += cine_->drawHalf(hp, cmd, cf);
+            SDL_EndGPURenderPass(hp);
+            cine_->composite(cmd, sceneTex_, rw, rh);
+        }
     }
     // D2K_GPU_TIMING=1 (measurement only: stalls the CPU every frame): the 3D pass's GPU time,
     // submit -> fence (SDL_gpu has no timestamp queries), averaged and logged every 120 frames.
@@ -2223,6 +3000,27 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
         static double sum = 0, worst = 0;
         static int n = 0;
         const double ms = double(SDL_GetTicksNS() - s0) / 1e6;
+        if (clutterAB) {  // (see D2K_CLUTTER_AB above; the first 120 frames are warm-up)
+            static double abSum[2] = {}, abN[2] = {};
+            if (abFrame > 120) {
+                abSum[abOff ? 1 : 0] += ms;
+                abN[abOff ? 1 : 0] += 1;
+            }
+            if (abFrame % 600 == 0 && abN[0] > 0 && abN[1] > 0)
+                SDL_Log("3D GPU pass A/B: clutter on %.2f ms, off %.2f ms, cost %.2f ms (%.0f + %.0f frames)", abSum[0] / abN[0],
+                        abSum[1] / abN[1], abSum[0] / abN[0] - abSum[1] / abN[1], abN[0], abN[1]);
+        }
+        if (gFeatAB > 0) {  // (see D2K_PHOTO_AB / D2K_SSAO_AB above; the first 120 frames are warm-up)
+            static double fSum[2] = {}, fN[2] = {};
+            if (gFeatFrame > 120) {
+                fSum[gFeatOff ? 1 : 0] += ms;
+                fN[gFeatOff ? 1 : 0] += 1;
+            }
+            if (gFeatFrame % 600 == 0 && fN[0] > 0 && fN[1] > 0)
+                SDL_Log("3D GPU pass A/B: %s on %.2f ms, off %.2f ms, cost %.2f ms (%.0f + %.0f frames)",
+                        gFeatAB == 1 ? "photo terrain" : "ambient occlusion", fSum[0] / fN[0], fSum[1] / fN[1],
+                        fSum[0] / fN[0] - fSum[1] / fN[1], fN[0], fN[1]);
+        }
         sum += ms;
         worst = std::max(worst, ms);
         if (++n == 120) {
@@ -2239,19 +3037,34 @@ void Renderer3D::render(const game::World& w, const CameraPose& want, int viewW,
     render::FrameProbe::Scope postScope("3dPost");
     const SDL_FRect dst{0, 0, float(viewW), float(viewH)};
     const SDL_FRect src{0, 0, float(rw), float(rh)};
-    const bool bloomOn = o.bloom && o.light && o.light->bloom > 0.001f;
+    float bloomK = o.light ? o.light->bloom : 0.0f, bloomT = o.light ? o.light->bloomThreshold : 1.0f;
+    if (aerial) {
+        // Aerial haze: a gentle glow on the brightest sand and highlights by day (the Modern lighting's own bloom
+        // is kept where it is stronger, e.g. at night).
+        const float day = 1.0f - std::clamp(o.light && !o.light->identity ? o.light->lamps * 1.5f : 0.0f, 0.0f, 1.0f);
+        bloomK = std::max(bloomK, kAerialBloom * day);
+        bloomT = std::min(bloomT, 1.0f - (1.0f - kAerialBloomT) * day);
+    }
+    const bool bloomOn = o.bloom && bloomK > 0.001f;
+    // Realistic grade: the picture's colour grade (render/hdr.hpp Grade), by day in full; towards the night the
+    // time of day's own blue grade keeps its colour.
+    render::Grade grade;
+    if (gradeOn_)
+        grade = render::Grade::natural(1.0f - std::clamp(o.light && !o.light->identity ? (o.light->lamps - 0.12f) * 1.4f : 0.0f, 0.0f, 1.0f));
     if (hdrScene() && o.hdr) {
         // HDR scene: bloom from the unclamped values, both through the tone map (render/hdr.*);
         // without the Modern lighting just clamped (the picture from before).
-        SDL_Texture* glow = bloomOn ? o.bloom->compute(sceneSdl_, rw, rh, o.light->bloomThreshold) : nullptr;
-        if (!o.hdr->compose(sceneSdl_, rw, rh, glow, bloomOn ? o.light->bloom : 0.0f, dst, o.light != nullptr))
+        SDL_Texture* glow = bloomOn ? o.bloom->compute(sceneSdl_, rw, rh, bloomT) : nullptr;
+        if (!o.hdr->compose(sceneSdl_, rw, rh, glow, bloomOn ? bloomK : 0.0f, dst, o.light != nullptr, grade))
             SDL_RenderTexture(r_, sceneSdl_, &src, &dst);
         drawPostRefraction(viewW, viewH);
     } else {
-        SDL_RenderTexture(r_, sceneSdl_, &src, &dst);
+        // (Realistic grade on an 8-bit scene: the tone map's shader without its shoulder, just the grade.)
+        if (!(grade.on() && o.gradePass && o.gradePass->compose(sceneSdl_, rw, rh, nullptr, 0.0f, dst, false, grade)))
+            SDL_RenderTexture(r_, sceneSdl_, &src, &dst);
         drawPostRefraction(viewW, viewH);
         // Modern lighting: bloom around the brightest parts of the picture (render/bloom.*).
-        if (bloomOn) o.bloom->apply(sceneSdl_, rw, rh, dst, o.light->bloom, o.light->bloomThreshold);
+        if (bloomOn) o.bloom->apply(sceneSdl_, rw, rh, dst, bloomK, bloomT);
     }
     drawSunGlare(viewW, viewH, o);
     cpuMs_ = double(SDL_GetTicksNS() - t0) / 1e6;
@@ -2397,6 +3210,21 @@ bool Renderer3D::screenToGround(float sx, float sy, float& wx, float& wy) const 
     return true;
 }
 
+// World beyond the map: the land outside the map under a view pixel, if that is what the pixel shows. The
+// ring never hides the map (Surround::kOcclusionSlope), so a ray that reaches the map's ground shows the map.
+bool Renderer3D::outsidePoint(float sx, float sy, float& wx, float& wy) const {
+    if (!terrainBuilt_ || !surroundOn_) return false;
+    Vec3 o, d, hit;
+    cam_.ray(sx, sy, o, d);
+    const float mapW = float(terrain_.cellsW() * 32), mapH = float(terrain_.cellsH() * 32);
+    if (terrain_.raycast(o, d, hit) && hit.x >= 0 && hit.z >= 0 && hit.x <= mapW && hit.z <= mapH) return false;
+    if (!surround_.raycast(o, d, hit)) return false;
+    if (hit.x >= 0 && hit.z >= 0 && hit.x <= mapW && hit.z <= mapH) return false;
+    wx = hit.x;
+    wy = hit.z;
+    return true;
+}
+
 // Picking (docs/3d-mode.md "Picking"): the object drawn under the cursor wins, nearest first along
 // the eye ray; the terrain point only when no object is hit (or the ground is nearer).
 //  - Building models: ray against their triangles (ModelHook::rayBuilding). A hit returns the centre
@@ -2445,7 +3273,7 @@ bool Renderer3D::pick(const game::World& w, float sx, float sy, float& wx, float
             const float gx = float(game::fixToPixel(u.posX)), gy = float(game::fixToPixel(u.posY));
             if (models && models_->hasUnitModel(u.type) &&
                 nearRay(gx, gy, 48.0f + std::max(0.0f, models_->unitModelHeight(u.type)) +
-                                    float(game::fixToPixel(u.posZ) & 0xff))) {
+                                    float(game::fixToPixel(u.posZ) & 0xff) + flyerLift(terrain_, u))) {
                 const float t = models_->rayUnit(w, terrain_, int(si), i, o, d);
                 if (t > 0 && (!unitBox || t < unitT)) {
                     unitBox = unitAny = true;
@@ -2455,7 +3283,7 @@ bool Renderer3D::pick(const game::World& w, float sx, float sy, float& wx, float
             }
             if (unitBox) continue;  // a box hit beats any radius hit
             const bool inf = t_.bin.units[u.type].isInfantry;
-            const float z = float(game::fixToPixel(u.posZ) & 0xff);
+            const float z = float(game::fixToPixel(u.posZ) & 0xff) + flyerLift(terrain_, u);
             const Vec3 p{gx, terrain_.height(gx, gy) + z, gy};
             float px = 0, py = 0;
             if (!cam_.project(p, px, py)) continue;
@@ -2530,7 +3358,9 @@ bool Renderer3D::pick(const game::World& w, float sx, float sy, float& wx, float
 }
 
 bool Renderer3D::worldToScreen(float wx, float wy, float above, float& sx, float& sy) const {
-    return cam_.project(Vec3{wx, terrain_.height(wx, wy) + above, wy}, sx, sy);
+    // (Beyond the map - the red cross of a click out there - the ground is the surrounding land's.)
+    const bool outside = surroundOn_ && (wx < 0 || wy < 0 || wx > float(terrain_.cellsW() * 32) || wy > float(terrain_.cellsH() * 32));
+    return cam_.project(Vec3{wx, (outside ? surround_.height(wx, wy) : terrain_.height(wx, wy)) + above, wy}, sx, sy);
 }
 
 void Renderer3D::fillGroundRect(float x0, float y0, float x1, float y1, SDL_FColor fill, SDL_FColor outline) const {
@@ -2631,9 +3461,9 @@ void Renderer3D::drawOverlays(const game::World& w, const Options& o) {
             if (pointHidden(float(game::fixToPixel(u.posX)), float(game::fixToPixel(u.posY)))) continue;
             const auto& t = t_.bin.units[u.type];
             if (t.hitPoints == 0) continue;
-            const float gx = float(game::fixToPixel(u.posX)), gy = float(game::fixToPixel(u.posY));
+            const float gx = float(u.posX) / 65536.0f, gy = float(u.posY) / 65536.0f;
             const float h = t.isInfantry ? 9.0f : 14.0f;
-            const Vec3 base{gx, terrain_.height(gx, gy) + float(game::fixToPixel(u.posZ) & 0xff), gy};
+            const Vec3 base{gx, terrain_.height(gx, gy) + float(game::fixToPixel(u.posZ) & 0xff) + flyerLift(terrain_, u), gy};
             float sx = 0, sy = 0;
             if (!cam_.project(base, sx, sy)) continue;
             const float ppw = cam_.pixelsPerUnit(cam_.depthOf(base));

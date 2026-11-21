@@ -17,8 +17,12 @@ struct Settings;
 
 // The language parts chosen in the settings (Advanced overrides "" = follow the language).
 formats::lang::Selection languageSelection(const Settings& s);
-// Changes whenever anything that applyLanguage() depends on changes.
+// Changes whenever anything that applyLanguage() depends on changes (incl. aiVoicesGeneration()).
 std::string languageKey(const Settings& s);
+// The Russian AI voice folder's content changed (the in-app download installed ru-ai-voices): the
+// next languageKey() differs, so App rebuilds the language sources. Thread-safe.
+void noteAiVoicesChanged();
+int aiVoicesGeneration();
 
 // <Dune 2000>/../ru-pc next to the game folder (discovery when no folder is set), or "".
 std::string defaultTranslationDir(const std::string& dataDir);

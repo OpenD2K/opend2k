@@ -47,6 +47,7 @@ struct Options {
                            // and log the frame times (performance checks)
     bool simtest = false;  // headless self-test (sim_test.hpp)
     int ticks = 0;         // --ticks N: simulate N ticks before showing/screenshotting
+    int movement = -1;     // --movement original|modern ("Unit movement" of the games started; -1 = Settings)
     bool battle = false;   // --battle: every armed ground unit attacks the nearest enemy (demo)
     bool vfxDemo = false;  // --vfx-demo: a weapon effects gallery around --at (render checks; changes the world)
     bool selectAll = false;  // --select: select all player units and buildings (HUD demo)
@@ -58,6 +59,17 @@ struct Options {
     std::string terrain2d;  // --terrain2d original|upscaled|designed|faithful (Graphics: Enhanced; docs/enhanced-graphics.md)
     std::string terrain3d;  // --terrain3d tiles|designed|faithful (Graphics: 3D; docs/3d-mode.md "Terrain v2" / "Terrain v3")
     std::string shadows3d;  // --shadows3d on|off (Graphics: 3D; docs/3d-mode.md "Sun shadows")
+    std::string reimagined;  // --reimagined on|off (Graphics: 3D, experimental; docs/3d-mode.md "Reimagined")
+    std::string groundDetail;  // --ground-detail off|sparse|dense (Reimagined; docs/3d-mode.md "Ground clutter")
+    std::string dustHaze;      // --dust-haze on|off (Reimagined; docs/3d-mode.md "Dust haze")
+    std::string groundDust;    // --ground-dust on|off (Reimagined; vehicle dust trails, placement dust ring)
+    std::string naturalGrade;  // --natural-grade on|off (Reimagined; docs/3d-mode.md "Realistic grade")
+    std::string vehicleWrecks;  // --vehicle-wrecks on|off (Reimagined; docs/3d-mode.md "Vehicle wrecks")
+    std::string photoTerrain;      // --photo-terrain on|off (Reimagined; docs/3d-mode.md "Photo terrain")
+    std::string ambientOcclusion;  // --ambient-occlusion on|off (Reimagined; docs/3d-mode.md "Ambient occlusion")
+    int gameSpeed = -1;         // --game-speed 0..100 (the GameSpeed of this run; -1 = the setting's)
+    std::string mapSurroundings;  // --map-surroundings off|band|full (on = band) (Reimagined; docs/3d-mode.md "World beyond the map")
+    std::string aerialHaze;    // --aerial-haze on|off (Reimagined; docs/3d-mode.md "Aerial haze": depth haze + bloom)
     std::string timeOfDay;  // --time-of-day day|dawn|dusk|night|cycle (Enhanced / 3D; docs/enhanced-graphics.md "Lighting")
     std::string lighting;   // --lighting classic|modern (Enhanced / 3D; docs/enhanced-graphics.md "Lighting")
     // Quality / display for this run (docs/enhanced-graphics.md "Quality"): --quality low|medium|high,
@@ -69,9 +81,17 @@ struct Options {
     std::string resolution3d;  // --resolution3d auto|100|75|50 (Settings::resolution3d)
     std::string graphics;  // --graphics original|enhanced|3d (empty = the saved setting);
                            // --hq = enhanced, --classic-ui = original
+    // --graphics-preset original|enhanced|3d|3d-classic: that graphics preset (Settings::applyPreset) before
+    // the other flags, which then override single values; empty = none (one-frame runs: the defaults).
+    std::string graphicsPreset;
     std::string artPack;   // --art-pack NAME (original|upscaled|<pack folder>; empty = the saved setting)
     std::string effects;   // --effects classic|modern (empty = the saved setting)
+    std::string effectsIntensity;  // --effects-intensity clean|balanced|cinematic (empty = the saved setting)
     std::string controls;          // --controls original|modern (empty = the saved setting)
+    std::string smoothDriving;     // --smooth-driving on|off (empty = the saved setting / the default)
+    std::string smoothCamera;      // --smooth-camera on|off (empty = the saved setting / the default)
+    std::string buildingPlacement; // --building-placement rise|dropin|assemble (3D models; empty = the saved setting)
+    std::string attackMove;        // --attack-move on|off (empty = the saved setting / the default)
     std::string vehicleAnimation;  // --vehicle-animation original|modern (empty = the saved setting)
     std::string panelTransparency;  // --panel-transparency off|light|medium (Enhanced panel; empty = saved)
     std::string shroud;    // --shroud classic|soft (Enhanced shroud edge; empty = the saved setting)

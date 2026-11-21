@@ -200,6 +200,29 @@ enum class UnitState : std::int32_t {
 // Object kinds of a CSide pool slot (slot +0x90).
 enum class SlotKind : std::uint8_t { Free = 0, Unit = 1, Building = 2, Bullet = 3, Explosion = 4 };
 
+// "Unit movement: Modern" (not original; modern_move.cpp, docs/modern-movement.md): the state of
+// a ground vehicle driven by the free-angle mover. Pure integers. Saved only in the world
+// section's modern tail (World::modernMovement()), so Original games save and hash as before.
+constexpr int kModernWaypoints = 16;
+struct ModernMotion {
+    std::int32_t heading = -1;          // body heading, 65536 per turn, 0 = north, clockwise; -1 = take it from facing
+    std::int32_t speed = 0;             // 16.16 px per tick along the heading
+    std::int32_t lastX = 0, lastY = 0;  // position after the last modern step (moved by someone else = restart)
+    std::int32_t goalX = 0, goalY = 0;  // 16.16 px: end of the current plan (centre of the goal tile)
+    std::int16_t goalTileX = -1, goalTileY = -1;  // the target tile the plan was made for (-1 = no plan)
+    std::array<std::uint8_t, kModernWaypoints> wpX{}, wpY{};  // corner tiles of the string-pulled path
+    std::uint8_t wpCount = 0, wpIndex = 0;
+    std::uint16_t stall = 0;    // ticks stopped short of the goal by another unit
+    std::uint16_t repath = 0;   // ticks before a changed target may be re-planned
+    std::uint8_t flags = 0;     // ModernMotion::k*
+    static constexpr std::uint8_t kStopping = 1;    // braking to a stop wherever it is (target = own cell)
+    static constexpr std::uint8_t kPartial = 2;     // the plan ends short of the goal (re-plan at its end)
+    static constexpr std::uint8_t kAvoidUnits = 4;  // the plan routes round the vehicles that were in the way
+    static constexpr std::uint8_t kYield = 8;       // pulling over for a vehicle met head-on: the plan (kPartial)
+                                                    // ends on a free cell off its lane, waits there (stall
+                                                    // counts the wait), then re-plans to the target
+};
+
 // The 0x94-byte Unit object (offsets in comments). Defaults are the zero wipe of a freed slot.
 struct Unit {
     bool alive = false;  // slot currently holds a unit (not original; kind == Unit)
@@ -258,6 +281,7 @@ struct Unit {
     // (padding bytes in vanilla; always 0 for vanilla missions).
     std::uint8_t tag = 0;
     bool prevSelected = false;
+    ModernMotion mm;  // not original: Modern movement only (see ModernMotion)
 
     int tileX() const { return fixToTile(posX); }
     int tileY() const { return fixToTile(posY); }
@@ -735,6 +759,16 @@ struct RallyPending {
     int x = 0, y = 0;
 };
 
+// Attack-move (not original; attack_move.cpp): an armed ground unit on its way to (destX, destY)
+// that engages enemies it meets. phase 0 = moving to the destination, 1 = engaged (chasing /
+// firing) since it stood on (leashX, leashY). `type` guards against a reused slot.
+struct AttackMove {
+    int side = 0, unit = kNoIndex, type = 0;
+    int destX = 0, destY = 0;
+    int phase = 0;
+    int leashX = 0, leashY = 0;
+};
+
 // What a smart order (World::smartOrder) did.
 //   Friendly: the target is an own/allied object and no Ctrl - the original selects it instead
 //             (the frontend decides; Modern controls move there).
@@ -885,6 +919,44 @@ public:
     bool orderSetRallyPoint(int side, int buildingIndex, int tileX, int tileY);
     bool orderClearRallyPoint(int side, int buildingIndex);
     bool rallyPoint(int side, int buildingIndex, int& tileX, int& tileY) const;
+
+    // ===================================================================================
+    // Attack-move (not original; attack_move.cpp). Queued like a move order (the frontend sends
+    // it to the orderGroup units): an armed ground unit walks to the tile; on its way it engages
+    // the enemies that come into weapon range (the original's FindNearestEnemy /
+    // FindNearestEnemyBuilding searches), chases them at most kAttackMoveLeash tiles, then goes
+    // on; at the tile it guards (state 3). Unarmed units and aircraft get a plain move order.
+    // Any other order to the unit ends it. Saved (World::attackMoves_).
+    // ===================================================================================
+    static constexpr int kAttackMoveLeash = 8;  // tiles from where the engagement began
+    void orderAttackMove(int side, int unitIndex, int tileX, int tileY);
+    // Sends the selected units of `side` (orderGroup: the order limit) on an attack-move to the
+    // tile; returns how many got the order (0 = none selected / off the map).
+    int orderGroupAttackMove(int side, int tileX, int tileY);
+    const std::vector<AttackMove>& attackMoves() const { return attackMoves_; }
+    bool isAttackMoving(int side, int unitIndex) const;
+
+    // ===================================================================================
+    // "Unit movement: Modern" (not original; modern_move.cpp, docs/modern-movement.md): ground
+    // vehicles drive at any angle on string-pulled paths, accelerate / brake, turn while
+    // driving, queue and spread out instead of reserving tiles; a group move order gives each
+    // vehicle its own tile around the target. Infantry, aircraft and worms keep the original
+    // movement. Chosen when the game starts (before the first tick) and saved with it; Original
+    // (false) is bit-exact with the original game.
+    // ===================================================================================
+    bool modernMovement() const { return modernMovement_; }
+    void setModernMovement(bool on) { modernMovement_ = on; }
+    bool isModernVehicle(const Unit& u) const;  // a unit the modern mover drives (Modern only)
+    // The body heading in 65536ths of a turn (0 = north, clockwise): the modern heading, else
+    // the 32-step facing. The modern heading only follows the facing while the modern mover
+    // runs; a standing unit turned by something else (FireAt turning a turretless trike /
+    // quad / missile tank towards its target, a carryall drop, ...) has a facing the heading
+    // no longer rounds to - then the facing is the truth (the mover re-syncs on its next step).
+    int unitHeading(const Unit& u) const {
+        if (u.mm.heading >= 0 && isModernVehicle(u) && (((u.mm.heading + 1024) >> 11) & 31) == (u.facing & 31))
+            return u.mm.heading;
+        return (u.facing & 31) << 11;
+    }
 
     // Object lookup with the original tile semantics (pixel inputs for units).
     const Unit* unitAt(int pixelX, int pixelY, int& sideOut, int& indexOut) const;  // GetUnitOnTile 0x4a5270
@@ -1147,6 +1219,7 @@ private:
             // Appended after the rally order so saved queues keep their values.
             BuildingAttackUnit,      // 0x1e GenerateBuildingAttackUnitOrder 0x459d20 (ProcessOrder case 0xb)
             BuildingAttackBuilding,  // 0x1f GenerateBuildingAttackBuildingOrder 0x459de0 (case 0xc)
+            AttackMove,              // not original (attack_move.cpp); x/y = destination tile
         } kind;
         int side, unitIndex, x, y;
         int targetSide = 0, targetIndex = kNoIndex;
@@ -1268,6 +1341,24 @@ private:
     bool updateExplosion(Explosion& e);                                                         // 0x49dd80
     bool moveUnitSimple(Unit& u, bool releaseFrom, bool markTo);                                // 0x495560
 
+    // modern_move.cpp (Modern movement)
+    bool moveUnitModern(Unit& u);
+    bool modernStaticPass(int x, int y, const Unit& u) const;
+    bool modernLineClear(const Unit& u, std::int32_t ax, std::int32_t ay, std::int32_t bx, std::int32_t by) const;
+    bool modernPlan(Unit& u);
+    bool modernWantsStop(const Unit& u) const;
+    bool modernPickFreeGoal(Unit& u);
+    bool modernCanYield(const Unit& u) const;
+    bool modernPullOver(Unit& u, const Unit& v);
+    bool modernMovingVehicleNear(const Unit& u) const;
+    void modernEnterCell(Unit& u, int nx, int ny);
+    const Unit* modernVehicleAt(int x, int y) const;
+    void modernIndexVehicles();
+    void applyModernFormations();
+    struct FormationEntry {
+        int side, index, x, y;
+    };
+
     // movement.cpp
     void getNextSquare(Unit& u);
     void storeRoute(Unit& u, const PathPoint* p, int len);
@@ -1357,6 +1448,11 @@ private:
     // A unit just added at a factory exit (or dropped at a starport): queue its rally move.
     void rallyUnitLeft(int side, int unitIndex, const Building& factory);
     void updateRally();  // moves units that have left their factory to its rally point
+    // attack_move.cpp
+    void processAttackMoveOrder(const Order& o);
+    void cancelAttackMove(int side, int unitIndex);
+    void updateAttackMoves();  // before ModelUpdate: engage / resume / guard at the destination
+    bool attackMoveAcquire(Unit& u, AttackMove& r);
     void applyBuildOverrides(int side);        // end of updateIcons
     bool cheatProductionNoFactory(int side, ProductionSlot& q);  // allowed unit without a factory
     bool cheatDeliveryTarget(int side, int& x, int& y) const;
@@ -1513,6 +1609,16 @@ private:
     CheatState cheats_;
     std::vector<RallyPoint> rallyPoints_;    // not original (rally.cpp)
     std::vector<RallyPending> rallyPending_;
+    std::vector<AttackMove> attackMoves_;    // not original (attack_move.cpp); saved from v9
+    // Modern movement (not original; modern_move.cpp): the switch is saved (v10: the world
+    // section's modern tail); the rest is scratch rebuilt every tick, not saved.
+    bool modernMovement_ = false;
+    std::vector<std::int32_t> vehicleAt_;    // per cell: (side << 16 | index) + 1 of the vehicle there, 0 = none
+    std::uint32_t vehicleAtTick_ = 0xFFFFFFFFu;
+    std::vector<std::int32_t> astarG_, astarFrom_;  // A* scratch (per cell)
+    std::vector<std::uint32_t> astarSeen_;
+    std::uint32_t astarStamp_ = 0;
+    std::vector<FormationEntry> formationBatch_;  // move orders of this tick (consumed in the same tick)
     ExtMission ext_;
     ExtUiRequests extUi_;  // not saved
 };

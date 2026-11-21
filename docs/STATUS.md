@@ -17,7 +17,8 @@ open "build/Dune 2000.app"          # the macOS app (double-click works too)
 Options: `--data DIR`, `--mute`, `--no-music`, `--graphics original|enhanced|3d` (`--hq` = enhanced,
 `--camera-tilt DEG` / `--camera-yaw DEG` set the 3D camera,
 `--classic-ui` = original), `--art-pack original|upscaled|NAME` and `--effects classic|modern` (Enhanced only,
-see `docs/enhanced-graphics.md`), `--time-of-day day|dawn|dusk|night|cycle` and `--lighting classic|modern` (Enhanced / 3D;
+see `docs/enhanced-graphics.md`), `--effects-intensity clean|balanced|cinematic` (Modern effects: how much a busy
+screen gets; docs/enhanced-graphics.md "Effects intensity"), `--time-of-day day|dawn|dusk|night|cycle` and `--lighting classic|modern` (Enhanced / 3D;
 docs/enhanced-graphics.md "Lighting"; one-frame runs default to Day + Classic = the old look), `--skirmish-ai N` (with `--skirmish`:
 N computer players, this run), `--frames N` (one-frame modes run N real-time frames, screenshot the last,
 log frame times; one-frame, recording and `--simtest` runs use a hidden window and take no input), `--at X Y` (centre on a tile), `--zoom Z`,
@@ -60,13 +61,13 @@ nothing is found, a screen asks for the folder (macOS folder picker) and remembe
 found; reachable from Options → *Change…* in Enhanced and Settings → *Data Folder* in Original) also
 offers **Choose installer (.exe)…**: the app unpacks the installer itself (no Windows, no Wine;
 `src/formats/nsis.*`; LZMA decoding by Igor Pavlov's public-domain LZMA SDK in `third_party/lzma`) with a progress bar and Cancel into
-`~/Library/Application Support/d2k-mac/Dune 2000/GameData/<installer name>/Dune 2000/` (the D2K+
+`~/Library/Application Support/OpenD2K/Dune 2000/GameData/<installer name>/Dune 2000/` (the D2K+
 Windows editors are skipped) and uses its `data` folder. A finished copy has a `.d2k-extracted`
 marker and is reused when the same installer is chosen again; an interrupted one (`*.partial`) is
 redone. Data discovery also falls back to the newest finished copy there. The Gruntmods **cutscene
 installers** (`Dune_2000_<Language>_Cutscene_Installer_1.1_Silent.exe` from files.gruntmods.com,
 433–557 MB, 43 VQA movies) can be chosen the same way, whatever the data source: their movies go
-into `~/Library/Application Support/d2k-mac/Dune 2000/Movies/`.
+into `~/Library/Application Support/OpenD2K/Dune 2000/Movies/`.
 Command line: `--install-from INSTALLER.exe` (then continues with that data; `--install-only` exits
 after unpacking; `--game-data-root DIR` unpacks under DIR instead, and then the settings are not
 changed). Timing (M-series Mac, chunks decoded on all cores): 1.6.7 installer → 14003 files /
@@ -80,17 +81,19 @@ only in the installer: `dotnetfx35setup.exe`. The installer's `movies/*.VQA` are
 like the installed ones; the real cutscenes come only from the separate cutscene installers
 (`Dune2000Cutscenes.exe` is an NSIS downloader for them).
 Settings (data folder, graphics mode, fullscreen, volumes, scroll speed, last skirmish lobby) live in
-`~/Library/Application Support/d2k-mac/Dune 2000/settings.ini`; save games next to it in
+`~/Library/Application Support/OpenD2K/Dune 2000/settings.ini`; save games next to it in
 `saves/SAVE0.SAV` … `SAVE9.SAV`.
 
 **Updating (the user data folder).** Everything the app writes lives in the per-user folder
-`SDL_GetPrefPath("d2k-mac", "Dune 2000")` (`platform/user_data.hpp`: `prefPath()`, fixed strings — not the app name,
+`SDL_GetPrefPath("OpenD2K", "Dune 2000")` (`platform/user_data.hpp`: `prefPath()`, fixed strings — not the app name,
 so development builds ("Dune 2000") and release builds ("OpenD2K", `-DD2K_APP_NAME`) share it): `settings.ini`,
 `saves/`, `highscores.txt`, `community_progress.ini`, `GameData/` (installer copies), `Movies/` (imported cutscenes),
 `Voices/`, `previews/`, `artpacks/` (downloaded art pack). Nothing is written into the .app or next to the
-executable, so replacing the app keeps all of it. Paths: macOS `~/Library/Application Support/d2k-mac/Dune 2000/`,
-Windows `%APPDATA%\d2k-mac\Dune 2000\`, Linux `$XDG_DATA_HOME/d2k-mac/Dune 2000/` (`~/.local/share/...`), iOS the
-app sandbox's `Library/Application Support/d2k-mac/Dune 2000/`, Android the app's internal storage (both survive
+executable, so replacing the app keeps all of it. The data-folder page (and the Enhanced Options page) shows the
+folder and an **Open data folder** button (`openUserDataFolder`: `SDL_OpenURL` on a percent-encoded `file://` URL;
+desktop only). Paths: macOS `~/Library/Application Support/OpenD2K/Dune 2000/`,
+Windows `%APPDATA%\OpenD2K\Dune 2000\`, Linux `$XDG_DATA_HOME/OpenD2K/Dune 2000/` (`~/.local/share/...`), iOS the
+app sandbox's `Library/Application Support/OpenD2K/Dune 2000/`, Android the app's internal storage (both survive
 app updates). A saved data folder that no longer exists (the game folder was next to an old app that was
 deleted) is skipped and discovery continues (next to the app, the cwd, usual installs, Documents, the newest
 `GameData/` copy); the folder found is saved again.
@@ -123,8 +126,8 @@ Missions in original-style lists — a campaign opens its mission list with prog
 choice / bonus) and the briefing, Start / Cancel; see docs/community-campaigns.md), Multiplayer Game →
 game type → Practice = the original skirmish page with name, house, colour, map list, difficulty,
 unit count, tech level, credits, AI players, crates and worms; Game Options = the settings box
-(fullscreen, smooth motion, mouse controls, cutscenes, *Graphics:* preset button cycling Original → Enhanced → 3D —
-Enhanced / 3D apply the preset and open the modern Graphics page; Custom is shown when the values are mixed —, resolution, Game Settings = game speed /
+(fullscreen, smooth motion, mouse controls, cutscenes, *Graphics:* preset button cycling Original → Enhanced → 3D → 3D Classic —
+Enhanced / 3D / 3D Classic apply the preset and open the modern Graphics page; Custom is shown when the values are mixed —, resolution, Game Settings = game speed /
 scroll rate / music / SFX volume + our Extended queue, Cheats, Modern effects, HD art, Rally points, Unlimited orders and
 Unlimited units check boxes → music selection, data
 folder — our rows are additions), Exit
@@ -187,14 +190,15 @@ Cheats button (when the Cheats option is on).
   the Christmas maps BLOXXMAS — converted from the 8-bit .R8 through bin/Palette.bin like LoadTileset 0x462d10).
 - **Options**: Graphics (opens the Graphics page; the button names the active preset), cutscenes, music/sound volume,
   language, game speed (original GameSpeed 0..100, default 75 = 20 ticks/s; 95+ = 60 ticks/s), scroll speed (original
-  ScrollRate 4..40, default 20), mouse controls (Original / Modern), smooth unit motion | frame time, production queue
+  ScrollRate 4..40, default 20), mouse controls (Original / Modern) | attack-move (On / Off; on in the Enhanced / 3D
+  presets, off in Original — see Controls), smooth unit motion | frame time, production queue
   (Original / Extended, default Extended — see Controls), cheats (On / Off, default On) | factory rally points (On /
   Off, default On), order limit (Original = a group order reaches the first 64 selected units like the original /
   Unlimited, applies at once) | unit limit (Original = 1000 objects per side / Unlimited = up to 10000, for new games;
   both default Original, re/notes/limits.md), game data folder. The rows scroll inside the panel (mouse wheel, draggable scroll bar, the keyboard
   focus is scrolled into view); Back stays fixed below it.
-- **Graphics page** (Options → Graphics; `--menu-page graphics|graphics-original|graphics-enhanced|graphics-3d|graphics-custom[-end]`):
-  tabs Original / Enhanced / 3D / Custom at the top (big enough to tap). The first three are one-tap presets — a tap
+- **Graphics page** (Options → Graphics; `--menu-page graphics|graphics-original|graphics-enhanced|graphics-3d|graphics-3d-classic|graphics-custom[-end]`):
+  tabs Original / Enhanced / 3D / 3D Classic / Custom at the top (big enough to tap; owner decision 2026-11-18). The first four are one-tap presets — a tap
   applies it; the tab shows a preview (shipped pre-rendered in `assets/previews` for the default setups and every
   Custom row value; other combinations rendered offscreen and cached in `<pref>/previews`; docs/enhanced-graphics.md
   "Presets"), one line on the look and its main values.
@@ -203,16 +207,24 @@ Cheats button (when the Cheats option is on).
   bars Selected, panel opaque, classic view Hold, art = the
   chosen redesign pack (pack.ini `kind=rendered`) or the original sprites — never an upscale; **3D** = the Enhanced
   values + graphics 3D, 3D terrain Faithful, sun shadows on, 3D models New (the OpenD2K 3D art pack; never the
-original sprites — without the pack the 3D tab only shows "needs the OpenD2K 3D art pack" and `--graphics 3d` runs as
-Enhanced, docs/3d-mode.md "Objects: models only"). **Custom** lists every graphics
+original sprites — without the pack the 3D tabs only show "needs the OpenD2K 3D art pack" and `--graphics 3d` runs as
+Enhanced, docs/3d-mode.md "Objects: models only") and the Reimagined look ("3D (Reimagined)"; the lite iPads: off);
+  **3D Classic** = the same with 3D terrain Original tiles (the 1998 tile art on the heightfield) and Reimagined off.
+  The Designed 3D terrain and plain (non-Reimagined) Faithful are legacy modes: Custom only, no new upgrades. **Custom** lists every graphics
   value grouped: Mode, Terrain, Art, Effects, Shroud, Interface (panel transparency, health bars, group numbers), 3D (terrain,
   shadows, models), Display, Classic view; changing any of them (here or in the pause menu) makes the setup Custom.
   Display (resolution in Original / UI scale in Enhanced and 3D, fullscreen, render resolution) is not part of a
   preset and shows under every tab. The active preset is underlined; settings.ini `graphicsPreset`
-  (original|enhanced|3d|custom; values that no longer match read as the preset they match, else Custom). The page
+  (original|enhanced|3d|3d-classic|custom; values that no longer match read as the preset they match, else Custom; a
+  stored `custom` stays Custom). `--graphics-preset original|enhanced|3d|3d-classic` applies a preset for one run (before
+  the single-value flags). The page
   stays modern while Original is picked; Back returns to Options (the original SETTINGS page in Original).
-- **In game**: Esc (or P) opens the pause menu (Resume / Options / Save game / Load game / Restart
-  mission / Quit to main menu / Quit game / Cheats when enabled); Save game / Load game show the 10 slots (saving picks the
+- **In game**: Esc (or P) opens the pause menu (Resume / Options / Mission briefing / Save game / Load game / Restart
+  mission / Quit to main menu / Quit game / Cheats when enabled; on short windows such as phones the buttons below
+  Resume sit in two columns). Mission briefing (campaign and custom missions; none in skirmish, like the original's
+  INGAME_SKIRMISH) is the original RECAP page's text in our style: the IG<h><n>MIS list box's EnterText keys
+  (Text.UIB, current language) or the custom mission's own briefing, wrapped, scrolling by wheel / drag / scroll
+  bar / Up-Down; Back or Esc returns (screenshot names `pause-briefing`, `pause-briefing-end`). Save game / Load game show the 10 slots (saving picks the
   first empty slot, else the oldest; "Overwrite" replaces a used one); Options has the gameplay rows plus the graphics values switchable in battle (resolution / UI scale, render, art, effects, health bars, shroud, sun shadows, panel transparency, terrain, classic view key — not the graphics mode, chosen in the main menu only) and the volumes; they scroll when the window is too small, Back stays fixed. After the MISSION ACCOMPLISHED / FAILED banner, a click or Enter returns to the menu (campaign missions: the score page, then the territory map).
 - Keyboard: arrows/Tab move the focus, Left/Right change values, Enter activates, Esc goes back.
 
@@ -229,7 +241,7 @@ menu has **Movies** to rewatch any of them.
   Player: `src/platform/movie_player.*` (frames streamed into a texture, synced to the audio clock;
   nearest scaling in Original graphics, linear in Enhanced, letterboxed). docs/formats.md.
 - Where the movies come from, first match: `<data>/../movies/*.VQA` (0-byte placeholders are
-  skipped), `~/Library/Application Support/d2k-mac/Dune 2000/Movies/*.VQA` (the data-folder page's
+  skipped), `~/Library/Application Support/OpenD2K/Dune 2000/Movies/*.VQA` (the data-folder page's
   *Choose installer* takes a Gruntmods cutscene installer and unpacks it there), then a **PS1 disc
   image** (data-folder page → *PS1 disc image…*, a `.cue` or `.bin` of Dune 2000 for the
   PlayStation; settings.ini `ps1Image`; `--ps1 IMAGE` for one run). The PS1 disc has 38 of the 41
@@ -251,11 +263,12 @@ page D2K_LANGUAGE, `--menu-page language`). A change reloads the front end; a ru
   (*Translation folder…*, settings.ini `translationDir`, `--translation DIR`). The 96 Gruntmods-only keys stay English.
 - Русский (PS1): speech and movies from the Russian PS1 disc image (`ps1Image`). 201 PC speech files map to PS1
   slots (docs/ps1-assets.md). Lines the disc lacks come from the Stream dub, else English. Text as Русский (перевод).
-- Русский (AI, оригинальные голоса): the Russian text as Русский (перевод) (Fargus + fixes), speech from our
-  generated AI voice set (251 lines in the original speakers' voices), the Stream dub's Russian cutscenes. How to
-  get it: run `tools/voice/gen_ru_ai.py` once with your own Yandex SpeechKit key (docs/ai-voices.md "Full set");
-  it writes `<pref path>/Voices/ru-ai/GAMESFX/*.AUD` (macOS: `~/Library/Application Support/d2k-mac/Dune 2000/`),
-  then pick the language. Without that folder the entry is dimmed with the hint. Lines the set lacks play in
+- Русский (AI, оригинальные голоса): the Russian text as Русский (перевод) (Fargus + fixes), speech from OpenD2K's
+  AI voice set (251 lines; Russian voices created with AI, similar to the original — an unofficial fan work), the
+  Stream dub's Russian cutscenes. How to get it (0.0.3+): **Options → Art pack → Extras → Russian AI voices →
+  Download** (about 4 MB, CC BY-SA 4.0); it installs into `<pref path>/Voices/ru-ai/GAMESFX/*.AUD` (macOS:
+  `~/Library/Application Support/OpenD2K/Dune 2000/`), then pick the language. The pack has voices only: without
+  the Russian translation folder the text stays English. Without the voices the entry is dimmed with the hint. Lines the set lacks play in
   English (never the Stream dub); SFX stay the game's. Other folder: settings.ini `aiVoicesDir`, `--ai-voices DIR`.
 - Command line: `--language en|fr|de|es|ru-ps1|ru-pc|ru-ai`, `--text-language` / `--voices-language` /
   `--movies-language CODE`, `--translation DIR`, `--ai-voices DIR`. `--sound-test` logs where each speech sample comes from.
@@ -351,9 +364,14 @@ screen points (like a system cursor; not scaled by the window or the zoom). On t
   resolution from `artpacks/<pack>/` (frames by DATA.R16 index, terrain tiles per tileset, optional
   house-colour and shadow masks, falling back to the upscaled original; mip-mapped), and render-side
   effects: particle fireballs / smoke plumes / sparks / debris, muzzle flashes, rocket smoke and sonic
-  rings, dust trails and tread marks, burning buildings and vehicles, spice sparkle, light glows,
+  rings, dust trails and tread marks (3D: lit track / tyre imprints in the sand), burning buildings and vehicles, spice sparkle, light glows,
   screen shake, smooth vehicle and turret turning, a vignette. They hold 120 Hz on a
-  ProMotion display. The Original mode ignores both settings.
+  ProMotion display. The Original mode ignores both settings. **Effects intensity** (Options → Graphics → Custom →
+  Effects, next to "Effects"; `effectsIntensity`, `--effects-intensity`): *Clean* is the default (owner 2026-11-16); *Balanced* keeps a single
+  explosion's full look but scales the effects down as the view gets busy (hit smoke clears in 1-3 s, smaller /
+  thinner / fewer puffs, nearby wreck columns merge, a few columns per screen), and smoke turns see-through over
+  units (more over the player's selected ones); *Cinematic* = the full look of before (only a light see-through);
+  *Clean* = short effects, minimal smoke. Enhanced 2D, plain 3D and Reimagined.
 - **Art pack download** (Options → **Art pack**; `platform/artpack_download.*`, `menu_artpack.cpp`, docs/release.md
   "Art pack"): shows the installed version / not installed / "update vX available", Download with a progress bar
   (MB, MB/s), Cancel (the next Download resumes), errors with Retry and "Open download page". The Graphics page's
@@ -361,9 +379,9 @@ screen points (like a system cursor; not scaled by the window or the zoom). On t
   "Art: Original sprites (no art pack)" with **Get the art pack**, the Custom tab's Art header has the same button, and
   the Original front end's SETTINGS page has an **Art pack** button (half of the Resolution row).
   **First-run welcome page** (`Menu::pageWelcome`, once per install, settings.ini `firstRunArtPackAsked`; both front
-  ends): right after the game data is set up - what OpenD2K is, "Choose your look" (Original / Enhanced / 3D cards with
-  the preset previews; a tap applies the preset; 3D disabled until the pack is installed, a tap marks it "after the
-  download" and the 3D preset is applied once the pack installs), and the art pack offer (size from the manifest fetched
+  ends): right after the game data is set up - what OpenD2K is, "Choose your look" (Original / Enhanced / 3D / 3D Classic cards with
+  the preset previews; a tap applies the preset; the 3D cards disabled until the pack is installed, a tap marks one "after the
+  download" and that preset is applied once the pack installs), and the art pack offer (size from the manifest fetched
   when the page opens, else "about 600 MB"; Wi-Fi note on phones/tablets; Download with progress, it continues in the
   background) with Not now / Continue. Older settings.ini files without the key never show it. `--menu-page
   welcome[-downloading|-installed|-failed|-nomanifest|-graphics|-graphics-custom]`; `D2K_PREF_DIR=<folder>` runs with a
@@ -447,6 +465,74 @@ minimap) works through 3D picking. Needs the SDL GPU renderer (Metal); otherwise
 Enhanced map and logs why. Modern effects, the rally flag, health bars and the cheat spawn preview are drawn in 3D
 too; the PS1 disc's building/vehicle models or the built-in "new" model pack can replace the billboards
 (Options → *3D models*, docs/3d-models.md).
+**Ground detail** (Reimagined only; Options → Graphics → 3D: Off / Sparse / Dense, default Dense; settings.ini
+`groundDetail`, `--ground-detail`): render-only ground clutter from the ground clutter pack
+(`artpacks/ground-clutter/clutter`, Poly Haven CC0 scans + procedural pieces, `tools/models/clutter_kit.py`) - boulders,
+talus rubble, dry shrubs, dead wood and rare old scrap on cells no unit uses (cliff feet, ledges), only pebbles, gravel,
+flat slabs and tufts under 3 px on cells units use; never on buildings / footprints / concrete / spice (also ones
+appearing later), shrouded, casting sun shadows, not pickable. docs/3d-mode.md "Ground clutter".
+**Dust haze** and **Ground dust** (Reimagined only, render only, both on by default; Options → Graphics → 3D and the
+in-game options in 3D; settings.ini `dustHaze` / `groundDust` on|off, `--dust-haze` / `--ground-dust`, env
+`D2K_HAZE_OFF=1` / `D2K_GROUND_DUST_OFF=1`): Dust haze = broad wind-blown dust veils drifting slowly across the map
+with the wind, dimming (up to ~14 %) and warming the light on the terrain, buildings, units and billboards (it
+replaced the old cloud shadows: Arrakis has no clouds). Ground dust (needs Modern effects, scaled by Effects
+intensity) = dust plumes behind moving ground vehicles (bigger and denser with speed; full on sand / dunes / spice,
+faint on rock, none on concrete; drifting with the same wind) and a short dust ring billowing out of a new
+building's footprint when it appears (placed or an MCV deployed; not with Building placement: Drop-in, which raises
+its own landing dust). The dust takes the ground's colour (spice orange-rust, sand warm sand, rock grey-brown grit),
+is lit by the sun (bright warm top / sun side, cooler shaded underside), casts a faint soft shadow on the ground and
+settles over ~2.5-4 s. **Aerial haze** (Reimagined only, render only, on by default; Options → Graphics → 3D and the
+in-game options in 3D; settings.ini `aerialHaze` on|off, `--aerial-haze`, env `D2K_AERIAL_OFF=1`): aerial perspective
+by view distance - the far part of a tilted view fades towards a pale warm desert-sky haze (none at the near edge, ~15 %
+at the far edge of the default view, at most 50 % far away; weaker at night) - plus a gentle day bloom on the brightest
+sand. docs/3d-mode.md "Atmosphere". **World beyond the map** (Reimagined only, render only, on by default; Options →
+Graphics → 3D and the in-game options in 3D; settings.ini `mapSurroundings` on|off, `--map-surroundings`, env
+`D2K_SURROUND_OFF=1`): instead of ending in a black void the map sits inside a larger desert - a decorative,
+non-playable ring of land (20 cells, then flat sand to the horizon) that continues the map's own edge (mirrored
+terrain: rock goes on as rock, sand as sand, cliffs keep going, an edge base stands on a larger plateau; no seam)
+and blends into procedural plateaus, mesas, outcrops and dunes with the same light, shadows, haze and a sparse
+ground clutter. The land beyond is a little darker and greyer with a faint line along the edge, takes the shroud of
+the nearest edge cell (black until explored) and never hides the battlefield. The 3D camera may scroll 5 cells past
+each edge (2D and 3D without it: the old clamp). A click or the moving pointer out there shows a small red cross
+briefly; orders, picking and the game logic are unchanged. Off = the old black void. docs/3d-mode.md "World beyond
+the map". **Realistic grade** (Reimagined only, render only, off by default since 2026-11-21 - vivid is the default look; optional;
+Options → Graphics → 3D and the in-game options in 3D; settings.ini `naturalGrade` on|off, `--natural-grade`, env
+`D2K_GRADE_OFF=1`): batch 1 of the audit against the Defcon Zero trailers (docs/reimagined-audit.md) - dark, worn
+objects on a pale, calm ground instead of cream models on orange sand. A colour grade of the 3D picture (saturation
+-22 %, a filmic toe, cooler shadows; the Modern day's orange sun a pale straw yellow); the ground palette pale ochre
+sand, rust / cinnamon spice (thick darker than thin), buildable rock with 40 % less contrast, calmer cliffs, grey
+concrete; models a third darker with their house colours kept as accents and fine sand dust on up-facing surfaces
+and over their foot; ground occlusion round buildings and walls (in the terrain's splat, rebuilt only when buildings
+change) and a soft blot under every ground unit; sand lying raggedly over the edges of concrete slabs. No new
+assets, no measurable frame cost. Off = the vivid look from before, unchanged. docs/3d-mode.md "Realistic grade".
+**Photo terrain** (Reimagined only, render only, on by default; Options → Graphics → 3D and the in-game options in
+3D; settings.ini `photoTerrain` on|off, `--photo-terrain`, env `D2K_PHOTO_OFF=1`): the ground's detail is real
+photographed ground - seven CC0 Poly Haven scans (fine sand, wind-rippled sand, stony sand, cracked sandstone,
+fractured rock, layered sandstone on the cliff faces, weathered concrete) instead of the procedural ripples, pebble
+dots, cracks and brick-like strata. The palette, the layout and the spice (still procedural, thick darker than thin)
+stay; no visible repeat at any zoom; not slower. Needs the photo terrain pack (`artpacks/photo-terrain`, 78 MB, not
+in git: `.venv/bin/python -I tools/fetch_photo_terrain.py`); without it the procedural ground is drawn.
+docs/3d-mode.md "Photo terrain". **Ambient occlusion** (Reimagined only, render only, on by default; same pages;
+settings.ini `ambientOcclusion` on|off, `--ambient-occlusion`, env `D2K_SSAO_OFF=1`): screen-space ambient occlusion
+at half resolution - soft dark creases where buildings meet the ground and between their parts, under hulls, in
+cliff crevices and between rocks - on the sky light only (the sun's light is untouched), combined with the Realistic
+grade's building occlusion rather than added to it; +0.35 ms at 1280 x 800. docs/3d-mode.md "Ambient occlusion".
+**Vehicle wrecks** (Reimagined with Modern effects and 3D models, render only, on by default; Options → Graphics →
+3D and the in-game options in 3D; settings.ini `vehicleWrecks` on|off, `--vehicle-wrecks`, env `D2K_WRECKS_OFF=1`):
+a destroyed ground vehicle no longer just vanishes in its explosion. The fireball is half as big again and cooks
+off, hot debris flies in arcs, and the vehicle's own model stays 7-10 s as a charred hulk with ember veins, small
+flames and a thin smoke column - a tank's turret is blown off and lands beside it - then sinks and crumbles away,
+leaving the scorch mark and a little debris. The unit itself is removed and its cell freed exactly as in the
+original (no game-logic change); a hulk a live unit drives into crumbles at once. Timed in real seconds (the same
+at any GameSpeed), at most 24 hulks. Off = the old death. Infantry: unchanged. docs/3d-mode.md "Vehicle wrecks".
+**Aircraft crashes** (the same setting, 2026-11-18): a destroyed ornithopter or carryall no longer vanishes in
+mid-air. It takes a fire burst on the hull, loses control and falls for 0.7-1.6 s along its heading - the
+ornithopter in a winding flat spin, banking over; the carryall nose down, rolling slowly - dragging fire and a
+black-to-grey smoke trail, its shadow running in to the impact point; it hits the ground 1-2 tiles on (always
+inside the map, not on a building when there is room) with an explosion, a dust ring, debris and a scorch mark and
+lies there 4.5-5.5 s as a small burning hulk that crumbles away. What a carryall carried falls with it; a vehicle
+gets its own hulk beside the carrier's. Render only: the original removes the flyer and its cargo at the hit, and
+that is unchanged (no damage where it falls). Checks: `D2K_VFX_DEMO=crash`. docs/3d-mode.md "Aircraft crashes".
 
 ## Render resolution, iPad
 Options → *Render*: **Auto** / Full / Half (settings.ini `renderResolution`, `--render-resolution`; applies at the
@@ -495,11 +581,16 @@ Both schemes:
 | Placement | left click places (green = valid), right click / Esc cancels |
 | S / D | stop / deploy MCV |
 | Ctrl+1..9 / 1..9 | assign / recall control groups |
-| M | toggle debug markers (spawn points, worm spawners, blooms) |
+| (Cheats → Toggles) | debug markers, hide the shroud (view only) — no longer on the M / F keys |
 | Esc / P | cancel placement / pause menu (with in-game options) |
-| F | toggle the shroud |
 | Tab (Enhanced / 3D) | classic view: the battlefield in the original 1998 graphics while held (Options → Classic view key: Off / Hold / Toggle) |
 | Ctrl+Shift+C | cheats page (again: close); only with the Cheats option on |
+| **Attack-move** (not original; Options → Attack-move (A): On in the Enhanced / 3D presets, Off in Original; Graphics: Original players set `attackMove=1` in settings.ini — the original option pages have no free row) | **Original**: hold **A** + left click on the ground; **Modern**: hold **A** + right click, or press **A** then left click (StarCraft style; Esc or a right click drops it). Also on the minimap / radar. The cursor shows the attack ring while A is active; the order ring is orange (Enhanced / 3D; Original: the usual puff). The selected units (Order limit applies) walk to the cell; every check tick (each 8th tick per unit) an armed ground unit looks for the nearest enemy unit in weapon range (the original FindNearestEnemy), else whoever just shot it (within 8 tiles), else an enemy turret / building in range, and attacks it with the original attack states (chasing at most 8 tiles from where the fight began); when it is dead or out of reach the unit walks on; at the cell it guards. An enemy under the cursor is simply attacked. Unarmed units (harvesters, MCV, engineers) and aircraft just move. The original has nothing like it: its moving units only fire while waiting for a blocked cell (re/notes/combat.md §1). `src/game/attack_move.cpp` (queued orders, saved state) |
+| **Smooth camera** (not original; Options → Smooth camera: On in the Enhanced / 3D presets, Off in Original — the original scrolling stays exact; settings.ini `smoothCamera`, `--smooth-camera on/off`) | Render / input only (`src/render/camera_smooth.*`, `Session::applyCameraSmoothing`; the simulation never sees it). **Scrolling**: arrow keys / screen edges speed up and slow down over ~0.18 s (exponential, same top speed as Scroll speed). **Right drag** (iPad: one-finger pan) moves the map 1:1; let go while moving and it coasts (70 % of the speed, 0.15 s time constant, capped), let go after resting (>60 ms) and it stops. Momentum stops at the map edges (no push / overshoot). **Wheel zoom** (2D): the wanted zoom changes at once, the shown zoom glides there in ~0.14 s, re-anchored at the cursor every frame so the ground point under it stays put; a pinch still follows the fingers 1:1. **Minimap click / drag** (2D): a ~0.2 s glide when the target is within 1.5 views, else a cut. **Control group key pressed twice** (within 0.4 s): centres the view on the group (glide when near). **3D**: Q/E turn and Page Up/Down tilt rates ease in / out; zoom, jumps and turns were already eased by the 3D camera (`render3d::Camera3D`, ~0.06-0.09 s). **Units** (Enhanced / 3D, with Smooth unit motion): the drawn positions of ground units follow the tick interpolation through a 0.04 s exponential, so vehicles ease into and out of motion instead of starting / stopping at full speed in one tick (they trail the simulation by speed × 0.04 s, never lead it; jumps > 1.5 tiles snap). Turning is eased by the Modern effects (32 facings → continuous, shortest arc; `Effects::UnitVisual`). Clicks / box selection / 3D picking use the drawn positions (`MotionInterpolator::applyDrawn` / `toSim`), so what is on screen is what gets picked. Every step is the exact exponential for its dt: the same motion at 60 / 120 / 144 Hz (game_test `testCameraSmooth`). Debug: `D2K_DEMO_INPUT` (scripted wheel / keys / drags / minimap clicks) and `D2K_CAMERA_LOG=file.csv` (per-frame camera). |
+| **Smooth driving** (not original; Options → Graphics, next to Vehicle animation: On in the Enhanced / 3D presets, Off in Original; needs Smooth unit motion; ignored with Graphics: Original; settings.ini `smoothDriving`, `--smooth-driving on/off`) | Render only (`src/render/smooth_drive.*`, called from `MotionInterpolator::apply`; the simulation never sees it - world hash and Original screenshots identical). The original drives tile centre to tile centre in 8 directions, stops and turns in place at corners of 90° or more, and its facings / turrets jump between 32 steps. **Path**: corners of a route (45 / 90 / 135°) are drawn as a quadratic Bezier through the corner tile's centre (radius ≤ 14 px, ≤ ~6 px from the corner; the drawn position stays ≤ 8 px from the simulated one, game_test `testSmoothDrive`). The corner ahead comes from the unit's own route (`Route[RouteSteps-1]`, `BlockTo` while turning); one only learned after the vehicle already drove up to the corner (a new move order at a waypoint, a new 13-cell route chunk) is not curved - it pivots there as the original. **Turning in place**: the turn's progress (its facing, interpolated between steps with the turn delay counter) moves the vehicle along the middle of the curve, so it creeps round while pivoting instead of stop-turn-go. **Speed**: eases down into a corner and up out of it (Hermite time warps of the curve), on top of the Smooth camera start / stop ease. **Body**: faces the curve's tangent / the leg it drives (not the sim's lagging facing when it turns while driving), else the sim facing between its steps; never faster than 1.5x the sim's turn rate. **Turret**: the sim's turret facing interpolated between its 32 steps at exactly the sim's rate (`TurretTurnDelay`), independent of the drawn body; fixed barrels follow the drawn body. **Lean**: Vehicle animation: Modern rolls the hull out of the curves it now really drives (~3° in a tile-radius corner) and dips the nose as it brakes into a corner. **3D**: wheel / sprocket / idler nodes turn with the distance driven, a low bob over rock (docs/3d-mode.md "Smooth driving in 3D"). A prediction that turns out wrong (re-planned route) is blended out over ~0.1 s. Picking uses the drawn positions (as Smooth camera). Not done: infantry (sub-cell spots, 8-frame sprites). Recordings: `~/Desktop/d2k-compare/smooth-tanks/`; demo `D2K_VFX_DEMO=route --vfx-demo --at 30 40` on H5V1; debug `D2K_DRIVE_LOG=file.csv` (per frame drawn position / facings of side 0's first units), `D2K_DRIVE_DEBUG=<unit index>` (path state on stderr). **Wheels and tracks** (3D, both model packs): the wheels turn and the track links run by the distance driven, the two sides counter-running in turns (docs/3d-models.md "Wheels and tracks"; recordings `~/Desktop/d2k-compare/wheels-tracks/`). |
+| **Unit movement: Modern** (not original; a game rule chosen per game: skirmish lobby row, Options → Unit movement (new games) for campaign / custom missions; the Enhanced / 3D presets set Modern, the Original preset Original (owner 2026-11-16); saved with the game; settings.ini `unitMovement`, `--movement original|modern`) | Ground vehicles drive free-angle string-pulled A* paths (straight lines at any angle), turn while driving at the original turn rate (tracked pivot for sharp turns, wheeled arc), accelerate / brake towards the original terrain speed (same time per tile of Chebyshev distance as the original at any heading), stop exactly on the goal tile's centre. No tile reservation: a vehicle owns the cell under its centre with the original cell bits, brakes for / follows the vehicle ahead, slides past clipped corners, asks idle friends to make room, re-plans round blockers. A group move order spreads the vehicles over their own tiles round the target; a taken goal tile near the end becomes the nearest free one. Attack states chase, brake to a stop when in range and fire with the original rules; the turret aims at the target while the hull drives. Harvester cycles, repair pads, carryalls, deploy, rally points, attack-move, AI orders unchanged. Infantry / aircraft / worms: original movement. Original stays bit-exact (simtest hash unchanged). `src/game/modern_move.cpp`, docs/modern-movement.md; recordings `~/Desktop/d2k-compare/modern-movement/`. |
+| **Building placement: Assemble** (not original; Options → Graphics → 3D: Rise from rock / Drop-in / Assemble; Assemble in the Enhanced / 3D presets since 2026-11-16 - an old settings.ini with the preset's `dropin` moves to it; settings.ini `buildingPlacement` rise\|dropin\|assemble, `--building-placement`) | Graphics: 3D with building models (also the Reimagined models): during the original build-up time (same counter, render only) a placed building is built up from the ground part by part, after the Defcon Zero reference: a glowing survey outline + dust on the footprint, then the model's pieces (6-22 parts found from its connected triangle islands) bottom-up - the foundation and big blocks extrude behind a glowing cut, roof units are lowered in, side modules slide out of the core, masts swing up on a hinge, small units telescope out of the roof; sparks along the cuts, a weld flash + spark burst + dust where each part seats, the lamps come on at the end; selling plays it backwards. Buildings standing at the start / in a loaded save are drawn finished. docs/3d-mode.md "Assemble build-up". |
+| **Building placement: Drop-in** (Options → Graphics → 3D; `--building-placement dropin`) | Graphics: 3D with building models: during the original build-up time (same counter, render only) a placed building comes down folded, lands with a dust ring, pebbles and a thud (S_BUILDCONC), unfolds bottom-up and switches its lamps on; the construction yard unfolds from the ground; selling plays it backwards. docs/3d-mode.md "Drop-in build-up". |
 | Rally point (not original; Options → Factory rally points, default On) | select one own factory (barracks, light/heavy factory, high-tech, WOR, starport) with no units selected, then **Original**: Alt+left click on the ground (plain left/right clicks keep their original meaning — right click still deselects); **Modern**: right click on the ground. The same click on the factory itself clears it. The selected factory shows a flag and a dashed line. Units leaving it (and frigate deliveries to that starport) drive there once out; harvesters only follow a point on spice (`src/game/rally.cpp`, orders + saved state) |
 
 ## Cheats

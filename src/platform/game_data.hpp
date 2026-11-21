@@ -53,6 +53,10 @@ struct GameStart {
     // "Play as any side" (not original; docs/play-as.md): the side the human plays in a mission
     // (campaign / custom / community); -1 = the mission's own side (SideId). Chosen per start.
     int playAsSide = -1;
+    // "Unit movement" (not original; game/modern_move.cpp): -1 = from Settings::modernMovement when
+    // the game starts (App::startGame resolves it), 0 Original, 1 Modern. Saved (SaveMeta).
+    int movement = -1;
+    bool modernMovement() const { return movement == 1; }
 };
 
 // A side the player can take in a mission ("Play as"): sides that start with units or

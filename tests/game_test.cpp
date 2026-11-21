@@ -11,7 +11,11 @@
 #include "formats/tileatr.hpp"
 #include "formats/vars.hpp"
 #include "game/geometry.hpp"
+#include "render/camera_smooth.hpp"
 #include "render/lighting.hpp"
+#include "render/motion.hpp"
+#include "render/smooth_drive.hpp"
+#include "render3d/model_texture.hpp"
 #include "platform/resolution3d.hpp"
 #include "render3d/lights.hpp"
 #include "game/pathfind.hpp"
@@ -2699,8 +2703,8 @@ void testSaveRoundTrip() {
             SaveWriter v6;
             v6.bytes(kSaveMagic, 8);
             v6.u32(6);
-            v6.u32(metaLen - 5);  // u8 kind + i32 missionNumber
-            v6.bytes(meta.data(), metaLen - 5);
+            v6.u32(metaLen - 6);  // u8 kind + i32 missionNumber (v7) + u8 modernMovement (v10)
+            v6.bytes(meta.data(), metaLen - 6);
             v6.u32(worldLen);
             v6.bytes(world.data(), world.size());
             v6.u64(fnv1a64(v6.data()));
@@ -2721,7 +2725,7 @@ void testSaveRoundTrip() {
             const std::uint32_t worldLen = r.u32();
             const auto world = r.take(worldLen);
             std::vector<std::uint8_t> metaBytes(meta.begin(), meta.end());
-            metaBytes[metaLen - 5] = 1;  // kind = CampaignMap
+            metaBytes[metaLen - 6] = 1;  // kind = CampaignMap (then missionNumber, modernMovement)
             SaveWriter f;
             f.bytes(kSaveMagic, 8);
             f.u32(kSaveVersion);
@@ -3304,6 +3308,135 @@ void testReinforcementSaveRoundTrip() {
         w->tick();
     }
     CHECK(countUnits(w->sides()[1], kTrike) == 2 && countUnits(w->sides()[1], kTank) == 2);
+}
+
+// Attack-move (attack_move.cpp, not original): a tank sent past enemy vehicles engages each one
+// that comes into weapon range, then goes on and guards at the destination. A plain move order on
+// the same layout passes them without a shot (the original's moving units never auto-target).
+void testAttackMove() {
+    CombatFixture f;
+    auto make = [&]() {
+        auto w = f.world(40, 12);
+        w->addUnit(0, kTank, 2, 5, 2, 5);
+        w->addUnit(1, kDummy, 12, 7, 12, 7);  // 2 tiles off the route
+        w->addUnit(1, kDummy, 24, 3, 24, 3);
+        return w;
+    };
+    // Plain move: both targets survive.
+    {
+        auto w = make();
+        const int a = w->sides()[0].firstUnit;
+        w->orderMove(0, a, 34, 5);
+        for (int k = 0; k < 900; ++k) w->tick();
+        CHECK(w->sides()[0].units[a].blockFromX == 34);
+        int alive = 0;
+        for (int i = w->sides()[1].firstUnit; i != -1; i = w->sides()[1].nextObject(i))
+            if (w->sides()[1].units[i].state != UnitState::Dead) ++alive;
+        CHECK(alive == 2);
+        CHECK(w->attackMoves().empty());
+    }
+    // Attack-move: both die, the tank arrives and guards.
+    auto w = make();
+    const int a = w->sides()[0].firstUnit;
+    w->sides()[0].units[a].selected = true;
+    CHECK(w->orderGroupAttackMove(0, 34, 5) == 1);
+    w->tick();
+    CHECK(w->isAttackMoving(0, a));
+    int engagedTicks = 0, firstKill = -1, secondKill = -1, arrived = -1;
+    for (int k = 1; k <= 1500 && arrived < 0; ++k) {
+        w->tick();
+        const Unit& u = w->sides()[0].units[a];
+        if (u.state == UnitState::AttackingUnit) ++engagedTicks;
+        if (w->sides()[1].unitsLost >= 1 && firstKill < 0) firstKill = k;
+        if (w->sides()[1].unitsLost >= 2 && secondKill < 0) secondKill = k;
+        if (u.state == UnitState::Guarding && u.blockFromX == 34 && u.blockFromY == 5) arrived = k;
+    }
+    std::printf("attack-move: kills at ticks %d / %d, at the destination (guarding) at %d, %d ticks engaged\n",
+                firstKill, secondKill, arrived, engagedTicks);
+    CHECK(firstKill > 0 && secondKill > firstKill);
+    CHECK(arrived > secondKill);
+    CHECK(engagedTicks > 0);
+    CHECK(w->sides()[0].unitsKilled == 2);
+    CHECK(w->attackMoves().empty());
+    const Unit& g = w->sides()[0].units[a];
+    CHECK(g.rememberX == 34 && g.rememberY == 5);
+    // A new order ends an attack-move; an unarmed unit just moves (no record).
+    {
+        auto w2 = make();
+        const int t = w2->sides()[0].firstUnit;
+        w2->orderAttackMove(0, t, 34, 5);
+        w2->tick();
+        CHECK(w2->isAttackMoving(0, t));
+        w2->orderStop(0, t);
+        w2->tick();
+        CHECK(!w2->isAttackMoving(0, t));
+        const int d = w2->addUnit(0, kDummy, 2, 8, 2, 8);
+        w2->orderAttackMove(0, d, 10, 8);
+        w2->tick();
+        CHECK(!w2->isAttackMoving(0, d) && w2->sides()[0].units[d].state == UnitState::Moving &&
+              w2->sides()[0].units[d].targetX == 10);
+    }
+    // Leash: a fast target that runs away is chased at most kAttackMoveLeash tiles, then the tank
+    // goes on to its destination.
+    {
+        CombatFixture f2;
+        f2.templates->bin.units[kDummy].speed = 0x100000;  // 16 px/tick
+        auto w3 = f2.world(40, 40);
+        const int t = w3->addUnit(0, kTank, 2, 5, 2, 5);
+        const int d = w3->addUnit(1, kDummy, 6, 7, 6, 7);
+        w3->orderAttackMove(0, t, 34, 5);
+        bool chased = false, fled = false;
+        int maxY = 0, arrivedAt = -1;
+        for (int k = 1; k <= 2000 && arrivedAt < 0; ++k) {
+            const Unit& u = w3->sides()[0].units[t];
+            if (!fled && u.state == UnitState::AttackingUnit) {
+                chased = true;
+                fled = true;
+                w3->orderMove(1, d, 6, 38);
+            }
+            w3->tick();
+            maxY = std::max(maxY, w3->sides()[0].units[t].blockFromY);
+            if (u.state == UnitState::Guarding && u.blockFromX == 34) arrivedAt = k;
+        }
+        std::printf("attack-move leash: chased to row %d, at the destination at tick %d\n", maxY, arrivedAt);
+        CHECK(chased);
+        CHECK(maxY <= 5 + World::kAttackMoveLeash + 2);
+        CHECK(arrivedAt > 0);
+    }
+}
+
+// Save / load in the middle of an attack-move (the records and the engaged state are saved).
+void testAttackMoveSaveRoundTrip() {
+    CombatFixture f;
+    auto make = [&]() {
+        auto w = f.world(40, 16);
+        for (int i = 0; i < 3; ++i) w->addUnit(0, i == 1 ? kInfantry : kTank, 2, 4 + 3 * i, 2, 4 + 3 * i);
+        w->addUnit(1, kDummy, 12, 6, 12, 6);
+        w->addUnit(1, kDummy, 20, 9, 20, 9);
+        w->addUnit(1, kTrike, 28, 7, 28, 7);
+        return w;
+    };
+    auto orders = [](World& w, std::uint32_t step) {
+        if (step == 3)
+            for (int i = w.sides()[0].firstUnit; i != -1; i = w.sides()[0].nextObject(i)) w.orderAttackMove(0, i, 36, 7);
+        if (step == 400)  // a fresh attack-move after the save, too
+            for (int i = w.sides()[0].firstUnit; i != -1; i = w.sides()[0].nextObject(i)) w.orderAttackMove(0, i, 5, 12);
+    };
+    // Saved at tick 120: the tanks are engaged / on their way.
+    auto r = saveRoundTrip(make, 120, 1200, orders, 25);
+    reportRoundTrip("attack-move", r);
+    auto w = make();
+    for (std::uint32_t k = 0; k < 120; ++k) {
+        orders(*w, k);
+        w->tick();
+    }
+    CHECK(!w->attackMoves().empty());
+    // A world that never attack-moved saves the same bytes as before version 9 (no tail).
+    auto plain = make();
+    const auto before = saveWorldState(*plain);
+    plain->orderAttackMove(0, plain->sides()[0].firstUnit, 30, 7);
+    plain->tick();
+    CHECK(saveWorldState(*plain).size() > before.size());
 }
 
 // ---- Community extended event system (game/mission_ext.cpp, docs/extended-events.md) -------
@@ -3975,6 +4108,528 @@ void testPlayAs() {
 #endif
 }
 
+// Smooth camera (render/camera_smooth.hpp): render / input only. The eased motion must not depend
+// on the frame rate (60 / 120 / 144 Hz and uneven frames end at the same place), the scroll eases
+// in and out, the zoom glide ends exactly on its target, and a drag that rested gives no flick.
+// Smooth driving (render/smooth_drive.hpp): a tank driving a route with corners, drawn at 3 frames
+// per tick. The drawn position stays within 8 px of the tick-interpolated one, leaves the straight
+// 8-direction legs at the corners, the drawn heading turns without jumps, and the simulation is
+// bit-identical to a run without it (positions restored after every frame).
+// ---------------------------------------------------------------------------------------
+// "Unit movement: Modern" (game/modern_move.cpp, docs/modern-movement.md)
+
+int vehicleCellCount(const World& w) {
+    int n = 0;
+    for (int y = 0; y < w.height(); ++y)
+        for (int x = 0; x < w.width(); ++x) n += (w.cell(x, y).flags & cell_flags::kVehicle) != 0;
+    return n;
+}
+
+// A straight drive at an angle that is not a multiple of 45 degrees: the hull points along the
+// line (fine heading), the track stays on the line (no 8-way staircase), and the tank stops
+// exactly at the target tile's centre.
+void testModernDiagonal() {
+    Fixture f;
+    auto w = f.world(32, 32);
+    w->setModernMovement(true);
+    const int i = w->addUnit(0, kTank, 2, 2, 2, 2);
+    w->orderMove(0, i, 20, 11);
+    const Unit& u = w->sides()[0].units[i];
+    // The line from (2,2) to (20,11) centres: direction (18, 9) tiles.
+    const double lx = 18, ly = 9, ll = std::sqrt(lx * lx + ly * ly);
+    double maxOff = 0;
+    int t = 0, headingSeen = -1;
+    for (t = 1; t <= 600; ++t) {
+        w->tick();
+        const double px = u.posX / 65536.0 - (2 * 32 + 16), py = u.posY / 65536.0 - (2 * 32 + 16);
+        maxOff = std::max(maxOff, std::abs(px * ly - py * lx) / ll);
+        if (t == 60) headingSeen = u.mm.heading;
+        CHECK(vehicleCellCount(*w) == 1);
+        if (u.state == UnitState::Idle) break;
+    }
+    std::printf("modern: diagonal 18x9 tiles in %d ticks, max %.2f px off the line, heading %d (line %d)\n", t, maxOff,
+                headingSeen, int(std::lround(std::atan2(lx, -ly) * 32768 / 3.14159265)) & 0xFFFF);
+    CHECK(u.state == UnitState::Idle && u.blockFromX == 20 && u.blockFromY == 11);
+    CHECK(u.posX == tileCentre(20) && u.posY == tileCentre(11));
+    CHECK(maxOff < 4.0);
+    // Heading along the line (atan2(dx, -dy) with screen y down: 18 east, 9 south = 116.6 degrees).
+    const int lineHeading = int(std::lround(std::atan2(lx, -ly) * 32768 / 3.14159265)) & 0xFFFF;
+    CHECK(std::abs(headingSeen - lineHeading) < 2 * 182);
+    CHECK((w->cell(20, 11).flags & 0xF) == 0x8 && (w->cell(2, 2).flags & 0x8) == 0);
+    // Straight-line time: ~ distance / speed (2 px/tick) plus the turn and the ramps.
+    const double dist = std::sqrt(18.0 * 18 + 9 * 9) * 32;
+    CHECK(t < int(dist / 2) + 60);
+}
+
+// Ten tanks through a 2-tile gap in a wall to a point beyond it: no deadlock, every tank on its
+// own tile round the target, never two vehicles on one cell.
+void testModernGroupChoke() {
+    Fixture f;
+    auto w = f.world(40, 24);
+    w->setModernMovement(true);
+    for (int y = 0; y < 24; ++y)
+        if (y != 11 && y != 12) w->cell(20, y).flags = 0;
+    std::vector<int> ids;
+    for (int k = 0; k < 10; ++k) ids.push_back(w->addUnit(0, kTank, 4 + (k % 5) * 2, 6 + (k / 5) * 3, 4 + (k % 5) * 2, 6 + (k / 5) * 3));
+    for (int id : ids) w->orderMove(0, id, 31, 16);
+    int t = 0;
+    bool allIdle = false;
+    for (t = 1; t <= 4000 && !allIdle; ++t) {
+        w->tick();
+        CHECK(vehicleCellCount(*w) == 10);
+        allIdle = true;
+        for (int id : ids) allIdle = allIdle && w->sides()[0].units[id].state == UnitState::Idle;
+        if (std::getenv("D2K_MODERN_DEBUG") && (t % 25 == 0 || t == 1)) {
+            std::printf("t=%d", t);
+            for (int id : ids) {
+                const Unit& u = w->sides()[0].units[id];
+                std::printf(" [%d %d,%d (%d,%d) s%d st%d sp%x stall%d T%d,%d wp%d/%d]", id, u.blockFromX, u.blockFromY, u.posX >> 16,
+                            u.posY >> 16, int(u.state), u.posSteps, u.mm.speed, u.mm.stall, u.targetX, u.targetY, u.mm.wpIndex, u.mm.wpCount);
+            }
+            std::printf("\n");
+        }
+    }
+    int far = 0, maxR = 0;
+    for (std::size_t a = 0; a < ids.size(); ++a) {
+        const Unit& u = w->sides()[0].units[ids[a]];
+        far += u.blockFromX > 20;
+        maxR = std::max(maxR, chebyshev(u.blockFromX, u.blockFromY, 31, 16));
+        for (std::size_t b = a + 1; b < ids.size(); ++b) {
+            const Unit& v = w->sides()[0].units[ids[b]];
+            CHECK(!(u.blockFromX == v.blockFromX && u.blockFromY == v.blockFromY));
+        }
+    }
+    std::printf("modern: 10 tanks through a 2-tile gap: all idle after %d ticks, %d beyond the wall, spread %d tiles\n", t, far,
+                maxR);
+    CHECK(allIdle);
+    CHECK(far == 10);
+    CHECK(maxR <= 3);
+}
+
+// Two vehicles of a side meeting head-on (owner report 2026-11-19: two tanks next to a cliff
+// side-stepping in lockstep): in the open, and inside a 1-tile corridor through a thick wall. One
+// of them (the higher pool index) pulls over off the other's lane and waits, the other holds; both
+// reach their goals, never two vehicles on one cell.
+void testModernHeadOn() {
+    auto run = [](const char* name, bool corridor, int ax, int bx, int y, int limit) {
+        Fixture f;
+        auto w = f.world(32, 21);
+        w->setModernMovement(true);
+        if (corridor)
+            for (int yy = 0; yy < 21; ++yy)
+                for (int x = 13; x <= 17; ++x)
+                    if (yy != y) w->cell(x, yy).flags = 0;
+        const int a = w->addUnit(0, kTank, ax, y, ax, y);
+        const int b = w->addUnit(0, kTank, bx, y, bx, y);
+        w->orderMove(0, a, bx, y);
+        w->orderMove(0, b, ax, y);
+        const Unit& ua = w->sides()[0].units[a];
+        const Unit& ub = w->sides()[0].units[b];
+        int t = 0;
+        bool done = false;
+        for (t = 1; t <= limit && !done; ++t) {
+            w->tick();
+            CHECK(vehicleCellCount(*w) == 2);
+            CHECK(!(ua.blockFromX == ub.blockFromX && ua.blockFromY == ub.blockFromY));
+            done = ua.state == UnitState::Idle && ub.state == UnitState::Idle && ua.blockFromX == bx && ub.blockFromX == ax &&
+                   ua.blockFromY == y && ub.blockFromY == y;
+            if (std::getenv("D2K_MODERN_DEBUG") && t % 20 == 0)
+                std::printf("t=%d A(%d,%d) st%d stall%d fl%d  B(%d,%d) st%d stall%d fl%d\n", t, ua.posX >> 16, ua.posY >> 16,
+                            int(ua.state), ua.mm.stall, ua.mm.flags, ub.posX >> 16, ub.posY >> 16, int(ub.state), ub.mm.stall,
+                            ub.mm.flags);
+        }
+        std::printf("modern: head-on %s: %s after %d ticks (A at %d,%d, B at %d,%d)\n", name, done ? "both arrived" : "NOT arrived",
+                    t, ua.blockFromX, ua.blockFromY, ub.blockFromX, ub.blockFromY);
+        CHECK(done);
+    };
+    run("in the open", false, 6, 24, 10, 1500);
+    run("in a 1-tile corridor", true, 6, 24, 10, 2000);
+}
+
+// A harvester's whole cycle with Modern movement: from the field to the refinery dock (it stops
+// exactly on the dock tile's centre and docks facing south-east), unloads, drives back to spice.
+void testModernHarvesterCycle() {
+    EcoFixture fx;
+    auto w = fx.world(32, 32);
+    w->setModernMovement(true);
+    Side& s = w->sides()[0];
+    const int ri = w->addBuilding(0, kRefin, 6, 6, true, true);
+    CHECK(ri >= 0);
+    for (int y = 19; y <= 23; ++y)
+        for (int x = 19; x <= 23; ++x) w->cell(x, y).flags |= 0x200000;  // spice level 2
+    const int hi = w->addUnit(0, kHarv, 21, 21, 21, 21);
+    Unit& h = s.units[hi];
+    CHECK(h.state == UnitState::Harvesting && h.refineryIndex == ri);
+    int dx = 0, dy = 0;
+    for (int k = 0; k < 4; ++k) dx = 8, dy = 7;  // refinery (6,6) + exit point (2,1)
+    bool docked = false, back = false, dockExact = false;
+    int t = 0, maxVehicles = 0;
+    UnitState prev = h.state;
+    for (t = 1; t <= 12000 && !back; ++t) {
+        w->tick();
+        maxVehicles = std::max(maxVehicles, vehicleCellCount(*w));
+        if (h.state == UnitState::UnloadingSpice && !docked) {
+            docked = true;
+            dockExact = h.blockFromX == dx && h.blockFromY == dy && h.posX == tileCentre(dx) && h.posY == tileCentre(dy) &&
+                        h.facing == 12;
+            if (!dockExact)
+                std::printf("dock: at %d,%d px %d,%d facing %d (dock %d,%d)\n", h.blockFromX, h.blockFromY, h.posX >> 16, h.posY >> 16,
+                            h.facing, dx, dy);
+        }
+        if (docked && h.state == UnitState::Harvesting && prev == UnitState::MovingToHarvest) back = true;
+        prev = h.state;
+    }
+    std::printf("modern: harvester field -> dock (%s) -> unload -> field in %d ticks, spice harvested %d\n",
+                dockExact ? "exact" : "OFF", t, s.spiceHarvested);
+    CHECK(docked && dockExact && back);
+    CHECK(s.spiceHarvested == 700);
+    CHECK(maxVehicles == 1);
+    CHECK(w->cell(h.blockFromX, h.blockFromY).flags & 0x700000);  // back on spice
+}
+
+// Attack while moving: a tank chases a vehicle behind a wall; on the way round the wall its
+// turret tracks the target while the hull drives elsewhere, it stops to fire whenever the target
+// is in range (the original fires only standing), and follows the target when it moves on.
+void testModernAttackWhileMoving() {
+    CombatFixture f;
+    auto w = f.world(32, 32);
+    w->setModernMovement(true);
+    for (int y = 6; y < 32; ++y) w->cell(9, y).flags = 0;  // a wall: the way round it is to the north
+    const int a = w->addUnit(0, kTank, 3, 22, 3, 22);
+    const int d = w->addUnit(1, kDummy, 16, 24, 16, 24);
+    w->orderMove(1, d, 17, 12);
+    w->orderAttackUnit(0, a, 1, d);
+    const Unit& au = w->sides()[0].units[a];
+    const Unit& du = w->sides()[1].units[d];
+    int shots = 0, apart = 0, movingShots = 0;
+    for (int t = 1; t <= 600 && du.state != UnitState::Dead; ++t) {
+        w->tick();
+        if (au.reloadDelay == 10) {
+            ++shots;
+            movingShots += au.mm.speed != 0;
+        }
+        const int diff = std::abs(((au.facingTurret - au.facing) & 31) - 16);
+        if (std::getenv("D2K_MODERN_DEBUG") && t % 10 == 0)
+            std::printf("t=%d A %d,%d st%d ps%d sp%x f%d tf%d rl%d | D %d,%d st%d hp%d en%d\n", t, au.posX >> 16, au.posY >> 16, int(au.state),
+                        au.posSteps, au.mm.speed, au.facing, au.facingTurret, au.reloadDelay, du.posX >> 16, du.posY >> 16, int(du.state),
+                        du.health, au.enemyIndex);
+        if (au.mm.speed > 0 && diff < 13) ++apart;  // turret >= 3 steps off the hull while driving
+    }
+    std::printf("modern: attack while moving: %d shots (%d while rolling), turret off the hull for %d ticks, target %s\n", shots,
+                movingShots, apart, du.state == UnitState::Dead ? "destroyed" : "alive");
+    CHECK(shots >= 3);
+    CHECK(movingShots == 0);  // fires only standing, as the original
+    CHECK(apart > 5);
+    CHECK(du.state == UnitState::Dead || du.health < 400);
+}
+
+// Save / load in the middle of a Modern group move: identical continuation; the state hash
+// covers the modern state; two runs give the same hash.
+void testModernSaveRoundTrip() {
+    Fixture f;
+    auto make = [&f]() {
+        auto w = f.world(40, 24);
+        w->setModernMovement(true);
+        for (int y = 0; y < 24; ++y)
+            if (y != 11 && y != 12) w->cell(20, y).flags = 0;
+        for (int k = 0; k < 10; ++k) w->addUnit(0, kTank, 4 + (k % 5) * 2, 6 + (k / 5) * 3, 4 + (k % 5) * 2, 6 + (k / 5) * 3);
+        w->addUnit(0, kTrike, 10, 20, 10, 20);
+        return w;
+    };
+    auto script = [](World& w, std::uint32_t step) {
+        if (step == 0 || step == 300) {
+            const int tx = step == 0 ? 31 : 6, ty = step == 0 ? 16 : 4;
+            for (int i = w.sides()[0].firstUnit; i != -1; i = w.sides()[0].nextObject(i)) w.orderMove(0, i, tx, ty);
+        }
+        if (step == 120) w.orderMove(0, 989, 35, 2);  // the trike
+    };
+    const RoundTripReport r = saveRoundTrip(make, 140, 600, script, 20);  // saved mid-move
+    if (!r.ok) std::printf("modern save round trip: %s\n", r.error.c_str());
+    CHECK(r.ok);
+    // Determinism: a second run from scratch reaches the same state.
+    auto w1 = make(), w2 = make();
+    for (std::uint32_t k = 0; k < 500; ++k) {
+        script(*w1, k);
+        script(*w2, k);
+        w1->tick();
+        w2->tick();
+    }
+    CHECK(worldStateHash(*w1) == worldStateHash(*w2));
+    // The hash sees the modern state (speed / heading of a moving tank).
+    const std::uint64_t h = worldStateHash(*w1);
+    w1->sides()[0].units[999].mm.speed ^= 1;
+    CHECK(worldStateHash(*w1) != h);
+    // Original games save without the modern tail (and so hash as before).
+    auto o = f.world(16, 16);
+    o->addUnit(0, kTank, 2, 2, 2, 2);
+    const auto bytes = saveWorldState(*o);
+    o->setModernMovement(true);
+    CHECK(saveWorldState(*o).size() > bytes.size());
+    o->setModernMovement(false);
+    CHECK(saveWorldState(*o) == bytes);
+}
+
+// Data-backed Modern soak: campaign missions with their computer players and every armed ground
+// unit sent at the nearest enemy; occupancy stays consistent (no phantom / missing vehicle
+// cells, never two vehicles on one cell), object lists intact, and a save round trip.
+void testModernSoak() {
+#ifdef D2K_GAME_DATA_DIR
+    const std::string data = D2K_GAME_DATA_DIR, bin = data + "/bin";
+    if (formats::findFileNoCase(bin, "ARMOUR.BIN").empty()) return;
+    auto templates = std::make_unique<formats::Templates>(formats::loadTemplates(formats::findFileNoCase(bin, "Templates.bin")));
+    const auto speed = formats::loadSpeed(formats::findFileNoCase(bin, "SPEED.BIN"));
+    const auto armour = formats::loadArmour(formats::findFileNoCase(bin, "ARMOUR.BIN"));
+    const auto builexp = formats::readFile(formats::findFileNoCase(bin, "BUILEXP.BIN"));
+    const auto circles = formats::readFile(formats::findFileNoCase(bin, "CIRCLES.BIN"));
+    const auto vars = formats::loadVars(formats::findFileNoCase(bin, "VARS.BIN"));
+    const auto tileData = formats::loadTileData(formats::findFileNoCase(bin, "TILEDATA.BIN"));
+    struct Case { const char* name; int player; int ticks; };
+    for (const Case c : {Case{"A4V1", 0, 8000}, Case{"H5V1", 1, 8000}, Case{"O6V1", 2, 8000}, Case{"A8V1", 0, 6000}}) {
+        const std::string mapPath = formats::findFileNoCase(data + "/Missions", std::string(c.name) + ".MAP");
+        const std::string misPath = formats::findFileNoCase(data + "/maps", std::string("_") + c.name + ".MIS");
+        if (mapPath.empty() || misPath.empty()) continue;
+        const auto map = formats::loadMap(mapPath);
+        const auto mis = formats::loadMis(misPath);
+        const auto tileAtr = formats::loadTileAtr(formats::findFileNoCase(bin, mis.tileAttributes + ".BIN"));
+        Rules rules{templates.get(), &speed, &armour, nullptr, &builexp, &vars, &circles};
+        auto make = [&]() {
+            auto w = std::make_unique<World>(map, mis, tileAtr, tileData, rules, c.player);
+            w->setModernMovement(true);
+            return w;
+        };
+        auto w = make();
+        auto attackAll = [&](World& wd) {
+            for (int sd = 0; sd < kMaxSides; ++sd) {
+                Side& S = wd.sides()[sd];
+                for (int i = S.firstUnit; i != -1; i = S.nextObject(i)) {
+                    const Unit& u = S.units[i];
+                    if (wd.unitTemplate(u).primaryWeapon < 0 || (u.flags & 0x40) || wd.unitTemplate(u).specialBehavior != 0) continue;
+                    int best = 1 << 30, bs = -1, bi = -1;
+                    for (int es = 0; es < kMaxSides; ++es) {
+                        if (wd.diplomacy(sd, es) != 1) continue;
+                        const Side& E = wd.sides()[es];
+                        for (int j = E.firstUnit; j != -1; j = E.nextObject(j)) {
+                            const Unit& e = E.units[j];
+                            const int beh = wd.unitTemplate(e).specialBehavior;
+                            if ((e.flags & 0x400140) || beh == 5 || beh == 2 || beh == 8) continue;
+                            const int d = std::abs(e.blockFromX - u.blockFromX) + std::abs(e.blockFromY - u.blockFromY);
+                            if (d < best) { best = d; bs = es; bi = j; }
+                        }
+                    }
+                    if (bs >= 0) wd.orderAttackUnit(sd, i, bs, bi);
+                }
+            }
+        };
+        attackAll(*w);
+        int maxPhantom = 0, missing = 0, shared = 0, moved = 0;
+        bool listsOk = true;
+        std::vector<int> seen(static_cast<std::size_t>(w->width()) * w->height());
+        for (int k = 0; k < c.ticks; ++k) {
+            if (k == 3000) attackAll(*w);
+            w->tick();
+            if (k % 10 != 0) continue;
+            std::fill(seen.begin(), seen.end(), 0);
+            for (int sd = 0; sd < kMaxSides; ++sd) {
+                const Side& S = w->sides()[sd];
+                for (int i = S.firstUnit; i != -1; i = S.nextObject(i)) {
+                    const Unit& u = S.units[i];
+                    listsOk = listsOk && u.alive && S.links[i].kind == SlotKind::Unit;
+                    if (!w->isModernVehicle(u) || (u.flags & 0x400140) || u.state == UnitState::Dead) continue;
+                    moved += u.mm.speed != 0;
+                    const std::uint32_t f = w->cell(u.blockFromX, u.blockFromY).flags;
+                    if (!(f & cell_flags::kVehicle) || static_cast<int>(f & 7) != sd) ++missing;
+                    if (++seen[static_cast<std::size_t>(u.blockFromY) * w->width() + u.blockFromX] > 1) ++shared;
+                }
+            }
+            maxPhantom = std::max(maxPhantom, phantomVehicleCells(*w));
+        }
+        std::printf("modern soak %s (%d ticks): phantom %d, missing %d, shared %d, vehicle-samples moving %d\n", c.name, c.ticks,
+                    maxPhantom, missing, shared, moved);
+        CHECK(listsOk);
+        CHECK(maxPhantom == 0);
+        CHECK(missing == 0);
+        CHECK(shared == 0);
+        // Save / load mid-battle.
+        const int player = c.player;
+        const RoundTripReport r = saveRoundTrip(make, 1500, 1500, [player](World& wd, std::uint32_t step) { scriptedOrders(wd, player, step); });
+        if (!r.ok) std::printf("modern soak %s save round trip: %s\n", c.name, r.error.c_str());
+        CHECK(r.ok);
+    }
+#endif
+}
+
+void testSmoothDrive() {
+    Fixture f, f2;
+    auto w = f.world(20, 20), w2 = f2.world(20, 20);
+    const int i = w->addUnit(0, kTank, 2, 2, 2, 2), i2 = w2->addUnit(0, kTank, 2, 2, 2, 2);
+    w->orderMove(0, i, 12, 7);  // Bresenham: diagonal and straight steps (45 degree corners)
+    w2->orderMove(0, i2, 12, 7);
+    d2k::render::MotionInterpolator mi;
+    d2k::render::SmoothDrive drive;
+    const Unit& u = w->sides()[0].units[i];
+    float maxOff = 0, maxTurn = 0, lastF = -1;
+    bool curved = false;
+    for (int t = 1; t <= 260; ++t) {
+        mi.beforeTick(*w);
+        const std::int32_t px = u.posX, py = u.posY;
+        w->tick();
+        w2->tick();
+        for (int k = 1; k <= 3; ++k) {
+            const float a = float(k) / 3;
+            const float ix = (float(px) + float(u.posX - px) * a) / 65536.0f, iy = (float(py) + float(u.posY - py) * a) / 65536.0f;
+            const std::int32_t sx = u.posX, sy = u.posY;
+            drive.beginFrame(double(w->gameTicks()) + a, a, 1.0f / 60);
+            mi.apply(*w, a, -1, &drive);
+            const float dx = float(u.posX) / 65536.0f - ix, dy = float(u.posY) / 65536.0f - iy;
+            maxOff = std::max(maxOff, std::hypot(dx, dy));
+            // Off both the horizontal and the diagonal leg through the interpolated point = on a curve.
+            if (std::hypot(dx, dy) > 1.0f) curved = true;
+            if (const auto* o = drive.out(0, i)) {
+                if (lastF >= 0) {
+                    float d = std::fmod(o->facing - lastF + 48.0f, 32.0f) - 16.0f;
+                    maxTurn = std::max(maxTurn, std::abs(d));
+                }
+                lastF = o->facing;
+            }
+            mi.restore(*w);
+            CHECK(u.posX == sx && u.posY == sy);
+        }
+    }
+    CHECK(u.blockFromX == 12 && u.blockFromY == 7);
+    CHECK(maxOff <= 8.01f);
+    CHECK(curved);
+    CHECK(maxTurn < 1.0f);  // < 11 degrees per frame
+    const Unit& u2 = w2->sides()[0].units[i2];
+    CHECK(u.posX == u2.posX && u.posY == u2.posY && u.facing == u2.facing && w->gameTicks() == w2->gameTicks());
+    CHECK(std::abs(d2k::render::SmoothDrive::facingOf(1, 0) - 8) < 1e-4f);
+    CHECK(std::abs(d2k::render::SmoothDrive::facingOf(0, 1) - 16) < 1e-4f);
+}
+
+// Model textures (render3d/model_texture.*, docs/memory.md): mip chains, BC1 / BC3 / BC5 blocks that decode
+// close to their source, exact 0 / 255 alpha (cut-out / opaque), levels dropped by texel density.
+void testModelTextures() {
+    using namespace d2k::render3d;
+    // A gradient block over 150 steps: 4 palette colours along it, so up to ~1/6 of the range off.
+    std::uint32_t px[16], out[16];
+    for (int i = 0; i < 16; ++i) px[i] = std::uint32_t(40 + i * 10) | (std::uint32_t(200 - i * 8) << 8) | (std::uint32_t(90) << 16) | 0xFF000000u;
+    std::uint8_t blk[8];
+    encodeBc1(px, blk);
+    decodeBc1(blk, out);
+    int worst = 0;
+    for (int i = 0; i < 16; ++i)
+        for (int k = 0; k < 24; k += 8) worst = std::max(worst, std::abs(int((px[i] >> k) & 0xFF) - int((out[i] >> k) & 0xFF)));
+    CHECK(worst <= 30);
+    // A flat block: exact (565 representable).
+    for (auto& p : px) p = 0xFF000000u | (0x84u << 16) | (0x82u << 8) | 0x84u;
+    encodeBc1(px, blk);
+    decodeBc1(blk, out);
+    CHECK((out[5] & 0xFFFFFFu) == (px[5] & 0xFFFFFFu));
+    // BC4: cut-out 0, opaque 255 and emission values in one block keep 0 and 255 exactly.
+    std::uint8_t a[16] = {0, 0, 255, 255, 255, 200, 180, 128, 0, 255, 255, 255, 140, 255, 0, 255}, ad[16];
+    encodeBc4(a, blk);
+    decodeBc4(blk, ad);
+    bool exact = true;
+    int aw = 0;
+    for (int i = 0; i < 16; ++i) {
+        if ((a[i] == 0 || a[i] == 255) && ad[i] != a[i]) exact = false;
+        aw = std::max(aw, std::abs(int(a[i]) - int(ad[i])));
+    }
+    CHECK(exact);
+    CHECK(aw <= 10);
+    // A 64 x 64 texture: chain down to 4 x 4 for BC (5 levels), to 1 x 1 for RGBA8 (7), sizes add up.
+    std::vector<std::uint32_t> img(64 * 64);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) img[std::size_t(y * 64 + x)] = std::uint32_t(x * 4) | (std::uint32_t(y * 4) << 8) | 0xFF000000u;
+    TexCaps bc;
+    bc.bc = true;
+    const PreparedTexture t1 = prepareTexture(img, 64, 64, TexKind::Color, 0, bc);
+    CHECK(t1.format == TexFormat::BC1 && t1.levels == 5 && t1.bytes() == std::size_t(8 * (256 + 64 + 16 + 4 + 1)));
+    const PreparedTexture t2 = prepareTexture(img, 64, 64, TexKind::Color, 0, TexCaps{});
+    CHECK(t2.format == TexFormat::RGBA8 && t2.levels == 7 && t2.levelOffset(1) == 64 * 64 * 4);
+    // Level 1 is the 2 x 2 box filter of level 0.
+    std::uint32_t l1;
+    std::memcpy(&l1, t2.data.data() + t2.levelOffset(1), 4);
+    CHECK((l1 & 0xFF) == 2 && ((l1 >> 8) & 0xFF) == 2);
+    img[0] = 0x7F000000u;  // one non-opaque texel: BC3
+    CHECK(prepareTexture(img, 64, 64, TexKind::Color, 0, bc).format == TexFormat::BC3);
+    CHECK(prepareTexture(img, 64, 64, TexKind::Normal, 0, bc).format == TexFormat::BC5);
+    // Texel density: a 1024 map at 64 texels per world px drops to 256 (16 per px), never below 256.
+    std::vector<std::uint32_t> big(1024 * 1024, 0xFF808080u);
+    CHECK(prepareTexture(big, 1024, 1024, TexKind::Color, 64.0f, TexCaps{}).w == 256);
+    CHECK(prepareTexture(big, 1024, 1024, TexKind::Color, 1000.0f, TexCaps{}).w == 256);
+    CHECK(prepareTexture(big, 1024, 1024, TexKind::Color, 20.0f, TexCaps{}).w == 1024);
+}
+
+void testCameraSmooth() {
+    using d2k::render::CameraSmoother;
+    // 0.5 s of held keys, then 0.5 s released, at a given frame rate: the distance covered.
+    auto run = [](double hz, bool uneven) {
+        CameraSmoother c;
+        double x = 0, t = 0;
+        int i = 0;
+        while (t < 1.0 - 1e-9) {
+            double dt = 1.0 / hz;
+            if (uneven) dt *= (i++ % 3 == 0) ? 1.6 : 0.7;
+            dt = std::min(dt, (t < 0.5 - 1e-9 ? 0.5 : 1.0) - t);  // (a frame boundary at the release)
+            float dx = 0, dy = 0;
+            c.scroll(t < 0.5 - 1e-9 ? 1200.0f : 0.0f, 0, float(dt), dx, dy);
+            x += dx;
+            t += dt;
+        }
+        return x;
+    };
+    const double x60 = run(60, false), x120 = run(120, false), x144 = run(144, false), xu = run(90, true);
+    if (std::getenv("D2K_TEST_VERBOSE")) std::printf("smooth scroll: %.3f %.3f %.3f %.3f\n", x60, x120, x144, xu);
+    CHECK(std::abs(x60 - x120) < 1.0 && std::abs(x60 - x144) < 1.0 && std::abs(x60 - xu) < 1.0);
+    CHECK(x60 > 590 && x60 < 610);  // the ease lags in and catches up out: ~the instant 600 px
+    {
+        CameraSmoother c;  // the first frame does not jump to full speed
+        float dx = 0, dy = 0;
+        c.scroll(1200, 0, 1.0f / 120, dx, dy);
+        CHECK(dx > 0 && dx < 0.5f * 1200 / 120);
+        for (int k = 0; k < 120; ++k) c.scroll(0, 0, 1.0f / 120, dx, dy);
+        CHECK(!c.moving());  // stopped within a second of the release
+    }
+    {
+        CameraSmoother c;  // zoom: ends on the target, monotonic, the same after 0.3 s at 60 / 144 Hz
+        auto zoomRun = [](double hz) {
+            CameraSmoother z;
+            z.zoomBy(1.1f * 1.1f, 1.0f, 100, 100, 0.25f, 4.0f);
+            float zoom = 1.0f;
+            for (double t = 0; t < 0.3; t += 1.0 / hz) {
+                const float n = z.zoomStep(zoom, float(1.0 / hz));
+                if (n < zoom) return -1.0f;
+                zoom = n;
+            }
+            return z.zooming() ? -2.0f : zoom;
+        };
+        CHECK(zoomRun(60) == zoomRun(144) && std::abs(zoomRun(60) - 1.21f) < 1e-5f);
+        c.zoomBy(10.0f, 1.0f, 0, 0, 0.25f, 4.0f);
+        CHECK(c.zoomTarget() == 4.0f);  // clamped
+    }
+    {
+        CameraSmoother c;  // a flick keeps moving; a rested drag does not
+        c.dragBegin();
+        for (int k = 0; k < 10; ++k) c.dragSample(10, 0, 1.0 + k / 120.0);
+        c.dragRelease(1.0 + 10 / 120.0, 5000);
+        CHECK(c.moving());
+        float dx = 0, dy = 0;
+        c.scroll(0, 0, 1.0f / 60, dx, dy);
+        CHECK(dx > 0);
+        c.dragBegin();
+        for (int k = 0; k < 10; ++k) c.dragSample(10, 0, 2.0 + k / 120.0);
+        c.dragRelease(2.0 + 10 / 120.0 + 0.2, 5000);
+        CHECK(!c.moving());
+    }
+    {
+        CameraSmoother c;  // glide: reaches the target in ~0.25-0.5 s whatever the frame rate
+        float x = 0, y = 0;
+        c.glideTo(400, -200);
+        for (int k = 0; k < 120 && c.gliding(); ++k) c.glideStep(x, y, 1.0f / 120);
+        CHECK(!c.gliding() && x == 400 && y == -200);
+    }
+}
+
 // Time of day / Modern lighting (render/lighting.hpp): pure, render-only model. Classic Day must be
 // the identity (the old look); the Cycle starts and ends on Day and passes through Night.
 void testLighting() {
@@ -4017,6 +4672,16 @@ int main() {
     }
     testRandom();
     testLighting();
+    testCameraSmooth();
+    testModelTextures();
+    testSmoothDrive();
+    testModernDiagonal();
+    testModernGroupChoke();
+    testModernHeadOn();
+    testModernHarvesterCycle();
+    testModernAttackWhileMoving();
+    testModernSaveRoundTrip();
+    testModernSoak();
     testGeometry();
     testObjectPool();
     testOrderLimit();
@@ -4089,6 +4754,8 @@ int main() {
     testCheatReinforcements();
     testRallyPoint();
     testReinforcementSaveRoundTrip();
+    testAttackMove();
+    testAttackMoveSaveRoundTrip();
     testAutoQueueCounts();
     testAutoQueueOrder();
     testAutoQueueCancel();

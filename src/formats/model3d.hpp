@@ -7,6 +7,9 @@
 // Unit models: origin = the unit's position on the ground; front towards -z (north) = facing 0.
 // Building models: see Anchor.
 
+#include "render3d/model_texture.hpp"
+
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -35,7 +38,24 @@ struct MeshVertex {
 
 struct MeshPart {
     std::vector<MeshVertex> tris;  // triangle list
-    bool empty() const { return tris.empty(); }
+    // Positions only (x, y, z per corner), once the full vertices are on the GPU (slim()): what picking,
+    // roofs and decks read afterwards (render3d/models.cpp; docs/memory.md).
+    std::vector<float> slimPos;
+    bool empty() const { return tris.empty() && slimPos.empty(); }
+    std::size_t corners() const { return tris.empty() ? slimPos.size() / 3 : tris.size(); }
+    const float* pos(std::size_t i) const { return tris.empty() ? &slimPos[i * 3] : tris[i].pos; }
+    // Keep only the positions (drops the 80-byte vertices).
+    void slim() {
+        if (tris.empty()) return;
+        std::vector<float> p(tris.size() * 3);
+        for (std::size_t i = 0; i < tris.size(); ++i) std::copy(tris[i].pos, tris[i].pos + 3, &p[i * 3]);
+        slimPos.swap(p);
+        std::vector<MeshVertex>().swap(tris);
+    }
+    void release() {
+        std::vector<MeshVertex>().swap(tris);
+        std::vector<float>().swap(slimPos);
+    }
 };
 
 struct Model3D {
@@ -53,6 +73,18 @@ struct Model3D {
     // The texture's alpha also carries glTF emission (render3d/model_gltf.cpp foldEmission): opaque
     // texels 128..255, 255 - 127 x emission; drawn glowing by model_fs (docs/3d-models.md "Emission").
     bool emissiveInAlpha = false;
+    // PBR maps of the Reimagined models (docs/3d-models.md "Reimagined models"; glTF normalTexture present):
+    // pbrTexture = R occlusion, G roughness, B metallic, A house-colour mask (RGBA8, R lowest byte);
+    // normalTexture = tangent-space normals (glTF convention: green = towards decreasing glTF v, as Blender
+    // bakes them); model_pbr_fs builds the tangent frame from screen derivatives. Both empty = model_fs.
+    int pbrW = 0, pbrH = 0, nrmW = 0, nrmH = 0;
+    std::vector<std::uint32_t> pbrTexture, normalTexture;
+    // GPU-ready versions (glTF packs, render3d/model_texture.hpp: mip chains, block-compressed where the
+    // device can sample it; docs/memory.md): when set, the raw vectors above are empty. The renderer
+    // frees them once they are on the GPU.
+    render3d::PreparedTexture colorTex, pbrTex, nrmTex;
+    bool pbr = false;  // has PBR maps (stays set after the textures were freed)
+    bool hasPbrMaps() const { return pbr || (!pbrTexture.empty() && !normalTexture.empty()); }
     MeshPart body;             // fixed to the object, turned by its facing
     MeshPart turret;           // turned by the turret facing about turretPivot (empty = none)
     MeshPart shadow;           // flat polygons at ground level, drawn as a darkening of the ground
@@ -77,6 +109,7 @@ struct Model3D {
     struct Skeleton {
         struct Node {
             int parent = -1;
+            std::string name;  // the glTF node's name (wheel_* / sprocket_* / idler_* spin with Smooth driving)
             float t[3] = {}, r[4] = {0, 0, 0, 1}, s[3] = {1, 1, 1};  // rest TRS (glTF: rotation x y z w)
         };
         struct Channel {
@@ -105,6 +138,9 @@ struct Model3D {
     // Body geometry per pose (pose variants whose meshes differ, e.g. the harvester's unload poses
     // variants/HARVESTER_unloadNN.glb): bodyPoses[k] replaces `body` in pose k (empty = none).
     std::vector<MeshPart> bodyPoses;
+    // A simplified version (Reimagined pack: KEY_lod1.glb next to KEY.glb, same nodes, UVs and textures),
+    // drawn when the object is small on screen. Empty = none.
+    MeshPart lodBody, lodTurret, lodHouse;
     bool empty() const { return body.empty() && turret.empty(); }
 };
 

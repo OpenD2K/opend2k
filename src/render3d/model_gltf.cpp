@@ -96,6 +96,34 @@ bool foldEmission(const cgltf_material& mat, formats::Model3D& m) {
     return any;
 }
 
+// The Reimagined models' PBR maps (docs/3d-models.md "Reimagined models"): only for a textured material
+// with a normalTexture (no other pack has one, so they load exactly as before). Model3D::pbrTexture =
+// R occlusion (from the metallicRoughness image when the occlusionTexture is that same image, else 1),
+// G roughness x roughnessFactor, B metallic x metallicFactor, A the house-colour mask (that image's
+// alpha: our convention, unused by glTF); normalTexture as stored.
+void loadPbrMaps(const cgltf_material& mat, formats::Model3D& m) {
+    if (!mat.normal_texture.texture || !mat.has_pbr_metallic_roughness) return;
+    if (!decodePng(mat.normal_texture.texture->image, m.nrmW, m.nrmH, m.normalTexture) || m.nrmW <= 0) {
+        m.normalTexture.clear();
+        return;
+    }
+    const auto& pbr = mat.pbr_metallic_roughness;
+    const float rf = std::clamp(pbr.roughness_factor, 0.0f, 1.0f), mf = std::clamp(pbr.metallic_factor, 0.0f, 1.0f);
+    const cgltf_image* mrImg = pbr.metallic_roughness_texture.texture ? pbr.metallic_roughness_texture.texture->image : nullptr;
+    const bool ao = mrImg && mat.occlusion_texture.texture && mat.occlusion_texture.texture->image == mrImg;
+    if (mrImg && decodePng(mrImg, m.pbrW, m.pbrH, m.pbrTexture) && m.pbrW > 0) {
+        for (std::uint32_t& p : m.pbrTexture) {
+            const std::uint32_t r = ao ? (p & 0xFF) : 255u;
+            const std::uint32_t g = std::uint32_t(std::lround(float((p >> 8) & 0xFF) * rf));
+            const std::uint32_t b = std::uint32_t(std::lround(float((p >> 16) & 0xFF) * mf));
+            p = r | (g << 8) | (b << 16) | (p & 0xFF000000u);
+        }
+        return;
+    }
+    m.pbrW = m.pbrH = 1;  // no map: the factors, full occlusion, no house mask
+    m.pbrTexture.assign(1, 255u | (std::uint32_t(std::lround(rf * 255)) << 8) | (std::uint32_t(std::lround(mf * 255)) << 16));
+}
+
 // A node's local TRS (glTF defaults; a matrix is decomposed, no shear assumed).
 void nodeTrs(const cgltf_node& n, float t[3], float r[4], float sc[3]) {
     t[0] = t[1] = t[2] = 0;
@@ -236,6 +264,7 @@ bool loadGltfModel(const std::string& path, const GltfAdjust& adj, formats::Mode
             texMat = &data->materials[i];
     }
     if (texMat) out.emissiveInAlpha = foldEmission(*texMat, out);
+    if (texMat) loadPbrMaps(*texMat, out);
     const float yaw = adj.yawDeg * 3.14159265f / 180.0f, cy = std::cos(yaw), sy = std::sin(yaw);
     auto place = [&](const float p[3], float o[3], bool dir) {
         const float x = p[0] * adj.scale, z = p[2] * adj.scale;
@@ -280,6 +309,7 @@ bool loadGltfModel(const std::string& path, const GltfAdjust& adj, formats::Mode
             const cgltf_node& n = data->nodes[ni];
             auto& o = sk.nodes[ni];
             o.parent = n.parent ? int(n.parent - data->nodes) : -1;
+            if (n.name) o.name = n.name;
             nodeTrs(n, o.t, o.r, o.s);
         }
         const float sc = adj.scale * kTile;
@@ -474,6 +504,33 @@ bool loadGltfModel(const std::string& path, const GltfAdjust& adj, formats::Mode
         return false;
     }
     out.anchor = formats::Model3D::Anchor::Centre;
+    if (adj.prepareTextures && !out.texture.empty() && out.texW > 0 && out.texH > 0) {
+        // The base colour map's average texels per world px over the textured triangles (which levels the
+        // closest zoom can reach).
+        double worldArea = 0, uvArea = 0;
+        for (const formats::MeshPart* part : {&out.body, &out.turret, &out.house})
+            for (std::size_t t = 0; t + 2 < part->tris.size(); t += 3) {
+                const formats::MeshVertex &a = part->tris[t], &b = part->tris[t + 1], &c = part->tris[t + 2];
+                if (a.textured < 0.5f) continue;
+                const double e1[3] = {b.pos[0] - a.pos[0], b.pos[1] - a.pos[1], b.pos[2] - a.pos[2]};
+                const double e2[3] = {c.pos[0] - a.pos[0], c.pos[1] - a.pos[1], c.pos[2] - a.pos[2]};
+                const double cx = e1[1] * e2[2] - e1[2] * e2[1], cy = e1[2] * e2[0] - e1[0] * e2[2], cz = e1[0] * e2[1] - e1[1] * e2[0];
+                worldArea += 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz);
+                uvArea += 0.5 * std::abs(double(b.uv[0] - a.uv[0]) * double(c.uv[1] - a.uv[1]) -
+                                         double(b.uv[1] - a.uv[1]) * double(c.uv[0] - a.uv[0]));
+            }
+        const float density = worldArea > 1e-6 && uvArea > 1e-9 ? float(std::sqrt(uvArea * out.texW * out.texH / worldArea)) : 0.0f;
+        out.colorTex = render3d::prepareTexture(out.texture, out.texW, out.texH, TexKind::Color, density, adj.texCaps);
+        std::vector<std::uint32_t>().swap(out.texture);
+        if (!out.pbrTexture.empty() && !out.normalTexture.empty()) {
+            out.pbr = true;
+            const float k = out.texW > 0 ? density / float(out.texW) : 0.0f;
+            out.pbrTex = render3d::prepareTexture(out.pbrTexture, out.pbrW, out.pbrH, TexKind::Data, k * float(out.pbrW), adj.texCaps);
+            out.nrmTex = render3d::prepareTexture(out.normalTexture, out.nrmW, out.nrmH, TexKind::Normal, k * float(out.nrmW), adj.texCaps);
+            std::vector<std::uint32_t>().swap(out.pbrTexture);
+            std::vector<std::uint32_t>().swap(out.normalTexture);
+        }
+    }
     return true;
 }
 

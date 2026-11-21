@@ -61,6 +61,7 @@ struct CursorQuery {
     bool overRadar = false;       // inside the radar map while it is on and moves units on click
     bool shroud = true;           // the shroud is drawn (a fully shrouded cell hides its contents)
     bool ctrl = false, shift = false, alt = false;
+    bool attackMove = false;      // attack-move key held / armed (not original): the attack cursor
 };
 Cursor pickCursor(const game::World& w, const CursorQuery& q);
 

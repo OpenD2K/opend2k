@@ -3,7 +3,8 @@
 One setting picks the game language: **English / Français / Deutsch / Español / Русский (PS1) /
 Русский (перевод) / Русский (AI, оригинальные голоса)**. It switches text, fonts, the sidebar art, speech and cutscenes together. An
 optional *Advanced* mix takes each of Text / Voices / Cutscenes from any language. Everything comes from
-the player's own files at runtime. Nothing of it is in the repository.
+the player's own files at runtime. Nothing of it is in the repository. The one exception is the optional
+download of OpenD2K's own Russian AI voices (below), which contains only voice files made for OpenD2K.
 
 Code: `src/formats/language.*` (model, detection, file resolution, encodings; no SDL, tested by
 `formats_test`), `src/platform/language.*` (the active language and the loaders), speech from the PS1
@@ -17,7 +18,7 @@ disc in `src/formats/ps1_sound.*` (docs/ps1-assets.md "Speech slots → PC sampl
 | Français / Deutsch / Español | `Text{Fre,Ger,Spa}.UIB`, `FONT{..}.FNT`, `FONTCOL{..}.FNT`, `bin/FONT{..}.BIN` | `ui_{FRE,GER,SPA}.r16` | `GAMESFX{Fre,Ger,Spa}/` (AUDs and its `SOUND.RS`) | `*_{F,G,S}.VQA` (else English) |
 | Русский (перевод) | translation folder: `Ui_data/Text.uib` (CP1251), `font.fnt`, `fontcol.fnt`, `Bin/Font.bin` | `UI_RUS.R16` (in the Gruntmods data) | translation `GAMESFX/*.AUD` ("Stream" dub) | translation `MOVIES/*_E.vqa` (Russian dub) |
 | Русский (PS1) | as Русский (перевод) (English without the folder) | `UI_RUS.R16` | the Russian PS1 disc's speech banks | the Russian PS1 disc's STR movies first |
-| Русский (AI) | as Русский (перевод) (+ the text fixes) | `UI_RUS.R16` | our generated AI set `<pref>/Voices/ru-ai/GAMESFX/*.AUD`, else English | as Русский (перевод) |
+| Русский (AI) | as Русский (перевод) (+ the text fixes) | `UI_RUS.R16` | OpenD2K's AI voice set `<pref>/Voices/ru-ai/GAMESFX/*.AUD` (optional download), else English | as Русский (перевод) |
 
 This mirrors the community patch (`ref/dune2000-sp-patches/src/multi-language.c`, `InitLanguage`:
 dune2000.ini `[Options] Language=Eng|Fre|Ger|Spa|Rus` picks `text%s.uib`, `font%s.fnt`, `FontCol%s.fnt`,
@@ -70,20 +71,36 @@ language (its movies still fill in for missing PC cutscenes, as before).
 ### Русский (AI, оригинальные голоса)
 Code `ru-ai`. Text, fonts, sidebar art and the text-fixes option are those of Русский (перевод); the
 cutscenes are the translation folder's Russian-dubbed VQAs (else English; the Advanced overrides still
-apply). The speech is OpenD2K's AI voice set: Russian lines converted into each original speaker's voice
-(docs/ai-voices.md). It is never shipped. The player generates it once with their own Yandex SpeechKit key:
+apply). The speech is OpenD2K's AI voice set: **Russian voices created with AI, similar to the original**, an
+unofficial fan work (the wording used in the pack README, Options and the CHANGELOG).
 
-```
-python3 tools/voice/gen_ru_ai.py --data "<Dune 2000>/data" \
-    --out "~/Library/Application Support/d2k-mac/Dune 2000/Voices/ru-ai" ...   (docs/ai-voices.md "Full set")
-```
+**Download (0.0.3+, owner decision 2026-11-21).** The set is published as an optional extra of the art pack
+manifest: `ru-ai-voices`, `OpenD2K-ru-ai-voices-pack-<v>.zip` (251 `GAMESFX/*.AUD`, about 4 MB, CC BY-SA 4.0),
+built by `tools/release/package_artpack.sh` from the owner's generated set (`--voices DIR`, default
+`<pref>/Voices/ru-ai`; only `GAMESFX/*.AUD` is copied) and audited with `audit_artpack.py --kind voices`. Its
+manifest entry has `"install": "ai-voices"`, so the game unpacks it into `defaultAiVoicesDir()` =
+`<pref path>/Voices/ru-ai` (not `artpacks/`), writes `installed.ini` there and rebuilds the language sources
+(`noteAiVoicesChanged`). Options → Art pack lists it under *Extras* (not part of "Get all for 3D"); hovering the row
+shows its description. A folder there that the download did not write (a set generated with the tool: no
+`installed.ini`) is never replaced (the download refuses, `--artpack-install` skips it). With `aiVoicesDir` set in
+settings.ini the download still goes to the default folder.
+
+**Text: voices only.** The pack carries no text. The Russian text is the translation folder's (Fargus) text, and
+our `artpacks/lang/ru-fixes` overlay is built *on top of* it (`tools/ru_text_fixes.py` reads the Fargus Text.uib:
+`text_ru.tsv` = 368 keys that differ from Fargus, 86 of them automatic edits of Fargus lines; `manual_ru.tsv` =
+285 hand-written lines; the bitmap fonts with Cyrillic glyphs exist only in the Fargus folder). So no complete
+Russian text of our own exists, and nothing Fargus-derived is shipped: without the player's translation folder
+the AI voices play with English text (the pack README and the Options description say so).
+
+The set is generated with OpenD2K's voice tools (`tools/voice/`, not part of the public source export); a set
+generated locally into the same folder is used the same way.
 
 - **Folder:** `SDL_GetPrefPath()/Voices/ru-ai` (`lang::findAiVoices`: its `GAMESFX/` with non-empty AUDs, or
   the folder itself), or settings.ini `aiVoicesDir` / `--ai-voices DIR`. The generator's `manifest.tsv`,
   `preview/` and `work/` are ignored.
 - **Availability:** offered only when that folder has AUDs. Without it the entry is dimmed on the Original
-  Language page and left out of the Enhanced row; its hint says "no AI voices: generate with
-  tools/voice/gen_ru_ai.py". With the voices but no translation folder it plays the voices with English text.
+  Language page and left out of the Enhanced row; its hint says "no AI voices: download them in Options > Art
+  pack". With the voices but no translation folder it plays the voices with English text.
 - **Missing lines** (the Gruntmods `S01..S18` and new-unit voices, anything not generated) play the original
   English files, never the Stream dub or the PS1 disc. Silent files are skipped as for the Stream dub.
   SFX (`SOUND.RS`) stay the game's own.

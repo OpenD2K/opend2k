@@ -1,4 +1,5 @@
 #include "render/weld_fx.hpp"
+#include "formats/utf8_bom.hpp"
 
 #include "formats/templates.hpp"
 #include "game/world.hpp"
@@ -133,6 +134,7 @@ void PackAnchors::load(const ArtPack* pack, const formats::Templates& t) {
     {
         std::ifstream in(std::filesystem::path(pack->root()) / "models.ini");
         if (!in) return;
+        formats::skipUtf8Bom(in);
         std::string line, section;
         while (std::getline(in, line)) {
             if (const auto c = line.find_first_of(";#"); c != std::string::npos) line.erase(c);

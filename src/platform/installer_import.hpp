@@ -1,7 +1,7 @@
 #pragma once
 // Building the game data folder from the Gruntmods Edition installer (.exe) instead of an
 // installed game: the installer is unpacked with formats/nsis.* into
-//   <pref path>/GameData/<installer name>/Dune 2000/...   (SDL_GetPrefPath("d2k-mac", "Dune 2000"))
+//   <pref path>/GameData/<installer name>/Dune 2000/...   (SDL_GetPrefPath("OpenD2K", "Dune 2000"))
 // and the app then uses ".../Dune 2000/data". A finished copy carries a ".d2k-extracted" marker
 // and is reused when the same installer is chosen again. The Gruntmods cutscene installers
 // ("Dune 2000 <Language> Cutscene Installer.exe", movies only) are unpacked into the

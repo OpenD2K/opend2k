@@ -437,6 +437,8 @@ bool TouchControls::handleEvent(const SDL_Event& e, Session& s, Ui& ui, SDL_Wind
     case State::Swipe:
         if (!cancelled) s.touchSwipe(up.x0, up.y0, up.x - up.x0, up.y - up.y0);
         break;
+    case State::Pan: s.touchPanEnd(!cancelled); break;  // Smooth camera: a fling keeps some momentum
+    case State::Two: s.touchPanEnd(false); break;
     case State::Button:
         if (peekDown_) {  // the classic view button let go (also when slid off it)
             peekDown_ = false;

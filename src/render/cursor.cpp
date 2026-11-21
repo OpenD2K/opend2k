@@ -51,6 +51,8 @@ Cursor pickCursor(const game::World& w, const CursorQuery& q) {
 
     // Outside the battlefield (sidebar, options bar): the pointer, or the radar-move ring over
     // a working radar while units are selected.
+    // Attack-move (not original; A held / pressed): the attack cursor while units are selected.
+    if (q.attackMove && q.mode == 0 && unitsSelected && (q.overBattlefield || q.overRadar)) return Cursor::Attack;
     if (!q.overBattlefield) return q.overRadar && unitsSelected ? Cursor::RadarMove : Cursor::Arrow;
 
     const int tx = q.worldX >> 5, ty = q.worldY >> 5;

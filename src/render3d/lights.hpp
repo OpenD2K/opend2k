@@ -57,6 +57,22 @@ struct PointLightsU {
     float spriteTint[4];  // rgb: billboards' light (flat sunlit ground vs the old light)
     float grid[4];        // x, y = the grid's origin (world x, z), z = 1 / cell size, w = cells across
     float grid2[4];       // x = cells down, y = cell table start (uint4), z = index list start (uint4), w unused
+    // Reimagined "Dust haze" (docs/3d-mode.md "Dust haze"): drifting airborne dust veils that dim and warm the light.
+    // xy = the wind's unit direction (world x, z), z = px drifted so far along it, w = strength (0 = off: not computed).
+    float haze[4];
+    // Reimagined "Realistic grade" (docs/3d-mode.md "Realistic grade"; all 0 = off, the look from before):
+    // grade: x = the models' albedo scale (darker, worn objects on the paler ground; 0 = off), y = the strength of
+    // the sand dust settled on the models (up-facing surfaces, the foot of each model), z, w unused;
+    // dustColor: rgb = that dust's colour (the map's sand in the graded palette).
+    float grade[4];
+    float dustColor[4];
+    // Screen-space ambient occlusion (render3d/ssao.*, docs/3d-mode.md "Ambient occlusion"): xy = 1 / the scene
+    // target's size (a fragment's pixel position -> the occlusion texture's uv), z = strength (0 = off: not sampled).
+    float ssao[4];
+    // Reimagined "World beyond the map" (docs/3d-mode.md "Shroud and the map edge"; all 0 = off, the shroud as before):
+    // x = 1 on, y = the land beyond the map's fixed fog darkness (it never depends on exploration), z = its vignette
+    // (extra darkening far from the map), w = the share of the distance haze it fades into far from the map.
+    float edge[4];
     PointLightsU() { clear(); }
     // No lights, the old light (colours 1).
     void clear() {
@@ -75,7 +91,7 @@ struct PointLightsU {
         info[1] = specular;
     }
 };
-static_assert(sizeof(PointLightsU) == 96, "PointLightsU layout");
+static_assert(sizeof(PointLightsU) == 176, "PointLightsU layout");
 
 // One light for the grid: what the shaders read + its footprint on the ground (a circle that holds every
 // point the light can reach, in world x / z).

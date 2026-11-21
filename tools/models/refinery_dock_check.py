@@ -2,10 +2,12 @@
 """Check the refineries' docks against the harvester model, without starting the game (docs/3d-models.md
 "Docking"; the numbers are tools/models/refinery_dock.py's).
 
-  .venv/bin/python -I tools/models/refinery_dock_check.py PACK [--refinery FILE.glb ...] [--harvester PACK2] [-v]
+  .venv/bin/python -I tools/models/refinery_dock_check.py PACK [--refinery FILE.glb ...] [--harvester PACK2] [--scale S] [-v]
 
 For every *REFINERY.glb of PACK/models/building (or the given files) and the harvester of the pack
-(models/unit/HARVESTER.glb + variants/HARVESTER_unloadNN.glb):
+(models/unit/HARVESTER.glb + variants/HARVESTER_unloadNN.glb: full meshes, or node poses as export_poses.py writes
+them into a pack; scaled by --scale, else as the game does by the `scale` of [HARVESTER] in PACK2/models.ini, or in
+PACK2/models.ini.HARVESTER for the output of reimagined_harvester.py):
   * the plan bounds against the 3 x 3 cells (no fit move, no shrink expected: inside +-48 px);
   * the deck the harvester stands on at the dock cell's centre (as render3d/models.cpp deckAt: the highest
     surface <= 8 px within 5 px) and what the pad has above it under the harvester;
@@ -14,7 +16,9 @@ For every *REFINERY.glb of PACK/models/building (or the given files) and the har
   * intersections: refinery surface points inside the harvester's body (a solid: every column of its plan filled
     between its lowest and highest point) - turning on the dock centre through all 32 facings in the driving
     pose, and docked at facing 12 in every unloading pose (with the engine's slide). 0 points = clear.
-Exit code 1 if anything intersects, the model leaves its cells by more than 0.5 px or the slide is over 3 px.
+Exit code 1 if anything intersects, the model leaves its cells by more than 0.5 px or the slide is over 3 px;
+--allow-turn PX accepts intersections that only happen while the harvester turns on the dock centre and reach at
+most ~PX px into the refinery (a harvester shown bigger than the envelope the docks were laid out for).
 """
 import glob
 import json
@@ -36,16 +40,24 @@ def _quat(q):
                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
 
 
-def read_glb(path):
-    """-> (triangles (n, 3, 3) px in the glb axes: x east, y up, z south, {anchor: (x, y, z px, size)})"""
+def glb_json(path):
     d = open(path, "rb").read()
     jl = struct.unpack_from("<I", d, 12)[0]
-    J = json.loads(d[20:20 + jl])
-    bin0 = 20 + jl + 8
+    return d, json.loads(d[20:20 + jl]), 20 + jl + 8
+
+
+def read_glb(path, pose=None):
+    """-> (triangles (n, 3, 3) px in the glb axes: x east, y up, z south, {anchor: (x, y, z px, size)}).
+    pose: {node name: node dict} - a node-pose variant's transforms replacing those of the same name."""
+    d, J, bin0 = glb_json(path)
     tris, anchors = [], {}
 
     def walk(i, M):
         n = J["nodes"][i]
+        if pose and n.get("name") in pose:
+            n = dict(pose[n["name"]], children=n.get("children", []), mesh=n.get("mesh"))
+            if n["mesh"] is None:
+                del n["mesh"]
         L = np.eye(4)
         if "matrix" in n:
             L = np.array(n["matrix"]).reshape(4, 4).T
@@ -93,7 +105,7 @@ def sample(tris, step=0.5):
 
 class Harvester:
     """A pose as a solid: per plan cell (0.5 px) the lowest and highest point."""
-    RES, HALF = 0.5, 32.0
+    RES, HALF = 0.5, 48.0   # plan grid +-HALF px (a scaled harvester reaches past 32)
 
     def __init__(self, tris):
         p = sample(tris, 0.35)
@@ -147,26 +159,64 @@ def deck_at(tris, x, z):
     return best
 
 
+def harvester_tris(hpack, scale):
+    """The harvester's driving pose and its unloading poses (triangles, px), scaled about its origin."""
+    base = os.path.join(hpack, "models", "unit", "HARVESTER.glb")
+    out = [read_glb(base)[0] * scale]
+    for f in sorted(glob.glob(os.path.join(hpack, "variants", "HARVESTER_unload*.glb"))):
+        _, J, _ = glb_json(f)
+        if J.get("meshes"):
+            out.append(read_glb(f)[0] * scale)
+        else:                                             # node poses (export_poses.py)
+            out.append(read_glb(base, {n["name"]: n for n in J["nodes"] if "name" in n})[0] * scale)
+    return out[0], out[1:]
+
+
+def ini_scale(hpack):
+    """`scale` of [HARVESTER] in hpack/models.ini (a pack) or hpack/models.ini.HARVESTER (the generator's --out); 1 without."""
+    sec, sc = "", 1.0
+    ini = os.path.join(hpack, "models.ini")
+    if not os.path.exists(ini):
+        ini += ".HARVESTER"
+    try:
+        for line in open(ini):
+            line = line.split(";")[0].split("#")[0].strip()
+            if line.startswith("["):
+                sec = line[1:line.find("]")].strip()
+            elif sec == "HARVESTER" and "=" in line and line.split("=")[0].strip() == "scale":
+                sc = float(line.split("=", 1)[1])
+    except OSError:
+        pass
+    return sc
+
+
 def main():
     args = sys.argv[1:]
     verbose = "-v" in args
     args = [a for a in args if a != "-v"]
     pack = args[0]
-    files, hpack = [], pack
+    files, hpack, scale, allow_turn = [], pack, None, 0.0
     i = 1
     while i < len(args):
         if args[i] == "--refinery":
             files.append(args[i + 1])
         elif args[i] == "--harvester":
             hpack = args[i + 1]
+        elif args[i] == "--scale":
+            scale = float(args[i + 1])
+        elif args[i] == "--allow-turn":
+            allow_turn = float(args[i + 1])
         i += 2
     if not files:
         files = sorted(glob.glob(os.path.join(pack, "models", "building", "*REFINERY.glb")))
-    drive = Harvester(read_glb(os.path.join(hpack, "models", "unit", "HARVESTER.glb"))[0])
-    poses = [Harvester(read_glb(f)[0]) for f in sorted(glob.glob(os.path.join(hpack, "variants", "HARVESTER_unload*.glb")))]
+    if scale is None:
+        scale = ini_scale(hpack)
+    dt, pt = harvester_tris(hpack, scale)
+    drive = Harvester(dt)
+    poses = [Harvester(t) for t in pt]
     last = poses[-1] if poses else drive
     r = np.hypot(drive.pts[:, 0], drive.pts[:, 2])
-    print(f"harvester: turning radius {r[drive.pts[:, 1] < 8].max():.1f} px below 8 px, {r[drive.pts[:, 1] >= 8].max():.1f} above; "
+    print(f"harvester (scale {scale:g}): turning radius {r[drive.pts[:, 1] < 8].max():.1f} px below 8 px, {r[drive.pts[:, 1] >= 8].max():.1f} above; "
           f"top {max(h.pts[:, 1].max() for h in poses + [drive]):.1f}; pipe mouth {last.tip[2]:.2f} px behind the centre, {last.tip[1]:.2f} px up")
     bad = False
     cx, cz = RD.DOCK[0], -RD.DOCK[1]
@@ -177,7 +227,7 @@ def main():
         over = max(-RD.BOX - x0, x1 - RD.BOX, -RD.BOX - z0, z1 - RD.BOX)
         deck = deck_at(tris, cx, cz)
         pts = sample(tris, 0.5)
-        near = pts[np.hypot(pts[:, 0] - cx, pts[:, 2] - cz) < 34]
+        near = pts[np.hypot(pts[:, 0] - cx, pts[:, 2] - cz) < 34 * max(1.0, scale) + 8]
         print(f"{key}: plan x {x0:.1f}..{x1:.1f}, north {-z1:.1f}..{-z0:.1f} (cells +-48; over by {max(over, 0):.2f}); deck at the dock centre {deck:.2f} px")
         if over > 0.5:
             bad = True
@@ -199,13 +249,14 @@ def main():
                 bad = True
             if slide > 32.0:
                 sx = sz = 0.0
-        total = 0
+        total = turned = 0
         worst = []
         for fc in range(32):                              # turning on the dock centre (driving pose, no slide)
             m = drive.inside(to_local(near, cx, cz, deck, fc))
             m &= near[:, 1] > deck + 0.05
             if m.any():
                 total += int(m.sum())
+                turned += int(m.sum())
                 worst.append((f"turning, facing {fc}", near[m]))
         for k, h in enumerate(poses):                     # docked: pose k = animFrame k, slide eased in over 7 frames
             e = min(1.0, k / 7.0)
@@ -216,22 +267,26 @@ def main():
             if m.any():
                 total += int(m.sum())
                 worst.append((f"docked, pose {k}", near[m]))
+        # how far the turning harvester sweeps past the nearest refinery part (the same height bands as the keep-out)
+        rl = r[drive.pts[:, 1] < RD.Z_LOW].max()
+        rh = r[(drive.pts[:, 1] >= RD.Z_LOW) & (drive.pts[:, 1] < RD.Z_HIGH)].max()
+        lo = near[(near[:, 1] > deck + 0.05) & (near[:, 1] < deck + RD.Z_LOW)]
+        hi = near[(near[:, 1] >= deck + RD.Z_LOW) & (near[:, 1] < deck + RD.Z_HIGH)]
+        dl = np.hypot(lo[:, 0] - cx, lo[:, 2] - cz).min() if len(lo) else 99
+        dh = np.hypot(hi[:, 0] - cx, hi[:, 2] - cz).min() if len(hi) else 99
+        depth = max(0.0, rl - dl, rh - dh)
         if total:
-            bad = True
-            print(f"   INTERSECTS: {total} surface points inside the harvester")
+            if total > turned or depth > allow_turn:
+                bad = True
+            print(f"   INTERSECTS: {total} surface points inside the harvester ({turned} while turning on the dock centre, "
+                  f"up to ~{depth:.1f} px deep{'; allowed' if total == turned and depth <= allow_turn else ''})")
             for name, q in worst if verbose else worst[:6]:
                 print(f"      {name}: {len(q)} points, x {q[:, 0].min():.1f}..{q[:, 0].max():.1f} north {-q[:, 2].max():.1f}..{-q[:, 2].min():.1f} "
                       f"height {q[:, 1].min():.1f}..{q[:, 1].max():.1f}")
         else:
             print("   clear: nothing inside the harvester (32 facings turning, every unloading pose)")
         # the smallest gap to the keep-out cylinder, for the record
-        d = np.hypot(near[:, 0] - cx, near[:, 2] - cz)
-        lo = near[(near[:, 1] > deck + 0.05) & (near[:, 1] < RD.Z_LOW)]
-        hi = near[(near[:, 1] >= RD.Z_LOW) & (near[:, 1] < RD.Z_HIGH)]
-        dl = np.hypot(lo[:, 0] - cx, lo[:, 2] - cz).min() if len(lo) else 99
-        dh = np.hypot(hi[:, 0] - cx, hi[:, 2] - cz).min() if len(hi) else 99
         print(f"   nearest part above the deck: {dl:.1f} px from the dock centre below {RD.Z_LOW} px (keep-out {RD.K_LOW}), {dh:.1f} above (keep-out {RD.K_HIGH})")
-        del d
     sys.exit(1 if bad else 0)
 
 

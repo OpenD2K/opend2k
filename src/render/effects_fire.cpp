@@ -356,7 +356,7 @@ void Effects::updateBurns(const game::World& w, float dt, const Camera& cam, int
             // The column: dark smoke rising from every point, thicker, blacker and higher with the
             // damage (just below half health: a light grey wisp).
             const float smoke = (p.flame ? 0.75f : 0.5f) + 0.9f * sev;
-            if (dt > 0) p.smokeAcc += dt * (2.2f + 3.2f * smoke) * ld * h;
+            if (dt > 0) p.smokeAcc += dt * (2.2f + 3.2f * smoke) * ld * h * budget_.columnRate();  // (effects intensity)
             while (p.smokeAcc >= 1) {
                 p.smokeAcc -= 1;
                 Particle q{};
@@ -378,6 +378,7 @@ void Effects::updateBurns(const game::World& w, float dt, const Camera& cam, int
                 q.blend = Blend::Alpha;
                 q.rot = rnd(0, kPi2);
                 q.vrot = rnd(-0.5f, 0.5f);
+                if (recordEvents_) q.fx |= kFxBlast;  // Reimagined: the cinematic particles draw this smoke, lit
                 add(q);
             }
         }

@@ -18,7 +18,7 @@ std::string normalizeDataDir(const std::string& dir);
 std::string gameDataRoot(const std::string& overrideRoot = {});
 
 // The app-managed cutscene folder (platform/movies.hpp): <SDL pref path>/Movies
-// (~/Library/Application Support/d2k-mac/Dune 2000/Movies), or <overrideRoot>/../Movies when a
+// (~/Library/Application Support/OpenD2K/Dune 2000/Movies), or <overrideRoot>/../Movies when a
 // GameData root override is given (--game-data-root, tests). Empty if there is no pref path.
 std::string appMoviesDir(const std::string& overrideRoot = {});
 

@@ -78,7 +78,7 @@ the game, so folders with Cyrillic or accented names work) and long-path awarene
 ### First start: game data
 The data folder page appears when no game is found. Either
 - **Choose installer (.exe)…** and pick `Dune 2000 Gruntmods Edition 1.6.7.exe` — the game unpacks it itself
-  (no installation, nothing runs) into `%APPDATA%\d2k-mac\Dune 2000\GameData\`; or
+  (no installation, nothing runs) into `%APPDATA%\OpenD2K\Dune 2000\GameData\`; or
 - **Choose folder…** and pick an installed `Dune 2000` folder (the one with `data\` inside).
 
 The game also finds an installation by itself next to `OpenD2K.exe` (copy the build into the game folder, or
@@ -86,7 +86,7 @@ the game folder next to it), in `%ProgramFiles(x86)%\Dune 2000`, `%ProgramFiles%
 `C:\Games\Dune 2000`, `C:\Westwood\Dune2000` and `C:\Dune 2000`. From a console: `d2k.exe --data "D:\Games\Dune 2000\data"`.
 Cutscenes: the Gruntmods cutscene installers are chosen the same way (**Choose installer**).
 
-Settings, saves, unpacked data and movies live in `%APPDATA%\d2k-mac\Dune 2000\` (`SDL_GetPrefPath`).
+Settings, saves, unpacked data and movies live in `%APPDATA%\OpenD2K\Dune 2000\` (`SDL_GetPrefPath`).
 
 ### 3D mode on Windows
 Graphics → 3D (or `--graphics 3d`). The renderer log line says which GPU backend runs:
@@ -117,7 +117,7 @@ Distributions with an SDL3 >= 3.4 package (`libsdl3-dev`, `sdl3`) use it automat
 packages with `-devel` names (SDL's `docs/README-linux.md` lists them). The file dialogs (folder / installer
 picker) use the XDG desktop portal or `zenity`; without either, pass `--data DIR` or `--install-from FILE.exe`.
 Data is also found under `~/Games/Dune 2000` and in the Wine prefix (`$WINEPREFIX` or `~/.wine`,
-`drive_c/Program Files (x86)/Dune 2000`, `drive_c/Games/Dune 2000`). Settings: `~/.local/share/d2k-mac/Dune 2000/`.
+`drive_c/Program Files (x86)/Dune 2000`, `drive_c/Games/Dune 2000`). Settings: `~/.local/share/OpenD2K/Dune 2000/`.
 The in-game art pack download (Options → Art pack) loads `libcurl.so.4` at run time (`libcurl4`, present on most
 desktops; no build dependency); without it the page shows the manual download link.
 
@@ -212,6 +212,10 @@ README.md  CHANGELOG.md  LICENSE.txt
   `-msse2 -mfpmath=sse`); never `-ffast-math`. The only libm transcendental in the simulation is the sin/cos table
   built at start-up; `game_test` checks its hash, so a C library that rounds differently fails the test on that
   platform. `sqrt` is exact (IEEE).
+- **Long string literals**: MSVC rejects a string literal piece over ~16380 bytes (C2026) and adjacent pieces over
+  65535 bytes in total; clang / GCC / MinGW accept both. The embedded shader sources (`render3d/*_msl.hpp`) split
+  long raw strings at a line start with `)MSL" R"MSL(`. `tools/check_msvc_literals.py` (ctest `msvc_literal_check`,
+  any platform) fails on a piece over 16000 bytes or a run over 65000.
 - **MinGW**: MSVC is the supported Windows compiler, but a MinGW-w64 (GCC 16) cross-build from macOS compiles and
   links everything (`tools/release/mingw-w64-x86_64.cmake`; the 0.0.1 Windows package is built this way); it
   embeds the manifest as a resource and links its runtimes statically (only `SDL3.dll` and system DLLs are needed).

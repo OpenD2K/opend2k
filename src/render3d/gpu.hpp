@@ -9,6 +9,8 @@
 // default (Metal) renderer. Without the GPU renderer (SDL_RENDER_DRIVER set, D2K_RENDERER=sdl,
 // or creation failed) the app uses SDL's default renderer and the 3D mode falls back to Enhanced.
 
+#include "render3d/model_texture.hpp"
+
 #include <SDL3/SDL.h>
 
 namespace d2k::render3d {
@@ -40,6 +42,13 @@ bool gpuAnisotropy();
 // the half-float scene fails to create (black battlefield) and the extended swapchain crashes; Vulkan /
 // Metal keep it. D2K_D3D12_HDR=1 retests it.
 bool gpuHdrOk();
+// Custom fragment shaders of SDL's GPU renderer (SDL_GPURenderState; render/hdr.*): not on Direct3D 12 with
+// SDL 3.4.20 - their pipeline fails to create (gpu.cpp). D2K_D3D12_RENDERSTATE=1 retests it.
+bool gpuRenderStateOk();
+// The model texture formats the device samples (render3d/model_texture.hpp): BC1 + BC3 + BC5 as sampled
+// 2D textures (desktop GPUs, Apple silicon Macs; not most phones / tablets). D2K_TEX_BC=0 turns it off
+// (tests the RGBA8 fallback). nullptr = none.
+TexCaps modelTextureCaps(SDL_GPUDevice* dev);
 // enable_depth_clip for a 3D pipeline's rasterizer state.
 inline bool gpuDepthClip() { return !gpuDepthClamp(); }
 

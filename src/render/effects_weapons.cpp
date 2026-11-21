@@ -65,6 +65,19 @@ void Effects::addScorch(float x, float y, float size, float life, std::uint8_t k
 void Effects::spawnExplosion(ExClass c, float x, float y, float z, float age, const Camera& cam, int viewW, int viewH,
                              const TileAtlas& atlas, const game::World& w, bool crowded, int house, float sizeMul,
                              float shakeMul) {
+    EventScope ev(*this);  // effects intensity: a hit's / blast's smoke is transient (render/fx_budget.hpp)
+    if (age <= 0.05f) {
+        switch (c) {  // the busy level: what this event adds to the screen
+        case ExClass::Huge: countEvent(2.5f * sizeMul); break;
+        case ExClass::Big: countEvent(1.5f * sizeMul); break;
+        case ExClass::Medium: countEvent(1.0f * sizeMul); break;
+        case ExClass::Shell: countEvent(0.8f); break;
+        case ExClass::Artillery: countEvent(1.0f * sizeMul); break;
+        case ExClass::Small: countEvent(0.15f); break;
+        case ExClass::Gas: case ExClass::Plasma: countEvent(1.0f); break;
+        default: break;
+        }
+    }
     const std::size_t first = particles_.size();
     auto P = [&](Tex tex, Blend bl) {
         Particle p{};
@@ -79,6 +92,17 @@ void Effects::spawnExplosion(ExClass c, float x, float y, float z, float age, co
     const bool ground = z < 8;
     const float ld = load();
     float s = 1.0f, shake = 0;
+    if (age <= 0.05f) {
+        if (c == ExClass::Huge || c == ExClass::Big || c == ExClass::Medium)
+            note(FxEvent::Explosion, w, x, y, z, (c == ExClass::Huge ? 3.0f : c == ExClass::Big ? 2.0f : 1.0f) * sizeMul);
+        else if (c == ExClass::Whiten && z < 8)
+            note(FxEvent::VehicleDeath, w, x, y, z, 1.0f);
+        else if (c == ExClass::Artillery) {
+            const int tx = int(x) >> 5, ty = int(y) >> 5;
+            const std::uint32_t cf = w.inBounds(tx, ty) ? w.cell(tx, ty).flags : 0;
+            note(FxEvent::Artillery, w, x, y, z, sizeMul, (cf & (game::cell_flags::kVehicle | game::cell_flags::kBuilding)) || z > 4);
+        }
+    }
     switch (c) {
     case ExClass::Huge: s = 1.5f; shake = 0.5f; break;
     case ExClass::Big: s = 1.15f; shake = 0.22f; break;
@@ -283,13 +307,56 @@ void Effects::spawnExplosion(ExClass c, float x, float y, float z, float age, co
         }
     } else if (c == ExClass::Small) {
         spawnImpact(w, atlas, x, y, z, 1);
+    } else if (c == ExClass::Artillery) {
+        spawnArtillery(w, atlas, x, y, z, sizeMul);
+        shake = 0.05f * sizeMul * shakeMul;
+    } else if (c == ExClass::Shell) {
+        // A tank shell: a heavy small-arms hit (sparks + flash on armour, dust on the ground) and,
+        // on open ground, a column of thrown-up dust and a small dark mark - no fireball.
+        spawnImpact(w, atlas, x, y, z, 2.0f);
+        const int tx = int(x) >> 5, ty = int(y) >> 5;
+        const std::uint32_t cf = w.inBounds(tx, ty) ? w.cell(tx, ty).flags : 0;
+        const bool armour = (cf & (game::cell_flags::kVehicle | game::cell_flags::kBuilding)) || z > 4;
+        if (!armour) {
+            const std::uint32_t soil = terrainColour(w, atlas, x, y);
+            const int n = load() < 1 ? 2 : 4;
+            for (int i = 0; i < n; ++i) {
+                Particle d = P(kSmoke, Blend::Alpha);
+                d.x += rnd(-4, 4);
+                d.y += rnd(-3, 3);
+                d.vx = rnd(-10, 10) + kWindX * 0.4f;
+                d.vy = rnd(-6, 6);
+                d.vz = rnd(20, 45);
+                d.drag = 1.6f;
+                d.life = rnd(0.9f, 1.5f);
+                d.size0 = rnd(6, 9);
+                d.size1 = rnd(20, 30);
+                d.c0 = withAlpha(scaleRgb(soil, rnd(0.95f, 1.05f)), 150);
+                d.c1 = withAlpha(soil, 0);
+                d.vrot = rnd(-1, 1);
+                add(d);
+            }
+            addScorch(x, y, 14, 14, 0, 0.45f);
+        }
+        shake = 0.015f * shakeMul;
     } else if (c == ExClass::Whiten) {
         // A vehicle died here (the death flash under its explosion): a burning wreck - a charred
         // hulk mark and a fire with a smoke column that burns for a while.
-        if (ground && fires_.size() < 160) {
+        if (ground && !flyerFlash_ && fires_.size() < 160) {  // (not under a flyer that falls: airCrashes())
             Fire f{x + rnd(-2, 2), y + rnd(-2, 2), 0, rnd(9, 14), rnd(0.55f, 0.72f), 0};
             f.smoke = 0.6f;
-            fires_.push_back(f);
+            // Effects intensity: a wreck burning within ~1.5 tiles takes this one over (one column, stoked).
+            Fire* near = nullptr;
+            if (budget_.on())
+                for (Fire& o : fires_)
+                    if (o.smoke > 0.3f && std::hypot(o.x - f.x, o.y - f.y) < budget_.mergeRadius()) near = &o;
+            if (near) {
+                near->life = std::max(near->life, near->age + f.life * 0.6f);
+                near->size = std::max(near->size, f.size);
+                near->smoke = 0.6f;
+            } else {
+                fires_.push_back(f);
+            }
             addScorch(x, y, 30, 45, 1);
         }
     } else if (c == ExClass::DhmTrail) {
@@ -525,18 +592,201 @@ void Effects::spawnExplosion(ExClass c, float x, float y, float z, float age, co
     // (Muzzle / Trail: the bullets draw their own flash and trail.)
     // Screen shake, fading with the distance from the view centre.
     if (shake > 0) addTrauma(x, y, shake, cam, viewW, viewH);
+    // Reimagined: the cinematic particles draw this blast (render3d/cinematic_fx.*); tag its sprites.
+    if (recordEvents_ && (c == ExClass::Huge || c == ExClass::Big || c == ExClass::Medium || c == ExClass::Artillery))
+        for (std::size_t i = first; i < particles_.size(); ++i) particles_[i].fx |= kFxBlast;
     // Pre-aged spawn (the first frame of a view: the explosion was already running).
     preAge(first, age);
+}
+
+// An artillery impact (EX_155MMGUN: the siege tank's howitzer k = 1, a grenade k ~0.6): on the ground a
+// fountain of sand and earth thrown up steeply that slows and falls back, clods of dirt raining down, a flash
+// at the core for a few frames (no rolling fireball), a low ring of dust pushed out, a shock ring along the
+// ground, a short-lived brown-grey cloud drifting off with the wind and the crater; on armour (a vehicle or
+// building) a flash, sparks and a small burst of dark smoke instead of the earth.
+void Effects::spawnArtillery(const game::World& w, const TileAtlas& atlas, float x, float y, float z, float k) {
+    EventScope ev(*this);  // transient (effects intensity)
+    const int tx = int(x) >> 5, ty = int(y) >> 5;
+    const std::uint32_t cf = w.inBounds(tx, ty) ? w.cell(tx, ty).flags : 0;
+    const bool armour = (cf & (game::cell_flags::kVehicle | game::cell_flags::kBuilding)) || z > 4;
+    const float ld = load();
+    const float ks = std::sqrt(k);
+    auto P = [&](Tex tex, Blend bl) {
+        Particle p{};
+        p.x = x;
+        p.y = y;
+        p.z = z;
+        p.tex = tex;
+        p.blend = bl;
+        p.rot = rnd(0, 2 * kPi);
+        return p;
+    };
+    // The flash: white-hot for a few frames, and its light on the surroundings.
+    {
+        Particle q = P(kGlow, Blend::Add);
+        q.z += 3 * k;
+        q.life = 0.06f + 0.03f * k;
+        q.size0 = 20 * k + 6;
+        q.size1 = 38 * k + 8;
+        q.c0 = rgba(255, 246, 220, 235);
+        q.c1 = rgba(255, 170, 90, 0);
+        add(q);
+        addFlash(x, y - z, z, 80 * k + 30, rgba(255, 196, 130, 190), 0.1f + 0.06f * k);
+    }
+    if (armour) {
+        spawnImpact(w, atlas, x, y, z, 1.4f + 0.8f * k);  // sparks, a flash, a wisp
+        const int sparks = int((5 + 6 * k) * ld) + 1;
+        for (int i = 0; i < sparks; ++i) {
+            Particle p = P(kSpark, Blend::Add);
+            const float a = rnd(0, 2 * kPi), sp = rnd(70, 190) * ks;
+            p.z += 5;
+            p.vx = std::cos(a) * sp;
+            p.vy = std::sin(a) * sp * 0.7f;
+            p.vz = rnd(30, 110);
+            p.gravity = -320;
+            p.drag = 1.2f;
+            p.life = rnd(0.2f, 0.45f);
+            p.size0 = rnd(2.0f, 2.8f);
+            p.size1 = 1.0f;
+            p.c0 = rgba(255, 238, 190, 255);
+            p.c1 = rgba(255, 120, 40, 0);
+            p.streak = true;
+            add(p);
+        }
+        const int puffs = int((3 + 2 * k) * ld) + 1;  // a small burst of dark smoke
+        for (int i = 0; i < puffs; ++i) {
+            Particle p = P(kSmoke, Blend::Alpha);
+            const float a = rnd(0, 2 * kPi);
+            p.age = -rnd(0, 0.06f);
+            p.z += 6;
+            p.vx = std::cos(a) * rnd(8, 22) * k + kWindX * 0.4f;
+            p.vy = std::sin(a) * rnd(5, 14) * k;
+            p.vz = rnd(14, 30) * ks;
+            p.drag = 1.6f;
+            p.life = rnd(1.1f, 1.8f);
+            p.size0 = rnd(5, 8) * k + 2;
+            p.size1 = rnd(20, 28) * k + 6;
+            const int g = int(rnd(40, 56));
+            p.c0 = rgba(g + 4, g, g - 4, 190);
+            p.c1 = rgba(g + 62, g + 58, g + 54, 0);
+            p.vrot = rnd(-0.8f, 0.8f);
+            add(p);
+        }
+        return;
+    }
+    const std::uint32_t soil = terrainColour(w, atlas, x, y);
+    const std::uint32_t dirt = scaleRgb(soil, 0.52f);  // the darker earth from under the surface
+    // 1. The fountain: puffs of sand and earth thrown up steeply - each rises, slows under gravity, spreads and
+    // sinks back as it thins out; the later ones go highest (a column ~80 px tall for the howitzer).
+    const int nCol = int((7 + 5 * k) * ld) + 2;
+    for (int i = 0; i < nCol; ++i) {
+        Particle p = P(kSmoke, Blend::Alpha);
+        const float u = float(i) / float(std::max(1, nCol - 1));
+        const float h = (0.25f + 0.75f * u) * 90 * k * rnd(0.85f, 1.1f);
+        p.x += rnd(-4, 4) * k;
+        p.y += rnd(-3, 3) * k;
+        p.vz = std::sqrt(2 * 260 * h);
+        const float side = (24 - 12 * u) * k;  // the low puffs spread wide: a cone, not a pipe
+        p.vx = rnd(-side, side);
+        p.vy = rnd(-side, side) * 0.6f;
+        p.gravity = -260;
+        p.drag = 1.2f;
+        p.life = rnd(1.4f, 2.0f) * (0.8f + 0.2f * ks);
+        p.size0 = rnd(9, 13) * k + 3;
+        p.size1 = rnd(32, 46) * k + 8;
+        p.c0 = withAlpha(lerpColour(soil, dirt, rnd(0.4f, 0.95f)), 235);
+        p.c1 = withAlpha(scaleRgb(soil, 0.85f), 0);
+        p.vrot = rnd(-1.2f, 1.2f);
+        add(p);
+    }
+    // 2. Sand spray: small fast grains in a cone.
+    const int nSpray = int((5 + 5 * k) * ld);
+    for (int i = 0; i < nSpray; ++i) {
+        Particle p = P(kSmoke, Blend::Alpha);
+        const float a = rnd(0, 2 * kPi), sp = rnd(20, 70) * k;
+        p.vx = std::cos(a) * sp;
+        p.vy = std::sin(a) * sp * 0.65f;
+        p.vz = rnd(80, 170) * ks;
+        p.gravity = -300;
+        p.drag = 0.9f;
+        p.life = rnd(0.6f, 1.0f);
+        p.size0 = rnd(2.5f, 4.5f);
+        p.size1 = rnd(8, 12) * ks;
+        p.c0 = withAlpha(scaleRgb(soil, rnd(0.8f, 1.0f)), 225);
+        p.c1 = withAlpha(soil, 0);
+        add(p);
+    }
+    // 3. Clods of earth raining back down round the hole.
+    const int nClod = int((5 + 7 * k) * ld) + 2;
+    for (int i = 0; i < nClod; ++i) {
+        Particle p = P(kDebris, Blend::Alpha);
+        const float a = rnd(0, 2 * kPi), sp = rnd(20, 75) * ks;
+        p.vx = std::cos(a) * sp;
+        p.vy = std::sin(a) * sp * 0.7f;
+        p.vz = rnd(110, 220) * ks;
+        p.gravity = -420;
+        p.drag = 0.4f;
+        p.life = rnd(1.1f, 1.7f);
+        p.size0 = p.size1 = rnd(1.8f, 3.4f) * (0.7f + 0.3f * ks);
+        p.c0 = p.c1 = withAlpha(scaleRgb(dirt, rnd(0.6f, 0.9f)), 255);
+        p.vrot = rnd(-12, 12);
+        p.fx = kFxLateFade | (rnd() < 0.5f ? kFxLandDust : 0);
+        add(p);
+    }
+    // 4. A low ring of dust pushed out along the ground.
+    const int nRing = int((5 + 3 * k) * ld) + 1;
+    for (int i = 0; i < nRing; ++i) {
+        Particle p = P(kSmoke, Blend::Alpha);
+        const float a = (float(i) + rnd(0, 0.6f)) / float(nRing) * 2 * kPi, sp = rnd(35, 65) * k;
+        p.age = -0.03f;
+        p.vx = std::cos(a) * sp;
+        p.vy = std::sin(a) * sp * 0.75f;
+        p.z = 1;
+        p.vz = rnd(2, 8);
+        p.drag = 2.2f;
+        p.life = rnd(1.0f, 1.6f);
+        p.size0 = 8 * k + 2;
+        p.size1 = rnd(24, 36) * k + 4;
+        p.c0 = withAlpha(scaleRgb(soil, rnd(0.8f, 0.95f)), 140);
+        p.c1 = withAlpha(soil, 0);
+        p.vrot = rnd(-0.6f, 0.6f);
+        add(p);
+    }
+    // 5. What is left hanging: a short-lived brown-grey cloud of dust and smoke drifting off with the wind.
+    const int nCloud = int((2 + 2 * k) * ld) + 1;
+    for (int i = 0; i < nCloud; ++i) {
+        Particle p = P(kSmoke, Blend::Alpha);
+        p.age = -rnd(0.12f, 0.4f);
+        p.x += rnd(-6, 6) * k;
+        p.y += rnd(-4, 4) * k;
+        p.z += rnd(8, 22) * k;
+        p.vx = rnd(-5, 5) + kWindX;
+        p.vy = rnd(-3, 3) + kWindY;
+        p.vz = rnd(6, 14);
+        p.drag = 0.6f;
+        p.life = rnd(2.0f, 3.0f) * (0.8f + 0.2f * ks);
+        p.size0 = rnd(12, 16) * k;
+        p.size1 = rnd(46, 62) * k + 6;
+        p.c0 = withAlpha(lerpColour(rgba(70, 58, 46, 255), dirt, 0.3f), 175);
+        p.c1 = withAlpha(lerpColour(rgba(150, 140, 128, 255), soil, 0.3f), 0);
+        p.vrot = rnd(-0.5f, 0.5f);
+        add(p);
+    }
+    // 6. On the ground: a shock ring of heaved sand racing out, the crater.
+    addScorch(x, y, 70 + 70 * k, 0.45f + 0.15f * k, 7, std::min(1.0f, 0.55f + 0.35f * k), soil);
+    addScorch(x, y, 16 + 22 * k, 24 + 10 * k, 0, std::min(1.0f, 0.6f + 0.35f * k));
 }
 
 // A small-arms hit: sparks on armour (a vehicle or building cell, or in the air), a puff of
 // dust and flying grains on the ground (terrain colour), a chip and a spark on rock.
 void Effects::spawnImpact(const game::World& w, const TileAtlas& atlas, float x, float y, float z, float scale) {
+    EventScope ev(*this);  // transient (effects intensity)
     const int tx = int(x) >> 5, ty = int(y) >> 5;
     const std::uint32_t cf = w.inBounds(tx, ty) ? w.cell(tx, ty).flags : 0;
     const bool armour = (cf & (game::cell_flags::kVehicle | game::cell_flags::kBuilding)) || z > 4;
     const bool sand = (cf & game::cell_flags::kSand) != 0;
     const float ld = load();
+    note(FxEvent::Impact, w, x, y, z, scale, armour);
     Particle b{};
     b.x = x;
     b.y = y;
@@ -647,6 +897,7 @@ void Effects::spawnImpact(const game::World& w, const TileAtlas& atlas, float x,
 // Muzzle flashes by weapon: a directional flash star (kMuzzle along the shot), a hot core, a
 // short light on the ground and the firer, smoke for cannons / artillery / rocket backblast.
 void Effects::spawnMuzzle(WeaponClass c, float x, float y, float z, float dx, float dy, float age, int house) {
+    EventScope ev(*this);  // transient (effects intensity)
     (void)age;
     const float len = std::hypot(dx, dy);
     const float ux = len > 0 ? dx / len : 0, uy = len > 0 ? dy / len : 1;
@@ -665,6 +916,17 @@ void Effects::spawnMuzzle(WeaponClass c, float x, float y, float z, float dx, fl
     case WeaponClass::Sonic: glow = 30; light = 70; lightA = 150; col = rgba(150, 215, 255, 200); break;
     case WeaponClass::Gas: glow = 26; light = 60; lightA = 110; col = withAlpha(gasGlow(house), 120); break;
     default: return;
+    }
+    if (recordEvents_) {  // the cinematic particles (render3d/cinematic_fx.*)
+        FxEvent fe;
+        fe.kind = FxEvent::Muzzle;
+        fe.x = x;
+        fe.y = y;
+        fe.z = z;
+        fe.weapon = c;
+        fe.tx = ux;
+        fe.ty = uy;
+        noteEvent(fe);
     }
     const float var = rnd(0.8f, 1.2f);
     if (L > 0) {  // the flash star, its muzzle end at the barrel
@@ -866,8 +1128,21 @@ void Effects::spawnShot(const game::World& w, const game::ShotEvent& e, WeaponCl
 // A machine-gun tracer: a short bright streak flying from the muzzle to the target (the gun
 // bullets reach their target within one tick, so the tracer carries the shot).
 void Effects::spawnTracer(float x, float y, float z, float tx, float ty, float tz) {
+    EventScope ev(*this);  // transient (effects intensity)
     const float dx = tx - x, dy = ty - y, dz = tz - z, dist = std::hypot(dx, dy);
     if (dist < 6) return;
+    if (recordEvents_) {  // the cinematic particles (render3d/cinematic_fx.*)
+        FxEvent fe;
+        fe.kind = FxEvent::Tracer;
+        fe.x = x;
+        fe.y = y;
+        fe.z = z;
+        fe.tx = tx;
+        fe.ty = ty;
+        fe.tz = tz;
+        fe.weapon = WeaponClass::Gun;
+        noteEvent(fe);
+    }
     constexpr float kSpeed = 1100;  // px / s
     const float life = std::clamp(dist / kSpeed, 0.05f, 0.16f);
     const float ux = dx / dist, uy = dy / dist;
@@ -910,6 +1185,7 @@ void Effects::spawnTracer(float x, float y, float z, float tx, float ty, float t
 // What a projectile in flight looks like this frame (strips / sprites rebuilt every update in
 // beams_): (x, y) ground point, z height, (vx, vy, vz) its velocity (any scale).
 void Effects::projectileLook(WeaponClass c, float x, float y, float z, float vx, float vy, float vz, int house, int seed) {
+    EventScope ev(*this);  // transient (effects intensity)
     auto put = [&](Tex t, Blend b, float size, float len, float rot, bool aligned, std::uint32_t col, float px, float py,
                    float pz) {
         Particle p{};

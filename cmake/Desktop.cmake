@@ -33,10 +33,14 @@ if(WIN32)
         endforeach()
     endif()
     if(TARGET SDL3::SDL3-shared)
+        # One copy step both executables depend on: two POST_BUILD copies of the same file into the
+        # same folder ran in parallel and failed now and then ("Error copying file", MinGW + Ninja).
+        add_custom_target(d2k_sdl3_dll
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:SDL3::SDL3-shared>" "$<TARGET_FILE_DIR:d2k>"
+            VERBATIM)
+        add_dependencies(d2k_sdl3_dll SDL3::SDL3-shared)
         foreach(t d2k d2k_gui)
-            add_custom_command(TARGET ${t} POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:SDL3::SDL3-shared>" "$<TARGET_FILE_DIR:${t}>"
-                VERBATIM)
+            add_dependencies(${t} d2k_sdl3_dll)
         endforeach()
     endif()
 else()

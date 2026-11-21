@@ -59,6 +59,9 @@ void presetPreviewScene(game::World& world, int side);
 // Check scene (D2K_FACING_DEMO=<UNIT NAME>,<UNIT NAME>,...): one row per unit type from tile (x, y), the
 // 8 body facings (0 = north, clockwise) 3 tiles apart, rows 3 tiles apart - unit shadows and lamps per facing.
 void facingDemoScene(game::World& world, int side, const char* types, int x, int y);
+// D2K_ATTACK_MOVE_DEMO (recordings of the attack-move, game/attack_move.cpp): a selected Atreides
+// group at (x, y) and Harkonnen units spread 5..14 tiles east of it.
+void attackMoveDemoScene(game::World& world, int side, int x, int y);
 
 class GraphicsPreviews {
 public:

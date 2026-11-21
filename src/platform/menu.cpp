@@ -13,6 +13,7 @@
 #include "platform/preset_previews.hpp"
 #include "platform/settings.hpp"
 #include "platform/ui.hpp"
+#include "platform/user_data.hpp"
 #include "render/art_pack.hpp"
 #include "render/ui_text.hpp"
 
@@ -253,12 +254,13 @@ bool Menu::openByName(const std::string& name) {
     else if (name.rfind("artpack", 0) == 0) return openArtPackPreview(name);
     else if (name.rfind("welcome", 0) == 0) return openWelcomePreview(name);
     else if (name.rfind("updates", 0) == 0) return openUpdatesPreview(name);
-    else if (name == "graphics-original" || name == "graphics-enhanced" || name == "graphics-3d") {
+    else if (name == "graphics-original" || name == "graphics-enhanced" || name == "graphics-3d" || name == "graphics-3d-classic") {
         // Screenshots of a preset tab: the preset applied (one-frame runs never save settings).
-        const bool no3d = name == "graphics-3d" && !Settings::modelPackInstalled();  // the tab only explains
-        if (!no3d) settings_.applyPreset(Settings::graphicsPresetFrom(name.substr(9)));
+        const Settings::GraphicsPreset p = Settings::graphicsPresetFrom(name.substr(9));
+        const bool no3d = Settings::isThreeDPreset(p) && !Settings::modelPackInstalled();  // the tab only explains
+        if (!no3d) settings_.applyPreset(p);
         open(MenuPage::Graphics);
-        if (no3d) graphicsTab_ = static_cast<int>(Settings::GraphicsPreset::ThreeD);
+        if (no3d) graphicsTab_ = static_cast<int>(p);
     }
     else if (name == "graphics-custom" || name == "graphics-custom-end") {  // -end: scrolled to the bottom
         open(MenuPage::Graphics);
@@ -973,9 +975,9 @@ MenuResult Menu::pageSkirmish() {
     backdrop(multi_);
     // Rectangles: the 640x400 stage, or (phoneUi) a phone layout in pixels: map list on the left, the
     // preview and two columns of 48 dp choices on the right, Back / Start along the bottom.
-    SDL_FRect listR = st_.r(28, 56, 282, 296), pv = st_.r(326, 56, 286, 128), backR = st_.r(84, 367, 82, 22),
+    SDL_FRect listR = st_.r(28, 56, 282, 296), pv = st_.r(326, 56, 286, 104), backR = st_.r(84, 367, 82, 22),
               goR = st_.r(470, 367, 82, 22);
-    std::function<SDL_FRect(int)> choiceR = [&](int i) { return st_.r(326, 204 + i * 25.0f, 286, 22); };
+    std::function<SDL_FRect(int)> choiceR = [&](int i) { return st_.r(326, 180 + i * 25.0f, 286, 22); };
     const bool phone = phoneUi();
     if (phone) {
         int w = 0, h = 0;
@@ -989,7 +991,7 @@ MenuResult Menu::pageSkirmish() {
         const float lw = std::round(w * 0.36f);
         listR = {m, top, lw, bottom - top};
         const float rx = m + lw + 2 * gap, rw = w - m - rx, cw = (rw - gap) / 2;
-        const float choicesY = bottom - 3 * bh - 2 * gap;
+        const float choicesY = bottom - 4 * bh - 3 * gap;
         pv = {rx, top, rw, std::max(40 * d, choicesY - gap - top)};
         choiceR = [=](int i) { return SDL_FRect{rx + (i % 2) * (cw + gap), choicesY + (i / 2) * (bh + gap), cw, bh}; };
     } else {
@@ -1041,6 +1043,9 @@ MenuResult Menu::pageSkirmish() {
     ui_.choice(choiceR(4), tr("AI difficulty"), settings_.skirmishDifficulty, {tr("Easy"), tr("Normal"), tr("Hard")});
     std::vector<std::string> units = {tr("MCV only"), trf("MCV + %d", 3), trf("MCV + %d", 5), trf("MCV + %d", 10)};
     ui_.choice(choiceR(5), tr("Starting units"), unitsChoice_, units);
+    // Not original: the game's movement rule (game/modern_move.cpp); remembered as the default.
+    int movement = settings_.modernMovement ? 1 : 0;
+    if (ui_.choice(choiceR(6), tr("Unit movement"), movement, {tr("Original"), tr("Modern")})) settings_.modernMovement = movement == 1;
 
     const bool back = ui_.button(backR, tr("Back"));
     const bool go = ui_.button(goR, tr("Start"), ButtonStyle::Primary, map != nullptr);
@@ -1058,6 +1063,7 @@ MenuResult Menu::pageSkirmish() {
         s.sk.startingCredits = std::uint32_t(settings_.skirmishCredits);
         s.sk.difficulty = settings_.skirmishDifficulty;
         s.sk.unitCount = kUnits[std::clamp(unitsChoice_, 0, int(kUnits.size()) - 1)];
+        s.movement = settings_.modernMovement ? 1 : 0;
     }
     return res;
 }
@@ -1095,15 +1101,15 @@ MenuResult Menu::pageOptions() {
     const float x = 116, w = 408, h = 20, gap = 1;
     // The rows scroll inside the panel (Back stays below it): wheel, scroll bar, keyboard focus.
     const int optionRows = 6 + kLanguageOptionRows + kGameplayOptionRows;
-    const float contentH = 2 + optionRows * (h + gap) + 4 + 30 + 22 + 4;
+    const float contentH = 2 + optionRows * (h + gap) + 4 + 30 + 22 + 4 + (kTouchPlatform ? 0 : 8 + 30 + 22 + 4);
     SDL_FRect view = R(104, 59, 426, 312);
     if (phone) view = {box.x + 4 * sx, box.y + 3 * sy, box.w - 14 * sx, box.h - 6 * sy};
     float y = (ui_.beginScroll(view, optionsScroll_, contentH * sy, std::max(4.f, 5 * sy)) - oy) / sy + 2;
     {
-        // Graphics: its own page (presets Original / Enhanced / 3D + Custom); the button names the
-        // active preset.
-        static const char* const kPreset[] = {"Original", "Enhanced", "3D", "Custom"};
-        const int p = std::clamp(static_cast<int>(settings_.activePreset()), 0, 3);
+        // Graphics: its own page (presets Original / Enhanced / 3D / 3D Classic + Custom); the button
+        // names the active preset.
+        static const char* const kPreset[] = {"Original", "Enhanced", "3D", "3D Classic", "Custom"};
+        const int p = std::clamp(static_cast<int>(settings_.activePreset()), 0, 4);
         if (ui_.button(R(x, y, w, h), std::string(tr("Graphics")) + ": " + tr(kPreset[p]) + "  >"))
             open(MenuPage::Graphics);
     }
@@ -1147,6 +1153,17 @@ MenuResult Menu::pageOptions() {
         const SDL_FRect e = R(x + 165, y + 5, 0, 0);
         ui_.text(ui_.ellipsize(dataDirError, R(0, 0, w - 170, 0).w, ts_), e.x, e.y, theme::kBad, ts_);
     }
+    if constexpr (!kTouchPlatform) {  // the per-user folder (settings.ini, saves, imported data): user_data.hpp
+        y += 22 + 8;
+        const SDL_FRect ul = R(x + 5, y, 0, 0);
+        ui_.text(tr("Settings and saves:"), ul.x, ul.y, theme::kText, ui_.textScale);
+        ui_.text(ui_.ellipsize(userDataFolderForDisplay(), R(0, 0, w - 10, 0).w, ts_), ul.x,
+                 ul.y + ui_.textHeight(ui_.textScale) + 4 * ts_, theme::kDim, ts_);
+        y += 30;
+        if (ui_.button(R(x + 5, y, 150, 22), ui_.ellipsize(tr("Open data folder"), R(0, 0, 140, 0).w, ts_), ButtonStyle::Normal,
+                       !prefPath().empty()))
+            openUserDataFolder();
+    }
     ui_.endScroll();
     if (ui_.button(R(100, 377, 110, 22), tr("Back")) || ui_.takeBack()) open(MenuPage::Main);
     std::lock_guard lock(folderMutex_);
@@ -1159,8 +1176,8 @@ MenuResult Menu::pageOptions() {
     return res;
 }
 
-// Options -> Graphics (docs/enhanced-graphics.md "Presets"): tabs Original / Enhanced / 3D are
-// one-tap presets (a tap applies it; the tab shows a preview, one line on the look and its main
+// Options -> Graphics (docs/enhanced-graphics.md "Presets"): tabs Original / Enhanced / 3D (Reimagined) /
+// 3D Classic (the original tiles on the 3D heightfield; owner 2026-11-18) are one-tap presets (a tap applies it; the tab shows a preview, one line on the look and its main
 // values); Custom lists every graphics value grouped, and any change there makes the setup Custom.
 // The Display rows (not part of a preset) follow on every tab. The active preset is underlined.
 MenuResult Menu::pageGraphics() {
@@ -1170,28 +1187,32 @@ MenuResult Menu::pageGraphics() {
     title(tr("Graphics"), 50, 30);
     const float px = 40, pw = 560;  // the panel (wide: the Custom tab has a preview column)
     ui_.panel(st_.r(px, 56, pw, 318));
-    static const char* const kNames[] = {"Original", "Enhanced", "3D", "Custom"};
+    static const char* const kNames[] = {"Original", "Enhanced", "3D", "3D Classic", "Custom"};
+    constexpr int kTabs = 5, kCustomTab = static_cast<int>(GP::Custom);
+    static_assert(static_cast<int>(GP::Custom) == kTabs - 1, "the tabs follow Settings::GraphicsPreset");
+    auto is3dTab = [](int t) { return Settings::isThreeDPreset(static_cast<GP>(t)); };
     const GP active = settings_.activePreset();
     // 3D needs an installed OpenD2K 3D art pack: without one its tab only explains that (no preset applied).
     const bool can3d = Settings::modelPackInstalled();
     // Tabs: big enough to tap (24 page px = 48+ points on an iPad).
     {
         const float tx = px + 8, tw = pw - 16, th = 24, tgap = 6;
-        const float each = (tw - 3 * tgap) / 4;
-        for (int i = 0; i < 4; ++i) {
+        const float each = (tw - (kTabs - 1) * tgap) / kTabs;
+        for (int i = 0; i < kTabs; ++i) {
             const SDL_FRect r = st_.r(tx + i * (each + tgap), 63, each, th);
             Ui::BoldScope bold(ui_, i == graphicsTab_);
-            const ButtonStyle style = i == graphicsTab_ ? ButtonStyle::Primary : i == 2 && !can3d ? ButtonStyle::Subtle : ButtonStyle::Normal;
+            const ButtonStyle style = i == graphicsTab_ ? ButtonStyle::Primary : is3dTab(i) && !can3d ? ButtonStyle::Subtle : ButtonStyle::Normal;
             if (ui_.button(r, tr(kNames[i]), style)) {
                 graphicsTab_ = i;
                 graphicsScroll_ = 0;
-                if (i < 3 && (i != 2 || can3d)) settings_.applyPreset(static_cast<GP>(i));  // one tap applies the preset
+                if (i < kCustomTab && (!is3dTab(i) || can3d)) settings_.applyPreset(static_cast<GP>(i));  // one tap applies the preset
             }
             if (static_cast<int>(active) == i)  // the preset in use
                 ui_.fill(st_.r(tx + i * (each + tgap) + 10, 63 + th + 1.5f, each - 20, 2), theme::kAccent);
         }
     }
-    const bool custom = graphicsTab_ == 3;
+    const bool custom = graphicsTab_ == kCustomTab;
+    const bool tab3d = is3dTab(graphicsTab_);
     // Custom: the rows on the left, the preview column (now / with the row pointed at) on the right.
     const float x = px + 16, w = custom ? 352 : pw - 32, h = 20, gap = 1;
     const float bodyTs = ui_.textScale * 0.85f;  // running text of the preset tabs
@@ -1199,7 +1220,7 @@ MenuResult Menu::pageGraphics() {
     layout.getArtPack = [this] { openArtPackFrom("graphics"); };  // the Custom tab's "Art" header
     const SDL_FRect view = st_.r(px + 4, 94, custom ? 368 : pw - 14, 277);
     const float pvW = 256, pvH = 160;  // preset preview (16:10 like the rendered frame)
-    const float promptH = graphicsTab_ == 2 && artPackPromptWanted() ? kArtPackPromptH : 0;  // "download the 3D art pack?"
+    const float promptH = tab3d && artPackPromptWanted() ? kArtPackPromptH : 0;  // "download the 3D art pack?"
     const float contentH = custom ? graphicsOptionListHeight(layout) : pvH + 10 + promptH + layout.headerH + kDisplayOptionRows * (h + gap);
     const float y0 = (ui_.beginScroll(view, graphicsScroll_, (contentH + 6) * st_.s, std::max(4.f, 5 * st_.s)) - st_.y) / st_.s + 3;
     float y = y0;
@@ -1212,15 +1233,16 @@ MenuResult Menu::pageGraphics() {
         GraphicsPreviews::Picture pic;
         if (previews_) pic = previews_->preset(graphicsTab_, settings_);
         else pic.unavailable = true;
-        static const char* const kBadge[] = {"1998", "2D", "3D"};
-        const bool needsPack = graphicsTab_ == 2 && pic.unavailable && previews_ && hasData();
+        static const char* const kBadge[] = {"1998", "2D", "3D", "3D"};
+        const bool needsPack = tab3d && pic.unavailable && previews_ && hasData();
         drawPreviewCard(ui_, pv, pic, kBadge[graphicsTab_],
                         needsPack ? tr("Needs the 3D art pack (a model pack)") : nullptr, bodyTs);
         // The look in one line, then its main values.
         static const char* const kLine[] = {
             "Exactly the 1998 game: pixel-exact sprites and tiles, the original sidebar, shroud and effects.",
             "Our best 2D: designed terrain, modern effects, soft shroud and the modern panel. Tab shows the 1998 view.",
-            "A 2.5D battlefield: designed 3D terrain with sun shadows, modern effects and the modern panel."};
+            "A 2.5D battlefield: designed 3D terrain with sun shadows, modern effects and the modern panel.",
+            "The original 1998 tiles on the 3D battlefield: 3D models, sun shadows, modern effects and the modern panel."};
         const float tx = x + pvW + 12, tw = w - pvW - 12;
         float ty = y + 2;
         {
@@ -1237,23 +1259,29 @@ MenuResult Menu::pageGraphics() {
         if (graphicsTab_ == 0) {
             add("Interface", tr("Original"));
         } else {
-            add("Terrain", tr(graphicsTab_ == 2 ? (settings_.terrain3d == Settings::Terrain3D::Designed ? "Designed"
+            add("Terrain", tr(tab3d ? (settings_.terrain3d == Settings::Terrain3D::Designed ? "Designed"
                                                     : settings_.terrain3d == Settings::Terrain3D::Faithful ? "Faithful"
                                                     : "Original tiles")
                                                  : (settings_.terrain2d == Settings::Terrain2D::Designed ? "Designed"
                                                     : settings_.terrain2d == Settings::Terrain2D::Faithful ? "Faithful"
                                                     : settings_.terrain2d == Settings::Terrain2D::Original ? "Original tiles" : "Upscaled")));
-            if (graphicsTab_ != 2)
+            if (!tab3d)
                 add("Art", settings_.artPack != "original" ? settings_.artPack
                            : artPackInstalled()            ? std::string(tr("Original"))
                                                            : std::string(tr("Original sprites (no art pack)")));
             else if (can3d) add("Art", render::ArtPack::threeDPack(settings_.modelPack));  // 3D: the objects' art
-            if (graphicsTab_ == 2) {
+            if (tab3d) {
                 static const char* const kModels[] = {"New (art pack)", "PS1"};
                 add("3D models", tr(kModels[std::clamp(static_cast<int>(settings_.models3d), 0, 1)]));
             }
         }
         ty += ui_.wrapped(details, st_.r(tx, ty, tw, 60), theme::kDim, bodyTs) / st_.s + 6;
+        if (graphicsTab_ == static_cast<int>(GP::ThreeD) && can3d) {
+            // The colours of 3D (Reimagined): vivid (default) or the optional Realistic grade (not part of the
+            // preset, so switching it keeps the preset; also in Custom and the in-game options).
+            ui_.toggle(st_.r(tx, ty, std::min(tw, 240.f), 20), tr("Realistic grade"), settings_.naturalGrade);
+            ty += 24;
+        }
         if (graphicsTab_ == 1 && !artPackInstalled()) {
             // Enhanced without the redesign pack: never silently "original art" - offer it.
             const auto ds = ArtPackDownloader::instance().status();
@@ -1263,7 +1291,7 @@ MenuResult Menu::pageGraphics() {
                            ButtonStyle::Primary))
                 openArtPackFrom("graphics");
         }
-        if (graphicsTab_ == 2 && !can3d) {
+        if (tab3d && !can3d) {
             const SDL_FRect a = st_.r(tx, y + pvH + 2, tw, 0);
             ui_.wrapped(tr(Settings::kNeeds3dPackNote), SDL_FRect{a.x, a.y - 2 * ui_.textHeight(ui_.textScale), a.w,
                         2 * ui_.textHeight(ui_.textScale)}, theme::kBad, ui_.textScale);
@@ -1584,10 +1612,10 @@ MenuResult Menu::pageDataDir() {
                                "or the Gruntmods Edition installer (.exe): it is unpacked once."};
         for (const char* l : lines) {
             ui_.text(ui_.ellipsize(tr(l), w - 40.f, s), cx, y, theme::kText, s, Align::Centre);
-            y += ui_.textHeight(s) + 8 * s;
+            y += ui_.textHeight(s) + 6 * s;
         }
     }
-    y += 10 * s;
+    y += 6 * s;
     if (hasData() && !kTouchPlatform) {  // iPad: a sandbox path; documentsSection says "Game data: found"
         ui_.text(tr("Current data folder:"), cx, y, theme::kDim, s, Align::Centre);
         y += ui_.textHeight(s) + 6 * s;
@@ -1697,7 +1725,18 @@ MenuResult Menu::pageDataDir() {
             y += bh + 10 * s;
         }
     }
-    const bool back = ui_.button({cx - bw / 2, y, bw, bh}, hasData() ? tr("Back") : tr("Quit")) || ui_.takeBack();
+    if constexpr (!kTouchPlatform) {
+        // Where settings.ini, saves/ and imported data live (user_data.hpp prefPath), with a button that shows
+        // the folder in Finder / Explorer / the file manager. Touch platforms: a sandbox folder, no button.
+        const std::string where = std::string(tr("Settings and saves:")) + " " + userDataFolderForDisplay();
+        ui_.text(ui_.ellipsize(where, w - 80.f, s), cx, y, theme::kDim, s, Align::Centre);
+        y += ui_.textHeight(s) + 8 * s;
+        if (ui_.button({cx - bw - 8 * s, y, bw, bh}, tr("Open data folder"), ButtonStyle::Normal, !prefPath().empty()))
+            openUserDataFolder();
+    }
+    // Desktop: Back sits right of "Open data folder"; touch: centred.
+    const float backX = kTouchPlatform ? cx - bw / 2 : cx + 8 * s;
+    const bool back = ui_.button({backX, y, bw, bh}, hasData() ? tr("Back") : tr("Quit")) || ui_.takeBack();
     if (back) {
         if (hasData()) open(MenuPage::Options);
         else res.kind = MenuResult::Quit;

@@ -16,7 +16,7 @@
 //   Russian (PS1) — speech and cutscenes from the Russian PS1 disc image (formats/ps1_sound.hpp,
 //     formats/ps1_str.hpp); text from the translation folder (the PS1 disc has only 192 strings).
 //   Russian (AI) — the Russian text as Russian (translation), the speech from OpenD2K's generated AI
-//     voice set (tools/voice/gen_ru_ai.py writes <pref path>/Voices/ru-ai/GAMESFX/*.AUD under the PC
+//     voice set (the optional ru-ai-voices download, or tools/voice/gen_ru_ai.py: <pref path>/Voices/ru-ai/GAMESFX/*.AUD, PC
 //     names; docs/ai-voices.md), lines it lacks in English; the translation's Russian-dubbed movies.
 //
 // Text is kept as the bytes of the files: Latin text in CP1252 (Latin-1), Russian in CP1251. The

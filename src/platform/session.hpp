@@ -14,6 +14,7 @@
 #include "render/cursor.hpp"
 #include "render/lighting.hpp"
 #include "render/map_renderer.hpp"
+#include "render/camera_smooth.hpp"
 #include "render/motion.hpp"
 #include "render/order_feedback.hpp"
 #include "render/vehicle_motion.hpp"
@@ -23,6 +24,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <future>
 #include <unordered_map>
 #include <memory>
@@ -44,6 +46,7 @@ class CommandPanel;
 class ClassicSidebar;
 class PhoneHud;
 class SceneLights;
+class Effects;
 class Bloom;
 class Hdr;
 struct ClassicAction;
@@ -180,6 +183,7 @@ public:
     // (the touch scheme is built on it: tap = select / move / attack).
     void setTouchInput(bool on) { touchInput_ = on; }
     void touchPan(float dx, float dy);    // the finger moved by (dx, dy): the map follows it
+    void touchPanEnd(bool fling);         // the pan's finger lifted (Smooth camera: fling momentum)
     void touchZoom(float factor, float x, float y);  // pinch, around (x, y)
     void touchRotate(float radians);      // 3D: two-finger twist turns the camera
     // A tap that would do nothing (no own unit selected, nothing under it, no click mode):
@@ -262,6 +266,11 @@ private:
     // Battlefield view pixel -> world pixel: the 2D camera, or a 3D pick (units: snap to a unit
     // drawn under the point; else the terrain point).
     void screenToWorld(float sx, float sy, float& wx, float& wy, bool units = true) const;
+    // World beyond the map (3D Reimagined; docs/3d-mode.md): shown? (the camera margin); the red cross.
+    static constexpr float kSurroundScroll = 5 * 32.0f;  // world px the 3D view may go past a map edge
+    bool surroundWanted() const;
+    bool naturalGradeWanted() const;  // Realistic grade (3D Reimagined; docs/3d-mode.md): shown?
+    void markOutside(float sx, float sy, bool click);
     // Scrolls the view by (dx, dy) world pixels along the screen axes (3D: turned by the yaw).
     void panView(float dx, float dy);
     void refreshBoxAnchor();
@@ -283,6 +292,7 @@ private:
     void playSoundEvents(const game::World& world);
     void queueSpeech(int sample, bool queue, int throttle = 0, int priority = 0);
     game::SoundView soundView() const;
+    void playDropInSounds(const game::World& world, const render::Effects& fx);  // drop-in landings (3D)
     void selectInRect(float x0, float y0, float x1, float y1, bool additive);
     // Original mouse scheme (HandleBattlefieldClick 0x4433a0, left button released).
     void originalLeftClick(float sx, float sy);
@@ -307,6 +317,11 @@ private:
     void layout();
     void drawPauseMenu(Ui& ui);
     void drawPauseOptions(Ui& ui);
+    void drawPauseBriefing(Ui& ui);  // the mission briefing (the original's RECAP page)
+    void openBriefing();
+    void buildBriefing();
+    bool hasBriefing();              // campaign / custom mission with briefing text
+    std::string recapFile() const;   // IG<h><n>MIS, "" = none (skirmish)
     void openSlots(bool saving);
     void drawPauseSlots(Ui& ui);
     void drawEndPrompt(Ui& ui);
@@ -376,6 +391,7 @@ private:
     // (a shared_ptr: its deleter is made in session.cpp, where ModelRenderer is complete)
     std::future<std::shared_ptr<std::unique_ptr<render3d::ModelRenderer>>> modelsJob_;
     std::string modelsJobKey_;
+    bool modelsAfterWorld_ = false;  // syncModels ran before the world existed: again after createWorld
     bool threeDFailed_ = false, snapCamera_ = true, middleDrag_ = false;
     // Enhanced "Terrain: Designed" (render3d/terrain_bake.*): the baked terrain chunks.
     std::unique_ptr<render3d::TerrainBaker> baker_;
@@ -413,11 +429,20 @@ private:
     // 60 drawn frames per second whatever the display rate.
     render::OrderFeedback orderFeedback_;
     double flickerClock_ = 0;
-    enum class Feedback { Move, AttackGround, AttackUnit, AttackBuilding, RadarMove };
+    enum class Feedback { Move, AttackGround, AttackUnit, AttackBuilding, RadarMove, AttackMove, RadarAttackMove };
     void orderFeedback(Feedback kind, float wx, float wy, int targetSide = -1, int targetIndex = -1);
     // Minimap / radar order (Original controls: left click with units selected, like the original
     // radar; Modern controls: right click; Ctrl: force attack). Returns true when an order went out.
     bool minimapOrder(float wx, float wy, bool smart);
+    // Attack-move (not original; Settings::attackMove, game/attack_move.cpp): A held (both control
+    // schemes) or pressed once before the click (Modern controls, like StarCraft; Esc / a right
+    // click / the order click ends it). attackMoveClick: the order for a battlefield click at world
+    // (wx, wy) - an enemy under the cursor is attacked as usual, anything else is an attack-move to
+    // the cell. attackMoveHeld: the A key is down now (the keyboard state, so focus loss clears it).
+    bool attackMoveArmed_ = false;
+    bool attackMoveHeld() const;
+    bool attackMoveActive() const;
+    bool attackMoveClick(float wx, float wy);
     int playerSide_ = 0;
     int placingType_ = -1;  // building type being placed (cursor footprint), -1 = none
     struct LogLine { std::string text; std::uint32_t until; };
@@ -431,7 +456,27 @@ private:
     void applyCameraMove(double dt);
     void applyDemoClicks(double dt);  // D2K_DEMO_CLICKS (recordings, debug)
     double demoClickT_ = 0;
-    render::MotionInterpolator motion_;
+    // (mutable: the const picking helpers move the units to their drawn positions for a moment)
+    mutable render::MotionInterpolator motion_;
+    render::SmoothDrive drive_;  // Smooth driving (Settings::smoothDriving): drawn vehicle paths / facings
+    // Smooth camera (Settings::smoothCamera; render/camera_smooth.hpp): inertia, eased zoom, glides.
+    render::CameraSmoother camSmooth_;
+    bool smoothCam() const { return settings_.smoothCamera; }
+    bool touchPanning_ = false;
+    int lastGroupKey_ = -1;      // Smooth camera: a control group key pressed twice centres on the group
+    Uint64 lastGroupKeyNs_ = 0;
+    // Minimap jumps / group centring: a short glide when near (Smooth camera, 2D), else a cut.
+    void glideViewOn(float wx, float wy);
+    // The units' drawn positions (render::MotionInterpolator::applyDrawn) while picking with them:
+    // what is on screen is what gets selected (Enhanced / 3D).
+    struct DrawnScope;
+    bool pickDrawn() const { return appliedGraphics_ != Settings::Graphics::Original && settings_.smoothMotion; }
+    void applyCameraSmoothing(double dt, float wantX, float wantY);
+    void applyDemoInput(double dt);  // D2K_DEMO_INPUT (recordings, debug)
+    double demoInputT_ = 0;
+    std::uint8_t demoKeys_ = 0;      // D2K_DEMO_INPUT: held arrows (1 left, 2 right, 4 up, 8 down)
+    std::FILE* cameraLog_ = nullptr; // D2K_CAMERA_LOG: per-frame camera CSV
+    double cameraLogT_ = 0;
     // "Vehicle animation: Modern" (render-only hull motion, render/vehicle_motion.hpp); its clock in
     // game ticks (+ the fraction of the next one) as the effects' (-1 = restart).
     std::unique_ptr<render::VehicleMotion> vehicleMotion_;
@@ -461,6 +506,10 @@ private:
     bool pauseOptions_ = false; // pause menu shows the in-game options page
     float pauseOptionsScroll_ = 0;  // its rows scroll when the window is too small
     int pauseSlots_ = 0;        // pause menu shows the save (1) / load (2) slot page
+    bool pauseBriefing_ = false;   // pause menu shows the mission briefing page
+    bool briefingBuilt_ = false;
+    float briefingScroll_ = 0;
+    std::string briefingHeading_, briefingText_;  // UTF-8 (RECAP: "Mission 1", then the IG_ text)
     std::vector<SaveSlot> slots_;
     int slotSel_ = 0, loadSlot_ = -1;
     float slotScroll_ = 0;

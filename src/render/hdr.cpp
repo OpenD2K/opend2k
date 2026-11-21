@@ -4,6 +4,7 @@
 #include "render3d/shader_blobs.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 namespace d2k::render {
@@ -19,6 +20,7 @@ struct TmUniforms {
     float bloomU, bloomV, inLinear, outLinear;
     float desaturate, adjustOn, pad1, pad2;
     float brightness, contrast, gamma, saturation;  // DisplayAdjust
+    float gradeDesat, gradeToe, gradeCool, gradeLift;  // Grade (all 0 = off)
 };
 }  // namespace
 
@@ -29,6 +31,29 @@ DisplayAdjust DisplayAdjust::fromSettings(int brightness, int contrast, int gamm
     a.gamma = float(std::clamp(gamma, 80, 140)) / 100.0f;
     a.saturation = float(std::clamp(saturation, -50, 50)) / 100.0f;
     return a;
+}
+
+Grade Grade::natural(float day) {
+    // Tuned against the Defcon Zero reference frames (docs/reimagined-audit.md): the ground loses its orange
+    // cast, cast shadows and the models' shaded sides go deep and neutral, the sunlit sand stays bright.
+    // D2K_GRADE="desat,toe,cool,lift" overrides (tuning).
+    static const Grade base = [] {
+        Grade g;
+        g.desaturate = 0.22f;
+        g.toe = 0.035f;
+        g.cool = 1.0f;
+        g.lift = 0.03f;
+        if (const char* e = std::getenv("D2K_GRADE")) std::sscanf(e, "%f,%f,%f,%f", &g.desaturate, &g.toe, &g.cool, &g.lift);
+        g.desaturate = std::clamp(g.desaturate, 0.001f, 0.9f);
+        return g;
+    }();
+    Grade g = base;
+    const float d = std::clamp(day, 0.0f, 1.0f);
+    g.desaturate = std::max(0.001f, g.desaturate * (0.45f + 0.55f * d));
+    g.toe *= 0.4f + 0.6f * d;  // (the night is dark already: units must stay readable)
+    g.cool *= d;
+    g.lift *= d;
+    return g;
 }
 
 void setHdrOutput(bool extended, float headroom) {
@@ -67,6 +92,10 @@ bool Hdr::available() {
 bool Hdr::init() {
     dev_ = render3d::gpuDeviceOf(r_);
     if (!dev_ || !render3d::deviceHasShaders(dev_)) return false;
+    if (!render3d::gpuRenderStateOk()) {  // Direct3D 12: the custom shader's pipeline fails there (render3d/gpu.hpp)
+        SDL_SetError("custom renderer shaders are off on %s", SDL_GetGPUDeviceDriver(dev_));
+        return false;
+    }
     shader_ = render3d::createShader(dev_, render3d::ShaderId::TonemapFs, 2, 1);
     if (!shader_) return false;
     SDL_GPUSamplerCreateInfo si{};
@@ -110,7 +139,7 @@ SDL_Texture* Hdr::createTarget(SDL_Renderer* r, int w, int h) {
 }
 
 bool Hdr::compose(SDL_Texture* scene, int srcW, int srcH, SDL_Texture* bloom, float bloomStrength, const SDL_FRect& dst,
-                  bool tonemap) {
+                  bool tonemap, const Grade& grade) {
     if (!scene || srcW <= 0 || srcH <= 0 || !available()) return false;
     if (!ensureState(bloom) && !(bloom && ensureState(nullptr))) return false;
     if (stateBloom_ != render3d::gpuTextureOf(bloom ? bloom : black_)) bloom = nullptr;  // fell back to black
@@ -132,6 +161,12 @@ bool Hdr::compose(SDL_Texture* scene, int srcW, int srcH, SDL_Texture* bloom, fl
     u.inLinear = 0.0f;   // the scene holds sRGB-coded values (the renderer is an sRGB one)
     u.outLinear = 0.0f;  // sRGB-coded (EDR: extended above 1; presentCanvas decodes it)
     u.desaturate = 0.5f;
+    if (grade.on()) {
+        u.gradeDesat = grade.desaturate;
+        u.gradeToe = std::max(grade.toe, 1e-4f);
+        u.gradeCool = grade.cool;
+        u.gradeLift = grade.lift;
+    }
     SDL_SetGPURenderStateFragmentUniforms(state_, 0, &u, sizeof u);
     SDL_BlendMode blend = SDL_BLENDMODE_NONE;
     SDL_GetTextureBlendMode(scene, &blend);

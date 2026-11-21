@@ -180,12 +180,39 @@ void presetPreviewScene(game::World& w, int me) {
     if (harvester >= 0) w.orderMove(me, harvester, 21, 7);  // onto the spice: harvests
 }
 
+void attackMoveDemoScene(game::World& w, int me, int x, int y) {
+    const auto& T = w.rules().templates->bin;
+    auto unit = [&](const std::string& n) {
+        for (int i = 0; i < int(T.unitCount); ++i)
+            if (n == T.unitNames[i]) return i;
+        return -1;
+    };
+    int foe = -1;
+    for (int s = 0; s < game::kMaxSides && foe < 0; ++s)
+        if (s != me && w.diplomacy(me, s) == 1) foe = s;
+    if (foe < 0) foe = (me + 1) % game::kMaxSides;
+    struct U { bool mine; const char* name; int dx, dy; };
+    static const U kUnits[] = {{true, "ATREIDES COMBAT TANK", 0, -1}, {true, "ATREIDES COMBAT TANK", 0, 1},
+                               {true, "ATREIDES COMBAT TANK", 1, 0},  {true, "QUAD", -1, -2},
+                               {true, "QUAD", -1, 2},                 {true, "TROOPER", -2, 0},
+                               {false, "TROOPER", 5, -3},             {false, "LIGHT INF", 6, 3},
+                               {false, "QUAD", 8, 0},                 {false, "TRIKE", 10, -2},
+                               {false, "HARKONNEN COMBAT TANK", 12, 2}, {false, "TROOPER", 14, -1}};
+    for (const U& u : kUnits) {
+        const int ty = unit(u.name), ux = x + u.dx, uy = y + u.dy;
+        if (ty < 0 || !w.inBounds(ux, uy)) continue;
+        const int i = w.addUnit(u.mine ? me : foe, ty, ux, uy, ux, uy);
+        if (i >= 0 && u.mine) w.sides()[me].units[i].selected = true;
+    }
+}
+
 void facingDemoScene(game::World& w, int me, const char* types, int x0, int y0) {
     const auto& T = w.rules().templates->bin;
     // Army scenes (light / performance checks): "NAME*R" = R rows of that type; D2K_FACING_DEMO_COLS units per
     // row (default 8, the facings repeat), D2K_FACING_DEMO_STEP tiles apart (default 3).
     const int cols = std::getenv("D2K_FACING_DEMO_COLS") ? std::max(1, std::atoi(std::getenv("D2K_FACING_DEMO_COLS"))) : 8;
     const int step = std::getenv("D2K_FACING_DEMO_STEP") ? std::max(1, std::atoi(std::getenv("D2K_FACING_DEMO_STEP"))) : 3;
+    if (const char* at = std::getenv("D2K_FACING_DEMO_AT")) std::sscanf(at, "%d,%d", &x0, &y0);  // the first unit's tile
     std::stringstream ss(types ? types : "");
     std::string name;
     int row = 0;
@@ -207,6 +234,12 @@ void facingDemoScene(game::World& w, int me, const char* types, int x0, int y0) 
                 auto& u = w.sides()[std::size_t(me)].units[std::size_t(i)];
                 u.facing = (f * 4 + r * 4) & 31;
                 u.facingTurret = u.facingTurretTarget = u.facing;
+                // D2K_FACING_DEMO_MOVE=dx,dy: every unit is ordered that many tiles on (driving checks:
+                // wheels and tracks, docs/3d-models.md "Wheels and tracks").
+                if (const char* mv = std::getenv("D2K_FACING_DEMO_MOVE")) {
+                    int dx = 0, dy = 0;
+                    if (std::sscanf(mv, "%d,%d", &dx, &dy) == 2 && w.inBounds(x + dx, y + dy)) w.orderMove(me, i, x + dx, y + dy);
+                }
             }
     }
 }
@@ -254,9 +287,10 @@ void GraphicsPreviews::setData(const std::string& dataDir, const std::string& la
 
 bool GraphicsPreviews::presetSettings(int preset, const Settings& current, Settings& out) {
     out = current;
-    out.applyPreset(static_cast<Settings::GraphicsPreset>(std::clamp(preset, 0, 2)));
-    if (preset != 2) return true;
-    // 3D: the models of the chosen model pack, else the first installed one.
+    const auto p = static_cast<Settings::GraphicsPreset>(std::clamp(preset, 0, 3));  // (3 = 3D Classic)
+    out.applyPreset(p);
+    if (!Settings::isThreeDPreset(p)) return true;
+    // 3D / 3D Classic: the models of the chosen model pack, else the first installed one.
     out.models3d = Settings::Models3D::New;
     if (render3d::ModelRenderer::packPath(out.modelPack).empty()) out.modelPack.clear();
     return !render3d::ModelRenderer::packPath(out.modelPack).empty();
@@ -711,7 +745,7 @@ void GraphicsPreviews::trimDisk() {
 void GraphicsPreviews::prefetch(const Settings& current) {
     if (sync_ || dataDir_.empty() || dataFailed_) return;
     if (shippedOn_ && !shipped_.empty() && !envReady(false)) return;  // (the shipped keys need the Env)
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 4; ++i)
         if (preset(i, current, true).pending) return;  // the presets first (after the one shown)
     const std::string id = keyOf(current, PreviewShot::Overview);
     if (id == prefetched_) return;

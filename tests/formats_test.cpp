@@ -1,5 +1,6 @@
 // Format loader tests against the original game data (skipped if game/ is absent).
 
+#include "formats/utf8_bom.hpp"
 #include "formats/io.hpp"
 #include "formats/language.hpp"
 #include "formats/map.hpp"
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <fstream>
 #include <cstring>
+#include <sstream>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -92,6 +94,21 @@ std::vector<std::uint8_t> syntheticInstaller() {
 }
 
 // ---- art pack download pieces (no network): SHA-256, manifest, zip + traversal guard ----------
+
+void testUtf8Bom() {
+    // settings.ini / pack.ini / mission .ini written by Notepad or PowerShell 5 ("UTF-8" = with a BOM)
+    std::istringstream bom("\xEF\xBB\xBFgameSpeed=100\nfullscreen=1\n"), plain("gameSpeed=100\n"), shortText("ab");
+    std::string line;
+    d2k::formats::skipUtf8Bom(bom);
+    CHECK(std::getline(bom, line) && line == "gameSpeed=100");
+    d2k::formats::skipUtf8Bom(plain);
+    CHECK(std::getline(plain, line) && line == "gameSpeed=100");
+    d2k::formats::skipUtf8Bom(shortText);
+    CHECK(std::getline(shortText, line) && line == "ab");
+    CHECK(d2k::formats::stripUtf8Bom("\xEF\xBB\xBFkey=v") == "key=v" && d2k::formats::stripUtf8Bom("key=v") == "key=v");
+    const d2k::formats::IniFile ini = d2k::formats::parseIni("\xEF\xBB\xBF[Basic]\r\nName=Test\r\n");
+    CHECK(d2k::formats::iniGet(ini, "Basic", "Name") == "Test");
+}
 
 void testSha256() {
     using d2k::formats::Sha256;
@@ -203,6 +220,26 @@ void testArtPackManifest() {
     CHECK(parseArtPackManifest(R"({"name":"p","version":"1","size":5,"sha256":")" + sha + R"(","file":"p.zip"})",
                                "http://127.0.0.1:8765/dir/artpack-manifest.json?x=1", m, err));
     CHECK(m.urls.size() == 1 && m.urls[0] == "http://127.0.0.1:8765/dir/p.zip");
+    CHECK(m.extras.empty() && !m.isExtra);
+    // Extras (0.0.3): valid ones kept (min_engine inherited), bad ones / duplicate names dropped, main still fine.
+    CHECK(parseArtPackManifest(R"({"name":"p","version":"1","size":5,"sha256":")" + sha + R"(","file":"p.zip","min_engine":"0.0.3",
+        "extras":[{"name":"models-reimagined","title":"Reimagined models","version":"0.0.3","size":7,"sha256":")" + sha +
+                                   R"(","file":"r.zip","for3d":true,"requires":"p","description":"d"},
+                  {"name":"../bad","version":"1","size":5,"sha256":")" + sha + R"(","file":"x.zip"},
+                  {"name":"p","version":"1","size":5,"sha256":")" + sha + R"(","file":"dup.zip"},
+                  {"name":"photo-terrain","version":"0.0.3","size":9,"sha256":")" + sha + R"(","file":"t.zip"}, 3]})",
+                               "http://127.0.0.1:8765/artpack-manifest.json", m, err));
+    CHECK(m.extras.size() == 2 && m.extras[0].name == "models-reimagined" && m.extras[0].for3d && m.extras[0].requires_ == "p" &&
+          m.extras[0].isExtra && m.extras[0].minEngine == "0.0.3" && m.extras[0].urls[0] == "http://127.0.0.1:8765/r.zip" &&
+          m.extras[1].name == "photo-terrain" && !m.extras[1].for3d && m.extras[1].title == "photo-terrain");
+    CHECK(m.item("photo-terrain") == &m.extras[1] && m.item("p") == &m && m.item("nope") == nullptr);
+    CHECK(m.extras[0].install.empty());
+    // "install": the AI voice folder is known; an unknown target drops that extra only.
+    CHECK(parseArtPackManifest(R"({"name":"p","version":"1","size":5,"sha256":")" + sha + R"(","file":"p.zip",
+        "extras":[{"name":"ru-ai-voices","version":"0.0.3","size":7,"sha256":")" + sha + R"(","file":"v.zip","install":"ai-voices"},
+                  {"name":"future","version":"1","size":5,"sha256":")" + sha + R"(","file":"f.zip","install":"somewhere"}]})",
+                               "http://127.0.0.1:8765/artpack-manifest.json", m, err));
+    CHECK(m.extras.size() == 1 && m.extras[0].name == "ru-ai-voices" && m.extras[0].install == kInstallAiVoices && !m.extras[0].for3d);
     // Refused: bad names (path traversal via the folder name), bad hash, no size, newer format, junk.
     for (const char* bad : {R"({"name":"../evil","version":"1","size":5,"sha256":"%s","file":"p.zip"})",
                             R"({"name":"a/b","version":"1","size":5,"sha256":"%s","file":"p.zip"})",
@@ -960,7 +997,7 @@ void testLanguageSynthetic() {
         ai.aiVoicesDir = lang::findAiVoices(ai.aiVoicesRoot);
         CHECK(ai.aiVoicesDir.empty());
         const auto none = lang::availability(lang::Id::RussianAi, ai);
-        CHECK(!none.any() && none.needs.find("tools/voice/gen_ru_ai.py") != std::string::npos);
+        CHECK(!none.any() && none.needs.find("Options > Art pack") != std::string::npos);
         {   // Without the voices, ru-ai falls back to English voices (not the Stream dub) and English text.
             const lang::Resolved r = lang::resolve({lang::Id::RussianAi, lang::Id::RussianAi, lang::Id::RussianAi}, ai);
             CHECK(r.sel.voices == lang::Id::English && r.voicesDir.empty() && r.sel.text == lang::Id::English);
@@ -1051,6 +1088,7 @@ int main() {
     testNsisSynthetic();
     testFormat80();
     testSha256();
+    testUtf8Bom();
     testArtPackManifest();
     testReleaseInfo();
     testZipReader();

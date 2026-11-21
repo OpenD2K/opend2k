@@ -115,6 +115,19 @@ void SceneLight::sunDirection(const float base[3], float out[3]) const {
     out[2] = -std::cos(az) * std::cos(el);
 }
 
+void calmDayCast(SceneLight& l) {
+    if (l.identity || !l.modern) return;
+    // The day's lamps are 0.12, dawn's 0.3: 1 at day .. 0 from dawn / dusk on.
+    const float day = std::clamp(1.0f - (l.lamps - 0.12f) / 0.15f, 0.0f, 1.0f);
+    if (day <= 0) return;
+    // The sun: from the Modern day's orange (1.20, 1.05, 0.84) to a paler straw yellow of the same strength.
+    static constexpr float kSun[3] = {1.10f, 1.07f, 0.89f};
+    for (int i = 0; i < 3; ++i) l.sun[i] += (kSun[i] - l.sun[i]) * day;
+    const float m = 0.3f * l.fog[0] + 0.59f * l.fog[1] + 0.11f * l.fog[2];
+    for (int i = 0; i < 3; ++i) l.fog[i] += (m - l.fog[i]) * 0.5f * day;
+    l.sat += (std::min(l.sat, 1.0f) - l.sat) * day;
+}
+
 SpriteShadowWarp spriteShadowWarp(const SceneLight& l) {
     SpriteShadowWarp w;
     if (!l.modern || l.identity || (std::fabs(l.dAz) < 1e-3f && std::fabs(l.elK - 1) < 1e-4f)) return w;

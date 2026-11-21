@@ -11,6 +11,7 @@
 
 #include "formats/templates.hpp"
 #include "game/world.hpp"
+#include "render/smooth_drive.hpp"
 
 #include <array>
 #include <cstdint>
@@ -35,7 +36,10 @@ public:
     void reset();
     // Once per drawn frame, with the drawn (interpolated) positions. dt = effect seconds since the
     // last call (0 while paused: the springs hold).
-    void update(const game::World& w, float dt);
+    // drive (Smooth driving, nullptr = off): the hull turns with the drawn heading (it leans into
+    // the curves it drives); bumps (3D only: a sub-pixel 2D bob reads as shaking) adds a low
+    // suspension bob on rock while driving.
+    void update(const game::World& w, float dt, const SmoothDrive* drive = nullptr, bool bumps = false);
     // nullptr = not a tracked ground vehicle (infantry, flyers, carried units, worms).
     const Pose* pose(int side, int index) const;
 
@@ -49,6 +53,7 @@ private:
         float pitch = 0, pitchV = 0, roll = 0, rollV = 0, lift = 0, liftV = 0;
         float rec = 0, recV = 0, trec = 0, trecV = 0;
         int terrain = -1;           // ground class of the last cell (one bump where it changes)
+        float odo = 0;              // px driven (the rock bob's phase)
         Pose out;
     };
     const formats::Templates& t_;

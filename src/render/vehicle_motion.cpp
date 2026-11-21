@@ -70,7 +70,7 @@ const VehicleMotion::Pose* VehicleMotion::pose(int side, int index) const {
     return s.key >= 0 ? &s.out : nullptr;
 }
 
-void VehicleMotion::update(const game::World& w, float dt) {
+void VehicleMotion::update(const game::World& w, float dt, const SmoothDrive* drive, bool bumps) {
     dt = std::clamp(dt, 0.0f, 0.1f);
     time_ += dt;
     const std::uint32_t now = w.gameTicks();
@@ -95,7 +95,8 @@ void VehicleMotion::update(const game::World& w, float dt) {
             const bool ground = !tp.isInfantry && !(u.flags & 0x200140) && tp.specialBehavior != 5 &&
                                 !(tp.specialBehavior == 1 && u.animFrame != 0);
             const float x = float(u.posX) / 65536.0f, y = float(u.posY) / 65536.0f;
-            const float face = float(u.facing & 31) * (2 * kPi / 32);
+            const SmoothDrive::Out* drawn = drive ? drive->out(s, i) : nullptr;
+            const float face = (drawn ? drawn->facing : float(u.facing & 31)) * (2 * kPi / 32);
             const std::int32_t key = u.type + 1;
             if (!ground) {
                 v.key = -1;
@@ -141,7 +142,9 @@ void VehicleMotion::update(const game::World& w, float dt) {
             // Roll: out of the turn (turning right = clockwise -> the left side goes down), with
             // speed only (a hull turning in place stays level: owner 2026-11-14, no motion while
             // standing but the recoil).
-            spring(v.roll, v.rollV, -omega * 0.008f * moving, 1.8f, 0.5f, dt);
+            // Smooth driving: the hull drives real curves (a steady turn rate while moving), so it
+            // leans out of them visibly (~3 degrees in a tile-radius corner).
+            spring(v.roll, v.rollV, -omega * (drawn ? 0.03f : 0.008f) * moving, 1.8f, 0.5f, dt);
             // Suspension: one bounce where the ground class changes (sand -> rock, onto concrete).
             // (No random bumps on rough ground and no idling tremble any more: owner 2026-11-14,
             // "every unit has some small shaking".)
@@ -156,12 +159,24 @@ void VehicleMotion::update(const game::World& w, float dt) {
                 v.terrain = cls;
             }
             spring(v.lift, v.liftV, 0, 3.4f, 0.32f, dt);
+            // 3D: a low suspension bob over rock while driving (two incommensurate waves of the
+            // distance driven; none on sand / concrete, none standing).
+            v.odo += dist;
+            float bobLift = 0, bobPitch = 0;
+            if (bumps && w.inBounds(tx, ty) && moving > 0.1f) {
+                const std::uint32_t cf = w.cell(tx, ty).flags;
+                if (!(cf & (game::cell_flags::kSand | game::cell_flags::kConcrete))) {
+                    const float k = std::min(moving, 1.0f);
+                    bobLift = 0.35f * k * std::sin(v.odo * 0.31f) * (0.6f + 0.4f * std::sin(v.odo * 0.113f));
+                    bobPitch = 0.012f * k * std::sin(v.odo * 0.23f + 1.3f);
+                }
+            }
             spring(v.rec, v.recV, 0, 2.6f, 0.55f, dt);
             spring(v.trec, v.trecV, 0, 4.5f, 0.75f, dt);
             Pose& o = v.out;
-            o.pitch = std::clamp(v.pitch, -0.14f, 0.14f);
+            o.pitch = std::clamp(v.pitch + bobPitch, -0.14f, 0.14f);
             o.roll = std::clamp(v.roll, -0.09f, 0.09f);
-            o.lift = std::clamp(v.lift, -1.5f, 2.5f);
+            o.lift = std::clamp(v.lift + bobLift, -1.5f, 2.5f);
             o.tremble = 0;
             o.recoil = std::clamp(v.rec, -1.0f, 3.0f);
             o.turretRecoil = std::clamp(v.trec, -1.0f, 3.5f);

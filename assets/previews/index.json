@@ -1,7 +1,7 @@
 {
   "format": 1,
   "scene_version": 2,
-  "engine_version": "0.0.2",
+  "engine_version": "0.0.3",
   "language": "en",
   "map_hash": "e8f91ba9cfb13fb9",
   "terrain_assets": true,
@@ -680,5 +680,5 @@
       "key": "s2|map:e8f91ba9cfb13fb9|battle|enhanced|original|fx1sh1hb2pt0tod4li1hdr1|t2d3"
     }
   ],
-  "total_bytes": 10113045
+  "total_bytes": 10261280
 }

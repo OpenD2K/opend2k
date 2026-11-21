@@ -16,7 +16,10 @@
 #include "formats/bintables.hpp"
 #include "formats/templates.hpp"
 #include "game/world.hpp"
+#include "render/building_assemble.hpp"
 #include "render/effect_anchors.hpp"
+#include "render/fx_budget.hpp"
+#include "render/smooth_drive.hpp"
 
 #include <algorithm>
 #include <array>
@@ -31,6 +34,8 @@ struct SDL_Vertex;
 namespace d2k::render {
 
 class MuzzleTips;
+class DropInSource;
+class AssemblySource;
 
 struct Camera;
 class TileAtlas;
@@ -74,9 +79,46 @@ public:
     // "Vehicle animation: Modern" (Settings::vehicleAnimation): a puff of dust kicked up when a
     // vehicle sets off. Set before update().
     void setVehicleAnimation(bool on) { vehicleAnim_ = on; }
+    // Smooth driving (render/smooth_drive.hpp; nullptr = off): ground vehicles' UnitVisual facings
+    // are the drawn ones of the smoothed path instead of the eased 32 steps.
+    void setDrive(const SmoothDrive* d) { drive_ = d; }
+    // Drop-in build-up (render/building_dropin.hpp; Graphics: 3D with models, "Building placement:
+    // Drop-in"): who says which buildings are dropping in this frame (nullptr = none). The landing
+    // kicks up a dust ring and pebbles, a soft shadow grows under the falling building and the sand
+    // under it stays dark for a moment (render/effects_dropin.cpp). Set before update().
+    void setDropIn(const DropInSource* s) { dropIn_ = s; }
+    // The built-in landing dust on / off: a later particle system (the Reimagined cinematic
+    // particles) can take the burst over and read dropInImpacts() instead; the marks stay.
+    void setDropInDust(bool on) { dropInDust_ = on; }
+    // The landings of this update (visible ones only): footprint (world px), its cell, the sand colour.
+    struct DropInImpact {
+        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        int tileX = 0, tileY = 0;
+        std::uint32_t sand = 0;
+        bool fromGround = false;  // an MCV unfolding where it stands (a lighter puff)
+    };
+    const std::vector<DropInImpact>& dropInImpacts() const { return dropInImpacts_; }
+    // Assemble build-up (render/building_assemble.hpp; "Building placement: Assemble"): who says which
+    // buildings are assembling this frame (nullptr = none): survey outline and dust on the footprint,
+    // sparks along the rising cuts, a weld flash and dust where each part seats (render/effects_assemble.cpp).
+    // Set before update().
+    void setAssembly(const AssemblySource* s) { assembly_ = s; }
     // Particle density of the continuous emitters (building fires): 1 = High, less on lower Quality
     // presets (phones). Set before update().
     void setDetail(float d) { detail_ = std::clamp(d, 0.25f, 1.0f); }
+    // "Effects intensity" (Settings::effectsIntensity; render/fx_budget.hpp): Cinematic = the full look,
+    // Balanced = scaled down as the view gets busy, Clean = short effects, minimal smoke. Set before update().
+    void setIntensity(FxIntensity i) { budget_.intensity = i; }
+    FxIntensity intensity() const { return budget_.intensity; }
+    const FxBudget& budget() const { return budget_; }
+    float areaK() const { return areaK_; }  // reference view area / the view's area (FxBudget::areaK)
+    // D2K_FX_HIDE=1 (measurements only): the particles are simulated as usual but not drawn (2D, plain 3D and
+    // the cinematic particles) - the "no effects" frame the readability numbers compare against.
+    static bool hideParticles();
+    // The extra opacity factor of a particle from the intensity: the early fade-out of a capped puff x the
+    // see-through over units (1 = as spawned).
+    struct Particle;
+    static float budgetAlpha(const Particle& p);
 
     // Screen shake for this frame, world pixels (add to the camera).
     float shakeX() const { return shakeX_; }
@@ -88,6 +130,13 @@ public:
         float facing = 0, turret = 0;   // 0..32 (32-way facing units, eased)
         float x = 0, y = 0;             // last drawn position (world px)
         float treadDist = 0, dustDist = 0;
+        // Track marks: this vehicle's trail (Tread nodes; 0 = none yet / broken), the px driven and
+        // the heading turned along it, the heading of its last node; while on rock / concrete the
+        // newest point is held back (pend*) and only laid when the trail reaches sand again.
+        std::uint32_t trail = 0;
+        float trailOdo = 0, trailTurn = 0, lastAngle = 0, nodeAngle = 0;
+        float pendX = 0, pendY = 0, pendAngle = 0, pendOdo = 0, pendTurn = 0;
+        bool pend = false, angleSet = false;
         float smokeT = 0;
         float still = 0;                // seconds standing (the dust kick-up on setting off)
         bool moving = false;
@@ -133,6 +182,11 @@ public:
         float len;            // > 0: a strip len world px long along rot, size wide
         std::uint8_t fx;      // kFx* behaviour flags (debris landing, smoke trails, late fade)
         float acc;            // kFxTrail: distance to the next trail puff
+        // Effects intensity (render/fx_budget.hpp; 0 = off): `cut` = the age (s) at which a transient puff has
+        // faded out and goes (capped smoke clears early; the look before that is unchanged); `clear` = how
+        // see-through it is over a unit (0 = not at all, eased per frame).
+        float cut;
+        float clear;
     };
     enum : std::uint8_t {
         kFxLandDust = 1,   // first ground contact: a dust puff
@@ -141,9 +195,26 @@ public:
         kFxLanded = 8,     // (internal) the landing effects ran
         kFxLateFade = 16,  // keeps c0 and fades out over the last quarter of its life (lying debris)
         kFxHot = 32,       // fire: the colour holds near c0 and cools late (colour lerp by t^2)
+        kFxBlast = 64,     // part of a weapon blast the 3D cinematic particles redraw (Reimagined): the 3D
+                           // renderer skips it while they run (its trail / landing puffs inherit the tag); also the
+                           // dark smoke of fires, damage and wrecks, which they draw lit (docs/3d-mode.md "Lit smoke")
     };
+    // Track marks (docs/3d-mode.md "Track marks"): the trail of a ground vehicle as nodes, each linked to
+    // the one before it on the same trail, so the 3D view draws continuous imprint strips through the
+    // turns (render3d/track_marks.hpp); 2D stamps its old tread marks at the `stamp` nodes.
     struct Tread {
-        float x, y, angle, age;
+        float x = 0, y = 0;         // the vehicle's drawn ground point (world px)
+        float angle = 0;            // its drawn hull heading (radians, screen: 0 = east, + clockwise)
+        float age = 0;              // s
+        float odo = 0;              // px driven along the trail (the tread pattern's phase)
+        float turn = 0;             // radians turned along the trail (unwrapped; the bands' own odometers)
+        float depth = 0;            // how soft the ground is here: 1 sand / dunes / spice, 0 rock / concrete
+        std::uint32_t serial = 0;   // node number (0 = empty slot)
+        std::uint32_t prev = 0;     // the node before it on the same trail (0 = the trail starts here)
+        std::int16_t type = -1;     // unit type
+        bool spin = false;          // turned on the spot since the previous node (a scuffed arc)
+        bool stamp = false;         // a 4 px step on sand (2D tread marks)
+        bool wheels = false;        // a wheeled vehicle (2D: no marks)
     };
     // ---- Light list (dynamic lights; docs/enhanced-graphics.md "Light list").
     // Rebuilt every update(): every light source of this frame - explosions and their flashes,
@@ -159,9 +230,17 @@ public:
         float x, y, size;
         std::uint32_t c;  // RGBA; alpha = intensity
         float z = 0;      // height of the source above the ground (world px)
+        bool blast = false;  // an explosion's fireball: the 3D cinematic particles light it themselves
     };
     const std::vector<Particle>& particles() const { return particles_; }
-    const std::vector<Tread>& treads() const { return treads_; }
+    const std::vector<Tread>& treads() const { return treads_; }  // a ring (serial 0 = empty)
+    const Tread* treadBySerial(std::uint32_t s) const {
+        if (s == 0 || treads_.empty()) return nullptr;
+        const Tread& t = treads_[s % treads_.size()];
+        return t.serial == s ? &t : nullptr;
+    }
+    std::uint32_t treadSerial() const { return treadSerial_; }  // the newest node
+    std::size_t treadCapacity() const { return treads_.size(); }
     const std::vector<Light>& lights() const { return lights_; }  // ground glows (x, y = drawn point)
     // Beam strips rebuilt every update (sonic ribbons): drawn like particles (age 0 = c0).
     const std::vector<Particle>& beams() const { return beams_; }
@@ -195,6 +274,47 @@ public:
     static std::uint32_t lightColour(const Light& l);
 
     int particleCount() const { return static_cast<int>(particles_.size()); }
+
+    // ---- Event log for the 3D "Cinematic" particles (render3d/cinematic_fx.*, docs/3d-mode.md "Reimagined"):
+    // off by default (2D and the plain 3D never pay for it). When on, every update() starts a fresh list of
+    // what happened this frame - explosions by size, impacts, vehicle / building deaths - at ground point
+    // (x, y) and height z (world px).
+    // Weapon kinds (FxEvent::weapon; the order is fixed: the cinematic particles switch on it).
+    enum class WeaponClass : std::uint8_t { Gun, Cannon, Rocket, Artillery, Sonic, Plasma, Gas, Bomb, Debris, Spice, None };
+    struct FxEvent {
+        // Muzzle: a shot leaves the barrel (x, y ground, z height; tx, ty = aim direction on the ground).
+        // Tracer: a machine-gun round flying from (x, y, z) to (tx, ty, tz). Projectile: a shell / rocket in
+        // flight this frame (x, y ground, z height; key stable per bullet).
+        // Artillery: a howitzer shell / grenade hit (scale 1 howitzer, ~0.6 grenade; armour: on a vehicle /
+        // building) - thrown-up earth and a flash rather than a fireball.
+        // Smoke: a puff of the original's damage smoke (EX_SMOKE3) off a vehicle (scale = its health 0..1) or, armour
+        // set, off a building's smoke point that feeds no fire (scale = its health).
+        enum Kind : std::uint8_t { Explosion, Impact, VehicleDeath, BuildingDeath, Muzzle, Tracer, Projectile, Artillery, Smoke };
+        Kind kind = Explosion;
+        float x = 0, y = 0, z = 0;
+        float scale = 1;    // Explosion: 0 small .. 1 medium, 2 big, 3 huge (x the type's size); death: 0..1 size
+        bool sand = false;  // the ground there is sand (dust) rather than rock / concrete
+        bool armour = false;  // Impact: on a vehicle / building
+        WeaponClass weapon = WeaponClass::None;  // Muzzle / Tracer / Projectile
+        float tx = 0, ty = 0, tz = 0;            // Muzzle: aim direction; Tracer: end point
+        std::uint32_t key = 0;                   // Projectile: side << 16 | pool index
+    };
+    // Aircraft crashes (render3d/wrecks.hpp, docs/3d-mode.md "Aircraft crashes"): on = a shot-down flyer falls and
+    // burns where it comes down, so the death flash under a flyer (the one flash DestroyUnit starts with the
+    // drift flag) or under what a carryall carried (a dead carried unit on the flash's pixel) starts no fire and
+    // leaves no hulk mark on the ground under the point it was hit at.
+    void airCrashes(bool on) { airCrashes_ = on; }
+    void recordEvents(bool on) {
+        recordEvents_ = on;
+        if (!on) events_.clear();
+    }
+    const std::vector<FxEvent>& events() const { return events_; }
+    // Burning buildings' fire points this frame (ground x / y, height z, strength 0..1): smoke columns.
+    struct SmokeSource {
+        float x, y, z, strength;
+        std::uint32_t key;  // stable per point
+    };
+    void smokeSources(std::vector<SmokeSource>& out) const;
 
     // Sandworms: Modern draws the moving worm's sand (render/effects_events.cpp), so the renderer skips the
     // original's one-pixel sand particles (World::particles).
@@ -270,10 +390,10 @@ private:
         HarvDust,   // EX_HARVDUST0..7: a harvester's load step (direction in exDir_)
         Smoke,      // EX_SMOKE3: the original's damage smoke (units: smoke timer, buildings: BUILEXP.BIN points)
         BloomGrow,  // EX_SPICEBLOOM: a spice bloom grows a stage
-        Refinery    // EX_REF: a refinery processes one unloaded spice blob
+        Refinery,   // EX_REF: a refinery processes one unloaded spice blob
+        Shell,      // EX_TANKGUN: a tank shell's hit - a heavy bullet, not a bomb: dust / sparks, no fireball
+        Artillery   // EX_155MMGUN: a howitzer shell / grenade - a fountain of earth, a flash, no rolling fireball
     };
-    enum class WeaponClass : std::uint8_t { Gun, Cannon, Rocket, Artillery, Sonic, Plasma, Gas, Bomb, Debris, Spice, None };
-
     SDL_Renderer* r_;
     const formats::Templates& t_;
     SDL_Texture* atlasTex_ = nullptr;
@@ -283,6 +403,15 @@ private:
     std::vector<CraterDecal> craterScratch_;
     void buildCraterTexture();
     std::vector<Particle> particles_;
+    bool recordEvents_ = false;
+    bool airCrashes_ = false;  // airCrashes()
+    bool flyerFlash_ = false;  // the explosion being spawned drifts (a flyer's death)
+    std::vector<FxEvent> events_;
+    void note(FxEvent::Kind k, const game::World& w, float x, float y, float z, float scale, bool armour = false);
+    void noteEvent(const FxEvent& e) {
+        if (recordEvents_ && events_.size() < kMaxEvents) events_.push_back(e);
+    }
+    static constexpr std::size_t kMaxEvents = 2048;
     std::vector<Tread> treads_;
     std::vector<Light> lights_;  // rebuilt every update
     std::vector<Particle> beams_;  // rebuilt every update
@@ -343,10 +472,29 @@ private:
     void addScorch(float x, float y, float size, float life, std::uint8_t kind, float strength = 1,
                    std::uint32_t c = 0);
     float load() const;  // 1 normally, less when the particle budget is filling up
+    // ---- Effects intensity (render/fx_budget.hpp).
+    FxBudget budget_;
+    float areaK_ = 1;           // reference view area / this view's area
+    int eventDepth_ = 0;        // > 0 while an event (a hit, a blast) spawns: its smoke is transient
+    std::uint32_t thinN_ = 0;   // thinning hash counter (not the effects' RNG)
+    struct EventScope {         // marks the particles added in its scope as an event's (transient) ones
+        explicit EventScope(Effects& e) : fx(e) { ++fx.eventDepth_; }
+        ~EventScope() { --fx.eventDepth_; }
+        Effects& fx;
+    };
+    // The weight of an event for the busy level (counted when it spawns in view).
+    void countEvent(float w) { budget_.addEvent(w); }
+    // Applies the budget to an event's particle; false = thinned out (not added).
+    bool budgetSpawn(Particle& p);
+    // Smoke over units: eases every alpha-blended puff's `clear` towards how much it covers a unit.
+    void updateSeeThrough(const game::World& w, float dt);
+    // Lasting columns (burning vehicle wrecks): merge nearby ones, cap how many smoke at once.
+    void capColumns(float dt, const Camera& cam, int viewW, int viewH);
     std::vector<GroundMark> marks_;
     std::vector<Particle> pending_;  // spawned while stepping (landings, trails)
     int nextBeamId_ = 1;
-    std::size_t treadHead_ = 0;
+    std::uint32_t treadSerial_ = 0;
+    std::uint32_t addTread(Tread t);
     std::array<std::vector<SlotSeen>, game::kMaxSides> seenEx_, seenBullet_;
     std::array<std::vector<UnitVisual>, game::kMaxSides> units_;
     // ---- Original non-weapon events (render/effects_events.cpp): harvest dust, damage smoke, spice
@@ -360,6 +508,12 @@ private:
     struct CaptureSeen { int side, index, type, tx, ty; float t; };
     std::vector<CaptureSeen> captures_;
     int spiceWeapon_ = -1;  // groupIds[50] (SPICEEXPL)
+    // Grenades share the howitzer's hit explosion (EX_155MMGUN): where grenades in flight come down tells
+    // the two apart (a smaller artillery hit).
+    int grenadeWeapon_ = -1;
+    std::vector<SpiceTarget> grenadeTargets_;
+    bool nearGrenadeTarget(float x, float y) const;
+    void spawnArtillery(const game::World& w, const TileAtlas& atlas, float x, float y, float z, float k);
     std::vector<std::int8_t> exDir_;  // EX_HARVDUST0..7: the 8-way direction
     void spawnHarvestDust(const game::World& w, const TileAtlas& atlas, float x, float y, int dir, bool burst);
     void spawnDamageSmoke(const game::World& w, float x, float y, float z);
@@ -448,6 +602,40 @@ private:
                          int viewH);
     void spawnWormDust(const game::World& w, const TileAtlas& atlas, float x, float y);
     void bloomMarks();
+    // Drop-in build-up (render/effects_dropin.cpp).
+    struct DropInSeen {
+        int side = 0, index = 0, type = 0, tileX = 0, tileY = 0;
+        float lastP = 0;
+        float impactT = -1e9f;  // time_ of the landing
+        float shadow = 0;       // the blob shadow under it this frame (0 = none)
+        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        std::uint32_t sand = 0;
+        bool fromGround = false, seen = false, visible = false;
+    };
+    std::vector<DropInSeen> dropIns_;
+    std::vector<DropInImpact> dropInImpacts_;
+    const DropInSource* dropIn_ = nullptr;  // setDropIn
+    bool dropInDust_ = true;                // setDropInDust
+    void updateDropIns(const game::World& w, const TileAtlas& atlas, float dt, const Camera& cam, int viewW, int viewH,
+                       bool showShroud);
+    void dropInMarks();
+    void spawnDropInDust(const DropInSeen& d);
+    // Assemble build-up (render/effects_assemble.cpp).
+    struct AssemblySeen {
+        int side = 0, index = 0, type = 0, tileX = 0, tileY = 0;
+        float lastP = -1;
+        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // the solid footprint (world px)
+        float p = 0;                            // this frame's progress (marks)
+        float dustAcc = 0;
+        std::uint32_t sand = 0;
+        bool seen = false, visible = false;
+    };
+    std::vector<AssemblySeen> assemblies_;
+    std::vector<AssemblyPartWorld> assemblyParts_;  // scratch
+    const AssemblySource* assembly_ = nullptr;      // setAssembly
+    void updateAssemblies(const game::World& w, const TileAtlas& atlas, float dt, const Camera& cam, int viewW, int viewH,
+                          bool showShroud);
+    void assemblyMarks();
     std::vector<ExClass> exClass_;
     std::vector<float> exScale_;          // fireball size per explosion type (classify)
     std::vector<std::uint8_t> exReplace_; // the original sprite is replaced (replacesExplosion)
@@ -462,6 +650,7 @@ private:
     mutable std::vector<EffectAnchor> anchorTmp_;
     const MuzzleTips* tips_ = nullptr;        // setMuzzleTips
     bool vehicleAnim_ = false;                // setVehicleAnimation
+    const SmoothDrive* drive_ = nullptr;      // setDrive
     // Per unit slot: the shots fired (alternates between a unit's guns) and where the last one
     // left (the bullet that follows starts drawn there).
     struct LastShot { std::uint32_t tick = 0; std::uint16_t count = 0; bool valid = false; EffectAnchor at; };

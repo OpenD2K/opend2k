@@ -443,7 +443,7 @@ void OriginalMenus::fillLanguageInfo(UilState& s) {
                 (src.ruFixesDir.empty() ? std::string("none found (artpacks/lang/ru-fixes)") : src.ruFixesDir),
             true);
     if (id == lang::Id::RussianAi)
-        add("AI voices: " + (src.aiVoicesDir.empty() ? "none at " + src.aiVoicesRoot + " (tools/voice/gen_ru_ai.py)" : src.aiVoicesDir) +
+        add("AI voices: " + (src.aiVoicesDir.empty() ? "none at " + src.aiVoicesRoot + " (download: Options > Art pack)" : src.aiVoicesDir) +
                 "; missing lines play in English",
             true);
     if (id == lang::Id::RussianPs1)
@@ -519,9 +519,9 @@ void OriginalMenus::overrides(const std::string& menu, UilOverrides& ov) {
     } else if (menu == "SETTINGS") {
         for (const char* w : {"8bit", "8bitText", "16bit", "16bitText"}) ov.hidden.insert(w);  // the Graphics button instead
         {
-            static const char* const kPreset[] = {"Original", "Enhanced", "3D", "Custom"};
+            static const char* const kPreset[] = {"Original", "Enhanced", "3D", "3D Classic", "Custom"};
             const int cp = formats::lang::activeCodepage();
-            const int p = std::clamp(static_cast<int>(settings_.activePreset()), 0, 3);
+            const int p = std::clamp(static_cast<int>(settings_.activePreset()), 0, 4);
             ov.text["graphics"] = formats::lang::toCodepage(std::string(render::tr("Graphics")) + ": " + render::tr(kPreset[p]), cp);
         }
         ov.text["fullscreenText"] = "Fullscreen";
@@ -643,14 +643,16 @@ void OriginalMenus::command(const std::string& menu, const std::string& op, cons
         // App sees the language key change and reloads the front-end texts.
         settings_.russianTextFixes = !settings_.russianTextFixes;
     } else if (op == "D2kCycleGraphics") {
-        // Our addition: the graphics preset (Settings::applyPreset), Original -> Enhanced -> 3D;
-        // Custom (mixed values) is shown but not picked. Enhanced / 3D hand the front end to the
+        // Our addition: the graphics preset (Settings::applyPreset), Original -> Enhanced -> 3D -> 3D Classic
+        // (the two 3D presets need the 3D art pack); Custom (mixed values) is shown but not picked. Enhanced / 3D hand the front end to the
         // modern pages (their Graphics page, where Custom is).
         using GP = Settings::GraphicsPreset;
         const GP cur = settings_.activePreset();
-        const GP next = cur == GP::Original                                          ? GP::Enhanced
-                        : cur == GP::Enhanced && Settings::modelPackInstalled() ? GP::ThreeD  // 3D needs the 3D art pack
-                                                                                : GP::Original;
+        const bool can3d = Settings::modelPackInstalled();
+        const GP next = cur == GP::Original               ? GP::Enhanced
+                        : cur == GP::Enhanced && can3d ? GP::ThreeD
+                        : cur == GP::ThreeD && can3d   ? GP::ThreeDClassic
+                                                       : GP::Original;
         settings_.applyPreset(next);
         if (settings_.enhanced()) action_.kind = OriginalMenuAction::Enhanced;
     } else if (op == "D2kCycleResolution") {

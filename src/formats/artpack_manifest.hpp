@@ -11,6 +11,17 @@
 // "urls" may be empty or relative: then "file" (or the relative url) is resolved against the
 // manifest's own URL. The zip holds one folder <name>/ with pack.ini (artpacks/<name>/ also
 // accepted). Pure (no OS calls).
+//
+// Optional "extras" (0.0.3+): more packs offered beside the main one, each an object with the same
+// keys (name, title, version, file, size, sha256, urls, licence, contains) plus "description"
+// (one line for the UI), "for3d" (suggested for the 3D Reimagined look) and "requires" (the pack
+// it only works with, e.g. the Reimagined models overlay the main pack's models). An extra's zip
+// holds one folder <name>/ (no pack.ini needed). Older games ignore the key (format stays 1); an
+// invalid extra is dropped, the main pack stays usable. 0.0.3 extras: models-reimagined,
+// photo-terrain, ground-clutter, ru-ai-voices (tools/release/package_artpack.sh).
+// "install" (an extra, 0.0.3+): where it goes. Absent = <art pack folder>/<name>; "ai-voices" = the
+// Russian AI voice folder (<pref path>/Voices/ru-ai, platform/language.hpp defaultAiVoicesDir; the
+// zip's <name>/ folder becomes that folder). An unknown value drops the extra (a newer game's kind).
 
 #include <cstdint>
 #include <string>
@@ -31,7 +42,19 @@ struct ArtPackManifest {
     std::string licence;
     std::vector<std::string> contains;  // "art", "models"
     std::string page;  // human download page (the manual-download link), "" = the release page
+    // Extras (see above). In an extra: description / for3d / requires; extras of an extra are ignored.
+    std::string description;
+    bool for3d = false;
+    std::string requires_;
+    bool isExtra = false;  // an entry of "extras": its zip needs no pack.ini
+    std::string install;   // "" = the art pack folder, kInstallAiVoices = the AI voice folder
+    std::vector<ArtPackManifest> extras;
+    // This manifest or one of its extras by pack name (nullptr when none).
+    const ArtPackManifest* item(const std::string& name) const;
 };
+
+// ArtPackManifest::install values.
+inline constexpr const char* kInstallAiVoices = "ai-voices";
 
 // Parses and validates (name is a plain folder name, size > 0, sha256 = 64 hex digits, at least
 // one download URL after resolving against `manifestUrl`). False + `error` otherwise.

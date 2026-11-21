@@ -674,6 +674,7 @@ void World::getNextSquare(Unit& u) {
 // (pos_steps == 0 && BlockFrom == Target), true while moving, turning or waiting.
 
 bool World::moveUnit(Unit& u) {
+    if (modernMovement_ && isModernVehicle(u)) return moveUnitModern(u);  // not original (modern_move.cpp)
     if (u.posSteps == 0 && u.blockFromX == u.targetX && u.blockFromY == u.targetY) return false;
     const auto& t = unitTemplate(u);
     const int side = u.side, idx = u.index;

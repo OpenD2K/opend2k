@@ -1,8 +1,11 @@
 #include "platform/app.hpp"
+#include "platform/user_data.hpp"
+#include "formats/utf8_bom.hpp"
 #include "platform/preset_previews.hpp"
 
 #include "platform/app_update.hpp"
 #include "platform/artpack_download.hpp"
+#include "render/mem_stats.hpp"
 #include "render/art_pack.hpp"
 
 #include "render/ui_text.hpp"
@@ -64,6 +67,10 @@ void logMapSummary(const GameData& g) {
 }  // namespace
 
 App::App(Options opt) : opt_(std::move(opt)) {
+    // Test / one-frame / recording runs never move a pre-0.0.3 user folder (user_data.hpp).
+    if (opt_.smoke || !opt_.menuScreenshot.empty() || opt_.simtest || opt_.soundTest || !opt_.renderPreviews.empty() ||
+        !opt_.screenshot.empty() || !opt_.recordDir.empty())
+        platform::migrationAllowed() = false;
     settings_ = Settings::load();
     persist_ = !opt_.smoke && opt_.menuScreenshot.empty() && !opt_.simtest && !opt_.soundTest && opt_.renderPreviews.empty();
     // --render-previews: exactly one art pack (--preview-pack, else the installed opend2k-redesign) is
@@ -116,6 +123,7 @@ App::App(Options opt) : opt_(std::move(opt)) {
     AppUpdateChecker::instance().setUrlOverride(opt_.updateUrl);
     AppUpdateChecker::instance().setSettingsUrl(settings_.appUpdateUrl);
     AppUpdateChecker::instance().setAutoCheckAllowed(persist_ || !opt_.updateUrl.empty());
+    if (!opt_.graphicsPreset.empty()) settings_.applyPreset(Settings::graphicsPresetFrom(opt_.graphicsPreset));
     if (!opt_.graphics.empty())
         settings_.graphics = Settings::parseGraphics(opt_.graphics);
     if (!opt_.models3d.empty()) settings_.models3d = Settings::models3dFrom(opt_.models3d);
@@ -123,6 +131,21 @@ App::App(Options opt) : opt_(std::move(opt)) {
     if (!opt_.terrain3d.empty()) settings_.terrain3d = Settings::terrain3dFrom(opt_.terrain3d);
     if (!opt_.terrain2d.empty()) settings_.terrain2d = Settings::terrain2dFrom(opt_.terrain2d);
     if (!opt_.shadows3d.empty()) settings_.shadows3d = opt_.shadows3d != "off" && opt_.shadows3d != "0";
+    if (!opt_.reimagined.empty()) settings_.reimagined = opt_.reimagined != "off" && opt_.reimagined != "0";
+    if (!opt_.groundDetail.empty()) settings_.groundDetail = Settings::groundDetailFrom(opt_.groundDetail);
+    if (!opt_.dustHaze.empty()) settings_.dustHaze = opt_.dustHaze != "off" && opt_.dustHaze != "0";
+    if (!opt_.groundDust.empty()) settings_.groundDust = opt_.groundDust != "off" && opt_.groundDust != "0";
+    if (!opt_.aerialHaze.empty()) settings_.aerialHaze = opt_.aerialHaze != "off" && opt_.aerialHaze != "0";
+    if (!opt_.mapSurroundings.empty()) {
+        settings_.mapSurroundings = opt_.mapSurroundings != "off" && opt_.mapSurroundings != "0";
+        if (opt_.mapSurroundings == "full") settings_.mapSurroundingsFull = true;
+        if (opt_.mapSurroundings == "band" || opt_.mapSurroundings == "on") settings_.mapSurroundingsFull = false;
+    }
+    if (!opt_.naturalGrade.empty()) settings_.naturalGrade = opt_.naturalGrade != "off" && opt_.naturalGrade != "0";
+    if (!opt_.vehicleWrecks.empty()) settings_.vehicleWrecks = opt_.vehicleWrecks != "off" && opt_.vehicleWrecks != "0";
+    if (!opt_.photoTerrain.empty()) settings_.photoTerrain = opt_.photoTerrain != "off" && opt_.photoTerrain != "0";
+    if (!opt_.ambientOcclusion.empty()) settings_.ambientOcclusion = opt_.ambientOcclusion != "off" && opt_.ambientOcclusion != "0";
+    if (opt_.gameSpeed >= 0) settings_.gameSpeed = std::clamp(opt_.gameSpeed, Settings::kMinGameSpeed, Settings::kMaxGameSpeed);
     if (!opt_.timeOfDay.empty()) settings_.timeOfDay = Settings::timeOfDayFrom(opt_.timeOfDay);
     if (!opt_.lighting.empty()) settings_.lighting = Settings::lightingFrom(opt_.lighting);
     // Quality / display (one-frame runs: the struct defaults unless these are given).
@@ -155,8 +178,13 @@ App::App(Options opt) : opt_(std::move(opt)) {
     if (!opt_.artPack.empty()) settings_.artPack = opt_.artPack;
     if (opt_.perfOverlay) settings_.perfOverlay = true;
     if (!opt_.effects.empty()) settings_.effects = opt_.effects == "classic" ? Settings::Effects::Classic : Settings::Effects::Modern;
+    if (!opt_.effectsIntensity.empty()) settings_.effectsIntensity = Settings::effectsIntensityFrom(opt_.effectsIntensity);
     if (!opt_.controls.empty())
         settings_.controls = opt_.controls == "modern" ? Settings::Controls::Modern : Settings::Controls::Original;
+    if (!opt_.attackMove.empty()) settings_.attackMove = onOff(opt_.attackMove);
+    if (!opt_.smoothCamera.empty()) settings_.smoothCamera = onOff(opt_.smoothCamera);
+    if (!opt_.smoothDriving.empty()) settings_.smoothDriving = onOff(opt_.smoothDriving);
+    if (!opt_.buildingPlacement.empty()) settings_.buildingPlacement = Settings::buildingPlacementFrom(opt_.buildingPlacement);
     if (!opt_.vehicleAnimation.empty())
         settings_.vehicleAnimation =
             opt_.vehicleAnimation == "original" ? Settings::VehicleAnimation::Original : Settings::VehicleAnimation::Modern;
@@ -218,6 +246,7 @@ int App::runSimTest() {
     GameStart start;
     start.map = opt_.map;
     start.tileset = opt_.tileset;
+    start.movement = opt_.movement;
     GameData g;
     try {
         g = loadGameData(dir, start);
@@ -607,6 +636,7 @@ void importOriginalIni(const std::string& dataDir, Settings& s) {
     const std::string ini = formats::findFileNoCase(dataDir + "/..", "dune2000.ini");
     if (ini.empty()) return;
     std::ifstream in(ini);
+    formats::skipUtf8Bom(in);
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -685,7 +715,10 @@ void App::drawLoading(const std::string& what) {
     presentFrame();
 }
 
-bool App::startGame(const GameStart& start) {
+bool App::startGame(const GameStart& startIn) {
+    GameStart start = startIn;
+    // "Unit movement" (not original): fixed for the whole game from here on (restart keeps it).
+    if (start.movement < 0) start.movement = opt_.movement >= 0 ? opt_.movement : settings_.modernMovement ? 1 : 0;
     if (!opt_.smoke && opt_.menuScreenshot.empty()) drawLoading(start.title.empty() ? start.map : start.title);
     std::unique_ptr<GameData> g;
     try {
@@ -713,11 +746,20 @@ bool App::startGame(const GameStart& start) {
     cfg.cameraTilt = opt_.cameraTilt;
     cfg.cameraYaw = opt_.cameraYaw;
     if (previews_) previews_->release();  // the preview game's GPU memory
+    // A game still running (a load from the game): gone before the new one loads, and its GPU memory
+    // with it - SDL_gpu frees released resources only once the GPU is done with them, which without a
+    // frame in between kept the old game's models alive during the new load (docs/memory.md).
+    session_.reset();
+    SDL_FlushRenderer(renderer_);  // (texture destructions are commands too)
+    if (SDL_GPUDevice* dev = render3d::gpuDeviceOf(renderer_)) SDL_WaitForGPUIdle(dev);
+    render::mem::releaseFreeMemory();
     if (sounds_) {
         // Community mission sounds (cleared in the menu); a new overlay is decoded in the background too.
         if (sounds_->setOverlay(g->modsDataDir)) sounds_->startPrefetch();
     }
+    render::mem::checkpoint("game data loaded");
     session_ = std::make_unique<Session>(renderer_, std::move(g), settings_, audio_.get(), sounds_.get(), cfg);
+    render::mem::checkpoint("session created");
     if (!opt_.recordDir.empty() || opt_.fixedStep) {
         std::error_code ec;
         std::filesystem::create_directories(opt_.recordDir, ec);
@@ -1219,8 +1261,9 @@ int App::run() {
             // the front end's font, texts, sounds and movie names, back on the options page.
             if (!dataDir_.empty() && languageKey(settings_) != languageKey_ && res.kind == MenuResult::None) {
                 const bool fromDataPage = menu_->page() == MenuPage::DataDir;
+                const bool fromArtPack = menu_->page() == MenuPage::ArtPack;  // (the AI voices were downloaded)
                 persistSettings();
-                if (loadData(dataDir_)) menu_->open(fromDataPage ? MenuPage::DataDir : MenuPage::Options);
+                if (loadData(dataDir_)) menu_->open(fromDataPage ? MenuPage::DataDir : fromArtPack ? MenuPage::ArtPack : MenuPage::Options);
             }
             if (res.kind == MenuResult::DataDirChosen && loadData(res.dataDir)) {
                 settings_.dataDir = res.dataDir;
@@ -1247,11 +1290,14 @@ int App::run() {
         drawPerfOverlay();
         const bool lastFrame = framesLeft <= 1;
         std::string shot = !lastFrame ? std::string() : !opt_.menuScreenshot.empty() ? opt_.menuScreenshot : opt_.screenshot;
-        if (!opt_.recordDir.empty() && session_) {  // --record: every frame (D2K_RECORD_FROM=N: from frame N on)
+        if (!opt_.recordDir.empty() && session_) {  // --record: every frame (D2K_RECORD_FROM=N: from frame N on;
+                                                    // D2K_RECORD_EVERY=K: every K-th frame from there)
             static const int from = [] { const char* e = std::getenv("D2K_RECORD_FROM"); return e ? std::atoi(e) : 0; }();
+            static const int every = [] { const char* e = std::getenv("D2K_RECORD_EVERY"); return e ? std::max(1, std::atoi(e)) : 1; }();
             char name[32];
             SDL_snprintf(name, sizeof name, "/frame_%05d.bmp", recordFrame_);
-            if (recordFrame_++ >= from) shot = opt_.recordDir + name;
+            if (recordFrame_ >= from && (recordFrame_ - from) % every == 0) shot = opt_.recordDir + name;
+            ++recordFrame_;
         }
         perfCpuEnd_ = SDL_GetTicksNS();
         if (opt_.frames > 1) cpuMs.push_back(double(perfCpuEnd_ - cpuStart) / 1e6);
@@ -1319,6 +1365,22 @@ int App::run() {
         }
         if ((opt_.smoke || !opt_.menuScreenshot.empty()) && --framesLeft <= 0) {
             running = false;
+            render::mem::checkpoint(session_ ? "game frame" : "menu frame");
+            // D2K_MEM_RELOADS=N (with D2K_MEM=1): leave the game and start the same one again N times, one
+            // frame each - memory must return to the same level (docs/memory.md).
+            static int reloads = [] { const char* e = std::getenv("D2K_MEM_RELOADS"); return e ? std::atoi(e) : 0; }();
+            if (session_ && reloads > 0) {
+                --reloads;
+                const GameStart start = session_->start();
+                session_.reset();
+                SDL_FlushRenderer(renderer_);
+                if (SDL_GPUDevice* dev = render3d::gpuDeviceOf(renderer_)) SDL_WaitForGPUIdle(dev);
+                render::mem::checkpoint("game closed");
+                if (startGame(start)) {
+                    running = true;
+                    framesLeft = 1;
+                }
+            }
             if (opt_.frames > 1 && cpuMs.size() > 10) {
                 // Frame-time report (skip the first frames: texture uploads, warm-up).
                 auto report = [](const char* what, std::vector<double> v) {

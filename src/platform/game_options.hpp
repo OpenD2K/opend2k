@@ -14,11 +14,11 @@ struct Settings;
 
 // Main menu Options: the gameplay rows only - game speed, scroll speed, mouse controls, smooth
 // motion | frame-time overlay, production queue, cheats | factory rally points, order limit,
-// unit limit. The graphics
+// unit limit, unit movement. The graphics
 // values live on the Graphics page (graphicsPresetTabs / graphicsOptionList below).
 // row(i) gives the i-th row rect. Returns the number of rows used (kGameplayOptionRows).
 int gameplayOptionRows(Ui& ui, Settings& settings, const std::function<SDL_FRect(int)>& row);
-constexpr int kGameplayOptionRows = 8;
+constexpr int kGameplayOptionRows = 9;
 
 // The in-game options of the pause menu (unchanged by the graphics presets page): resolution
 // (Original) / UI scale (Enhanced, 3D), game speed, scroll speed, controls, smooth motion | frame
@@ -27,7 +27,7 @@ constexpr int kGameplayOptionRows = 8;
 // transparency | terrain, time of day | lighting, the classic view key and the touch layout | phone UI size. No graphics-mode row: the mode is chosen in
 // the main menu only. A change to a preset value marks the graphics preset Custom.
 int inGameOptionRows(Ui& ui, Settings& settings, const std::function<SDL_FRect(int)>& row);
-constexpr int kInGameOptionRows = 21;  // the most rows (Enhanced: + Brightness, Contrast, Gamma, Saturation, Reset)
+constexpr int kInGameOptionRows = 26;  // the most rows (Enhanced: + effects intensity / ground detail, 3D: dust haze / ground dust, aerial haze / world beyond the map, realistic grade / vehicle wrecks, photo terrain / ambient occlusion, Brightness, Contrast, Gamma, Saturation, Reset)
 
 // The Graphics page's Custom tab (main menu): every graphics value grouped under headers - Mode,
 // Terrain, Art, Effects, Lighting, Quality, Shroud, Interface, 3D, Display, Classic view. `rect(y, h)` maps a

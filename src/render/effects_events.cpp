@@ -179,8 +179,10 @@ void Effects::spawnDamageSmoke(const game::World& w, float x, float y, float z) 
         p.blend = Blend::Alpha;
         p.rot = rnd(0, 2 * kPi);
         p.vrot = rnd(-0.5f, 0.5f);
+        if (recordEvents_) p.fx |= kFxBlast;  // Reimagined: the cinematic particles draw this smoke, lit
         add(p);
         }
+        note(FxEvent::Smoke, w, x, groundY, groundY - y, hp, true);
         return;
     }
     // A smoking vehicle (or any other EX_SMOKE3): a smaller puff; nearly dead ones flare up now
@@ -212,7 +214,10 @@ void Effects::spawnDamageSmoke(const game::World& w, float x, float y, float z) 
     p.blend = Blend::Alpha;
     p.rot = rnd(0, 2 * kPi);
     p.vrot = rnd(-0.8f, 0.8f);
+    if (recordEvents_) p.fx |= kFxBlast;  // Reimagined: the cinematic particles draw this smoke, lit
     add(p);
+    p.fx = 0;  // (the flare below copies p)
+    note(FxEvent::Smoke, w, x, y, z + 5, hp);
     if (hp < 0.25f && rnd() < 0.2f) {
         for (int k = 0; k < 2; ++k) {
             Particle f = p;
@@ -600,6 +605,34 @@ void Effects::updateBlooms(const game::World& w, const TileAtlas& atlas, float d
             ++i;
         }
     }
+    // The same for grenades (they hit with the howitzer's explosion: a smaller artillery hit).
+    for (std::size_t i = 0; i < grenadeTargets_.size();) {
+        if (grenadeTargets_[i].until < time_) {
+            grenadeTargets_[i] = grenadeTargets_.back();
+            grenadeTargets_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+    if (grenadeWeapon_ >= 0)
+        for (int s = 0; s < int(w.sides().size()); ++s) {
+            const auto& side = w.sides()[s];
+            for (int i = side.firstBullet; i >= 0; i = side.nextObject(i)) {
+                const auto& b = side.bullets[i];
+                if (!b.alive || b.type != grenadeWeapon_) continue;
+                const int key = s * 1000 + i;
+                SpiceTarget* t = nullptr;
+                for (auto& o : grenadeTargets_)
+                    if (o.key == key) t = &o;
+                if (!t) {
+                    grenadeTargets_.push_back({key, 0, 0, 0});
+                    t = &grenadeTargets_.back();
+                }
+                t->x = float(b.targetX);
+                t->y = float(b.targetY);
+                t->until = time_ + 0.4f;
+            }
+        }
     if (spiceWeapon_ >= 0)
         for (int s = 0; s < int(w.sides().size()); ++s) {
             const auto& side = w.sides()[s];
@@ -858,6 +891,12 @@ void Effects::spawnBloomBurst(const game::World& w, const TileAtlas& atlas, floa
     addScorch(x, y, 190, 1.0f, 3, 1.0f, lerpColour(sand, kSpiceLight, 0.3f));
     addScorch(x, y, 110, 0.7f, 2, 0.35f);
     addScorch(x, y, 54, 9.0f, 4, 1.0f, kSpiceDark);
+}
+
+bool Effects::nearGrenadeTarget(float x, float y) const {
+    for (const auto& t : grenadeTargets_)
+        if (std::fabs(t.x - x) < 24 && std::fabs(t.y - y) < 24) return true;
+    return false;
 }
 
 bool Effects::nearSpiceTarget(float x, float y) const {

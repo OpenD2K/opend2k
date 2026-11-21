@@ -1,4 +1,5 @@
 #include "platform/settings.hpp"
+#include "formats/utf8_bom.hpp"
 #include "platform/user_data.hpp"
 
 #include "render/art_pack.hpp"
@@ -104,8 +105,9 @@ Settings Settings::load() {
         s.firstRunArtPackAsked = false;  // the welcome page once the game data is there
         return s;
     }
+    formats::skipUtf8Bom(in);  // Notepad / PowerShell 5 "UTF-8" (formats/utf8_bom.hpp)
     std::string line;
-    bool sawGraphics = false, legacyHq = false, sawShroud = false, sawLighting = false, sawQuality = false, sawCycleDefault = false, sawLimits = false;
+    bool sawGraphics = false, legacyHq = false, sawShroud = false, sawLighting = false, sawQuality = false, sawCycleDefault = false, sawLimits = false, sawAttackMove = false, sawSmoothCamera = false, sawSmoothDriving = false, sawPlacement = false, sawPlacementRev = false, sawReimagined = false, sawMovement = false;
     auto toF = [](const std::string& v, float def) {
         try { return std::clamp(std::stof(v), 0.0f, 1.0f); } catch (...) { return def; }
     };
@@ -132,6 +134,17 @@ Settings Settings::load() {
         else if (k == "terrain2d") s.terrain2d = terrain2dFrom(v);
         else if (k == "classicView") s.classicView = classicViewFrom(v);
         else if (k == "shadows3d") s.shadows3d = v != "0" && v != "off";
+        else if (k == "reimagined") { s.reimagined = v == "on" || v == "1"; sawReimagined = true; }
+        else if (k == "groundDetail") s.groundDetail = groundDetailFrom(v);
+        else if (k == "dustHaze") s.dustHaze = v == "on" || v == "1";
+        else if (k == "groundDust") s.groundDust = v == "on" || v == "1";
+        else if (k == "aerialHaze") s.aerialHaze = v == "on" || v == "1";
+        else if (k == "mapSurroundings") s.mapSurroundings = v == "on" || v == "1";
+        else if (k == "mapSurroundingsFull") s.mapSurroundingsFull = v == "on" || v == "1";
+        else if (k == "naturalGrade") s.naturalGrade = v == "on" || v == "1";
+        else if (k == "vehicleWrecks") s.vehicleWrecks = v == "on" || v == "1";
+        else if (k == "photoTerrain") s.photoTerrain = v == "on" || v == "1";
+        else if (k == "ambientOcclusion") s.ambientOcclusion = v == "on" || v == "1";
         else if (k == "timeOfDay") s.timeOfDay = timeOfDayFrom(v);
         else if (k == "lighting") { s.lighting = lightingFrom(v); sawLighting = true; }
         else if (k == "cycleDefault") sawCycleDefault = true;
@@ -150,6 +163,7 @@ Settings Settings::load() {
         else if (k == "gamma") s.gamma = std::clamp(toI(v, 100), kMinGamma, kMaxGamma);
         else if (k == "saturation") s.saturation = std::clamp(toI(v, 0), kMinDisplayAdjust, kMaxDisplayAdjust);
         else if (k == "effects") s.effects = v == "classic" ? Effects::Classic : Effects::Modern;
+        else if (k == "effectsIntensity") s.effectsIntensity = effectsIntensityFrom(v);
         else if (k == "vehicleAnimation") s.vehicleAnimation = v == "original" ? VehicleAnimation::Original : VehicleAnimation::Modern;
         else if (k == "shroud") { s.shroud = v == "classic" ? Shroud::Classic : Shroud::Soft; sawShroud = true; }
         else if (k == "panelTransparency") s.panelTransparency = panelTransparencyFrom(v);
@@ -168,6 +182,12 @@ Settings Settings::load() {
         else if (k == "productionQueue") s.productionQueue = v == "original" ? ProductionQueue::Original : ProductionQueue::Extended;
         else if (k == "cheats") s.cheats = v != "0";
         else if (k == "rallyPoints") s.rallyPoints = v != "0";
+        else if (k == "unitMovement") { s.modernMovement = v == "modern"; sawMovement = true; }
+        else if (k == "attackMove") { s.attackMove = v != "0"; sawAttackMove = true; }
+        else if (k == "smoothCamera") { s.smoothCamera = v != "0"; sawSmoothCamera = true; }
+        else if (k == "smoothDriving") { s.smoothDriving = v != "0"; sawSmoothDriving = true; }
+        else if (k == "buildingPlacement") { s.buildingPlacement = buildingPlacementFrom(v); sawPlacement = true; }
+        else if (k == "buildingPlacementRev") sawPlacementRev = toI(v, 0) >= 3;
         else if (k == "orderLimit") { s.unlimitedOrders = v == "unlimited"; sawLimits = true; }
         else if (k == "unitLimit") s.unlimitedUnits = v == "unlimited";
         else if (k == "cutscenes") s.cutscenes = v != "0";
@@ -218,6 +238,30 @@ Settings Settings::load() {
     // A file from before the limit options that names one of those presets follows them.
     if (!sawLimits && (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD))
         s.unlimitedOrders = s.unlimitedUnits = true;
+    // Attack-move (2026-11-15): on in the Enhanced / 3D presets, off in Original; a file from before
+    // it follows its preset.
+    if (!sawAttackMove && (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD))
+        s.attackMove = true;
+    // Smooth camera (2026-11-15): on in the Enhanced / 3D presets; a file from before follows its preset.
+    if (!sawSmoothCamera && (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD))
+        s.smoothCamera = true;
+    // Smooth driving (2026-11-15): the same.
+    if (!sawSmoothDriving && (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD))
+        s.smoothDriving = true;
+    // Unit movement: Modern and (3D) the Reimagined look became the Enhanced / 3D presets' defaults
+    // (owner 2026-11-16); a file from before those keys follows its preset.
+    if (!sawMovement && (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD))
+        s.modernMovement = true;
+    if (!sawReimagined && s.graphicsPreset == GraphicsPreset::ThreeD && s.deviceProfile != "lite") s.reimagined = true;
+    // Building placement: Drop-in was the Enhanced / 3D presets' default 2026-11-15, Assemble since 2026-11-16
+    // (owner: Drop-in "doesn't look good"). A file from before follows its preset: no key, or the old preset
+    // default "dropin" written before the "buildingPlacementRev=2" marker, moves to Assemble (a Drop-in chosen
+    // after that stays).
+    // Rev 3 (owner 2026-11-16: "Assemble should be default"): also on the Custom preset - every setup but
+    // Original moves from Drop-in (or no key) to Assemble once.
+    if (s.graphicsPreset != GraphicsPreset::Original &&
+        (!sawPlacement || (!sawPlacementRev && s.buildingPlacement == BuildingPlacement::DropIn)))
+        s.buildingPlacement = BuildingPlacement::Assemble;
     // The Quality settings came 2026-11-13: a file from before that names the Enhanced / 3D preset
     // gets High (HDR rendering, 4x MSAA, 16x anisotropy) and the EDR output, like a new player.
     if (!sawQuality && (s.graphicsPreset == GraphicsPreset::Enhanced || s.graphicsPreset == GraphicsPreset::ThreeD)) {
@@ -254,19 +298,23 @@ bool Settings::modelPackInstalled() { return !render::ArtPack::threeDPack().empt
 
 bool Settings::matchesPreset(GraphicsPreset p) const {
     if (p == GraphicsPreset::Original) return graphics == Graphics::Original;
-    if (p != GraphicsPreset::Enhanced && p != GraphicsPreset::ThreeD) return false;
+    if (p != GraphicsPreset::Enhanced && !isThreeDPreset(p)) return false;
     const bool common = presetArt(artPack) && effects == Effects::Modern && shroud == Shroud::Soft &&
                         healthBars == HealthBars::Selected && panelTransparency == PanelTransparency::Off &&
                         classicView == ClassicView::Hold && timeOfDay == TimeOfDay::Cycle && lighting == Lighting::Modern &&
                         vehicleAnimation == VehicleAnimation::Modern;
     if (p == GraphicsPreset::Enhanced) return common && graphics == Graphics::Enhanced && terrain2d == Terrain2D::Faithful;
-    return common && graphics == Graphics::ThreeD && terrain3d == Terrain3D::Faithful && shadows3d && models3d == Models3D::New;
+    const bool common3d = common && graphics == Graphics::ThreeD && shadows3d && models3d == Models3D::New;
+    // 3D (Reimagined): Faithful terrain + the Reimagined look (the "lite" iPads: without it, as applyPreset).
+    if (p == GraphicsPreset::ThreeD) return common3d && terrain3d == Terrain3D::Faithful && reimagined == (deviceProfile != "lite");
+    // 3D Classic: the original tiles on the heightfield, Reimagined off.
+    return common3d && terrain3d == Terrain3D::Tiles && !reimagined;
 }
 
 Settings::GraphicsPreset Settings::activePreset() const {
     if (graphicsPreset == GraphicsPreset::Custom) return GraphicsPreset::Custom;
     if (graphicsPreset != GraphicsPreset::Auto && matchesPreset(graphicsPreset)) return graphicsPreset;
-    for (GraphicsPreset p : {GraphicsPreset::Original, GraphicsPreset::Enhanced, GraphicsPreset::ThreeD})
+    for (GraphicsPreset p : {GraphicsPreset::Original, GraphicsPreset::Enhanced, GraphicsPreset::ThreeD, GraphicsPreset::ThreeDClassic})
         if (matchesPreset(p)) return p;
     return GraphicsPreset::Custom;
 }
@@ -275,8 +323,14 @@ void Settings::applyPreset(GraphicsPreset p) {
     if (p == GraphicsPreset::Original) {
         graphics = Graphics::Original;
         unlimitedOrders = unlimitedUnits = false;  // the 1998 limits (64-unit orders, 1000 objects per side)
-    } else if (p == GraphicsPreset::Enhanced || p == GraphicsPreset::ThreeD) {
-        graphics = p == GraphicsPreset::ThreeD ? Graphics::ThreeD : Graphics::Enhanced;
+        attackMove = false;  // the original has no attack-move
+        smoothCamera = false;  // the original scrolling / zoom steps
+        smoothDriving = false;  // the original 8-direction steps and turns in place
+        buildingPlacement = BuildingPlacement::Rise;
+        reimagined = false;
+        modernMovement = false;  // the original tile-by-tile movement (a per-game rule, new games)
+    } else if (p == GraphicsPreset::Enhanced || isThreeDPreset(p)) {
+        graphics = isThreeDPreset(p) ? Graphics::ThreeD : Graphics::Enhanced;
         // A redesign pack the player chose stays; otherwise the installed redesign (the presets' look, as the
         // Graphics / welcome pages describe it), else the original sprites.
         if (artPack == "original" || !presetArt(artPack)) {
@@ -291,13 +345,30 @@ void Settings::applyPreset(GraphicsPreset p) {
         classicView = ClassicView::Hold;
         timeOfDay = TimeOfDay::Cycle;  // the day / night cycle (owner 2026-11-13)
         unlimitedOrders = unlimitedUnits = true;  // no 64-unit order cap / 1000-object pool (owner 2026-11-14)
+        attackMove = true;  // hold A + click (game/attack_move.cpp)
+        smoothCamera = true;  // camera inertia, eased zoom (platform/camera_smooth.hpp)
+        smoothDriving = true;  // vehicles drive round corners (render/smooth_drive.hpp)
+        buildingPlacement = BuildingPlacement::Assemble;  // 3D models are built up part by part (render/building_assemble.hpp)
         lighting = Lighting::Modern;
         vehicleAnimation = VehicleAnimation::Modern;
         applyQuality(Quality::High);
+        modernMovement = true;  // Unit movement: Modern for new games (game/modern_move.cpp; owner 2026-11-16)
+        reimagined = false;
         if (p == GraphicsPreset::ThreeD) {
             terrain3d = Terrain3D::Faithful;
             shadows3d = true;
             models3d = Models3D::New;
+            // The Reimagined look is the 3D preset's look (owner 2026-11-16), except on the A10 / A12-class
+            // iPads ("lite" device profile), which keep the plain 3D look for speed.
+            reimagined = deviceProfile != "lite";
+        } else if (p == GraphicsPreset::ThreeDClassic) {
+            // 3D Classic (owner 2026-11-18): the original 1998 tiles on the 3D heightfield, without the
+            // Reimagined look; the objects are the art pack's models as in 3D (the original sprites do not
+            // work in 3D, the PS1 models need a disc image - a preset every 3D player can use).
+            terrain3d = Terrain3D::Tiles;
+            shadows3d = true;
+            models3d = Models3D::New;
+            reimagined = false;
         }
     } else {
         return;
@@ -307,7 +378,7 @@ void Settings::applyPreset(GraphicsPreset p) {
 
 Settings::PresetValues Settings::presetValues() const {
     return {graphics, artPack, terrain2d, terrain3d, shadows3d, effects, shroud, healthBars, panelTransparency, classicView,
-            timeOfDay, lighting, vehicleAnimation};
+            timeOfDay, lighting, vehicleAnimation, reimagined};
 }
 
 void Settings::applyQuality(Quality q) {
@@ -370,6 +441,17 @@ bool Settings::save() const {
         << "terrain2d=" << terrain2dName(terrain2d) << "\n"
         << "classicView=" << classicViewName(classicView) << "\n"
         << "shadows3d=" << (shadows3d ? "on" : "off") << "\n"
+        << "reimagined=" << (reimagined ? "on" : "off") << "\n"
+        << "groundDetail=" << groundDetailName(groundDetail) << "\n"
+        << "dustHaze=" << (dustHaze ? "on" : "off") << "\n"
+        << "groundDust=" << (groundDust ? "on" : "off") << "\n"
+        << "aerialHaze=" << (aerialHaze ? "on" : "off") << "\n"
+        << "mapSurroundings=" << (mapSurroundings ? "on" : "off") << "\n"
+        << "mapSurroundingsFull=" << (mapSurroundingsFull ? "on" : "off") << "\n"
+        << "naturalGrade=" << (naturalGrade ? "on" : "off") << "\n"
+        << "vehicleWrecks=" << (vehicleWrecks ? "on" : "off") << "\n"
+        << "photoTerrain=" << (photoTerrain ? "on" : "off") << "\n"
+        << "ambientOcclusion=" << (ambientOcclusion ? "on" : "off") << "\n"
         << "timeOfDay=" << timeOfDayName(timeOfDay) << "\n"
         << "cycleDefault=1\n"
         << "cyclePhase=" << cyclePhase << "\n"
@@ -388,6 +470,7 @@ bool Settings::save() const {
         << "gamma=" << gamma << "\n"
         << "saturation=" << saturation << "\n"
         << "effects=" << effectsName(effects) << "\n"
+        << "effectsIntensity=" << effectsIntensityName(effectsIntensity) << "\n"
         << "vehicleAnimation=" << (vehicleAnimation == VehicleAnimation::Original ? "original" : "modern") << "\n"
         << "shroud=" << shroudName(shroud) << "\n"
         << "healthBars=" << healthBarsName(healthBars) << "\n"
@@ -406,6 +489,12 @@ bool Settings::save() const {
         << "productionQueue=" << (extendedQueue() ? "extended" : "original") << "\n"
         << "cheats=" << (cheats ? 1 : 0) << "\n"
         << "rallyPoints=" << (rallyPoints ? 1 : 0) << "\n"
+        << "unitMovement=" << (modernMovement ? "modern" : "original") << "\n"
+        << "attackMove=" << (attackMove ? 1 : 0) << "\n"
+        << "smoothCamera=" << (smoothCamera ? 1 : 0) << "\n"
+        << "smoothDriving=" << (smoothDriving ? 1 : 0) << "\n"
+        << "buildingPlacement=" << buildingPlacementName(buildingPlacement) << "\n"
+        << "buildingPlacementRev=3\n"
         << "orderLimit=" << (unlimitedOrders ? "unlimited" : "original") << "\n"
         << "unitLimit=" << (unlimitedUnits ? "unlimited" : "original") << "\n"
         << "cutscenes=" << (cutscenes ? 1 : 0) << "\n"

@@ -42,8 +42,14 @@ public:
     void addPuff(int wx, int wy);
     // Modern markers.
     void addMove(float wx, float wy, bool attackGround);
+    void addAttackMove(float wx, float wy);  // not original: an orange ring at the attack-move target
     void addAttackUnit(int side, int index);
     void addAttackBuilding(int side, int index);
+    // Not original (3D "World beyond the map", docs/3d-mode.md): a small red cross on the land outside the
+    // map - a click out there (it pops and fades in under a second), or the pointer moving over it (one
+    // fainter cross that follows the pointer and fades once it rests or leaves). Feedback only.
+    void addOutside(float wx, float wy);
+    void hoverOutside(float wx, float wy);
 
     // Advance by dt seconds (the original: per drawn frame, i.e. 60 steps per second).
     void update(double dt);
@@ -57,7 +63,7 @@ private:
     void stepPuffs();  // the advance part of Display__DrawCursorPuffs 0x428220
 
     struct Marker {
-        enum Kind { Move, AttackGround, AttackUnit, AttackBuilding } kind = Move;
+        enum Kind { Move, AttackGround, AttackUnit, AttackBuilding, AttackMove, Outside } kind = Move;
         float x = 0, y = 0;
         int side = -1, index = -1;
         float age = 0;
@@ -66,6 +72,7 @@ private:
     int puffFirst_ = -1, puffFrames_ = 0;
     double puffClock_ = 0;
     std::vector<Marker> markers_;
+    float hoverX_ = 0, hoverY_ = 0, hoverLeft_ = 0;  // the pointer's cross beyond the map: seconds left
 };
 
 }  // namespace d2k::render

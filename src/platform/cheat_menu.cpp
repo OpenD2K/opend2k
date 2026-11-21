@@ -524,7 +524,17 @@ float CheatMenu::drawToggles(Ui& ui, game::World& w, const SDL_FRect& a, float s
         pending_[key(kKindInstant, side_)] = on ? 1 : 0;
         status_ = tr(on ? "Instant build on" : "Instant build off");
     }
-    y += rowH + 18 * s;
+    y += rowH + 12 * s;
+    auto viewToggle = [&](const char* text, bool* flag, bool invert) {
+        if (!flag) return;
+        bool v = invert ? !*flag : *flag;
+        const float vw = std::min(a.w, ui.textWidth(text, ts) + ui.textWidth(tr("Off"), ts) + 100 * ts);
+        if (ui.toggle(SDL_FRect{a.x, y, vw, rowH}, text, v)) *flag = invert ? !v : v;
+        y += rowH + 12 * s;
+    };
+    viewToggle(tr("Hide the shroud (view only)"), shroud_, true);
+    viewToggle(tr("Debug markers (starts, worm spawners, blooms)"), markers_, false);
+    y += 6 * s;
     y += ui.wrapped(tr("Reveal: removes the shroud for you (it does not come back). Instant build: buildings, units and "
                        "upgrades finish in one tick; they are still paid for. Ctrl+Shift+C opens this page during the game."),
                     SDL_FRect{a.x, y, a.w, a.y + a.h - y}, theme::kDim, ui.bodyScale);

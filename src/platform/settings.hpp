@@ -1,6 +1,6 @@
 #pragma once
-// User settings persisted as key=value lines in SDL_GetPrefPath("d2k-mac", "Dune 2000")/settings.ini
-// (~/Library/Application Support/d2k-mac/Dune 2000/settings.ini on macOS).
+// User settings persisted as key=value lines in SDL_GetPrefPath("OpenD2K", "Dune 2000")/settings.ini
+// (~/Library/Application Support/OpenD2K/Dune 2000/settings.ini on macOS).
 
 #include "platform/platform_info.hpp"
 
@@ -90,9 +90,74 @@ struct Settings {
     // Graphics: 3D only (docs/3d-mode.md "Sun shadows"): a real sun shadow map (terrain, rocks and
     // models cast; everything receives) instead of the baked heightfield shadows. settings.ini "shadows3d".
     bool shadows3d = true;
+    // Graphics: 3D only, experimental (docs/3d-mode.md "Reimagined"): the modern-RTS look - taller cliffs,
+    // a lower sun with long cast shadows, procedural terrain detail (Faithful terrain) and the cinematic
+    // particle effects (Modern effects). Set by the 3D preset (owner 2026-11-16); since 2026-11-18 part of the
+    // 3D / 3D Classic preset match (3D = Reimagined, 3D Classic = off). settings.ini "reimagined".
+    bool reimagined = false;
+    // With Reimagined (docs/3d-mode.md "Ground clutter"): the ground clutter - stones, gravel, rubble, dry scrub - Off,
+    // Sparse (half of it) or Dense. settings.ini "groundDetail" off|sparse|dense.
+    enum class GroundDetail { Off, Sparse, Dense };
+    GroundDetail groundDetail = GroundDetail::Dense;
+    // With Reimagined (docs/3d-mode.md "Dust haze"): wind-blown dust veils drifting across the map (render only, not
+    // part of a preset). settings.ini "dustHaze" on|off.
+    bool dustHaze = true;
+    // With Reimagined + Modern effects (docs/3d-mode.md "Vehicle dust trails", "Placement dust ring"): dust behind
+    // moving ground vehicles and round newly placed buildings, scaled by Effects intensity (render only, not part of
+    // a preset). settings.ini "groundDust" on|off.
+    bool groundDust = true;
+    // With Reimagined (docs/3d-mode.md "Aerial haze"): aerial perspective - the far part of a tilted view fades towards
+    // a warm desert-sky haze - and a gentle bloom on the brightest sand (render only, not part of a preset).
+    // settings.ini "aerialHaze" on|off.
+    bool aerialHaze = true;
+    // With Reimagined (docs/3d-mode.md "World beyond the map"): a decorative, non-playable desert around the
+    // battlefield instead of the black void, and a few cells of camera travel past the map's edges (render
+    // only, not part of a preset). settings.ini "mapSurroundings" on|off.
+    bool mapSurroundings = true;
+    // Its extent: false = only a band near the edge that fades to dark (default), true = the whole landscape to the
+    // horizon. settings.ini "mapSurroundingsFull" on|off.
+    bool mapSurroundingsFull = false;
+    // With Reimagined (docs/3d-mode.md "Realistic grade"): the natural colour grade - a calmer, paler ground
+    // palette with rust spice, darker models with sand dust on them, a filmic grade of the 3D picture and
+    // ground occlusion round buildings and under vehicles (render only, not part of a preset). Off = the vivid
+    // look, the default since 2026-11-21 (owner: with photo terrain and the new models vivid reads right for
+    // Dune; Realistic is the optional Defcon-like look). settings.ini "naturalGrade" on|off.
+    bool naturalGrade = false;
+    // With Reimagined + Modern effects + 3D models (docs/3d-mode.md "Vehicle wrecks"): a destroyed ground vehicle's
+    // model stays for a few seconds as a charred, burning hulk - turret blown off - then crumbles away; units
+    // drive through it (render only: the unit is gone from the world as in the original; not part of a preset).
+    // Off = the vehicle vanishes in its explosion as before. settings.ini "vehicleWrecks" on|off.
+    bool vehicleWrecks = true;
+    // With Reimagined (docs/3d-mode.md "Photo terrain"): real photographed ground - the CC0 scans of the photo
+    // terrain pack (artpacks/photo-terrain, tools/fetch_photo_terrain.py) - instead of the procedural ripples,
+    // gravel, cracks and strata; the palette stays. Without the pack the procedural ground is drawn whatever this
+    // says (render only, not part of a preset). settings.ini "photoTerrain" on|off.
+    bool photoTerrain = true;
+    // With Reimagined (docs/3d-mode.md "Ambient occlusion"): screen-space ambient occlusion - soft darkening where
+    // buildings meet the ground, between their parts, under hulls, in crevices - on the sky light only (render
+    // only, not part of a preset). settings.ini "ambientOcclusion" on|off.
+    bool ambientOcclusion = true;
+    static const char* groundDetailName(GroundDetail v) {
+        return v == GroundDetail::Off ? "off" : v == GroundDetail::Sparse ? "sparse" : "dense";
+    }
+    static GroundDetail groundDetailFrom(const std::string& v) {
+        return v == "off" ? GroundDetail::Off : v == "sparse" ? GroundDetail::Sparse : GroundDetail::Dense;
+    }
     enum class Effects { Classic, Modern };
     Effects effects = Effects::Modern;
     bool modernEffects() const { return enhanced() && effects == Effects::Modern; }
+    // Modern effects only (Enhanced 2D, plain 3D, Reimagined; render/fx_budget.hpp, docs/enhanced-graphics.md
+    // "Effects intensity"): Cinematic = the full look; Balanced = the effects scale down as the view gets busy,
+    // only burning wrecks / buildings keep lasting smoke, smoke turns see-through over units; Clean = short
+    // effects, minimal smoke. Not part of any preset. settings.ini "effectsIntensity" clean|balanced|cinematic.
+    enum class EffectsIntensity { Clean, Balanced, Cinematic };
+    EffectsIntensity effectsIntensity = EffectsIntensity::Clean;  // the default (owner 2026-11-16)
+    static const char* effectsIntensityName(EffectsIntensity v) {
+        return v == EffectsIntensity::Clean ? "clean" : v == EffectsIntensity::Cinematic ? "cinematic" : "balanced";
+    }
+    static EffectsIntensity effectsIntensityFrom(const std::string& v) {
+        return v == "clean" ? EffectsIntensity::Clean : v == "cinematic" ? EffectsIntensity::Cinematic : v == "balanced" ? EffectsIntensity::Balanced : EffectsIntensity::Clean;
+    }
     // Enhanced / 3D only (docs/enhanced-graphics.md "Vehicle animation"; render/vehicle_motion.hpp):
     // Modern = render-only hull motion of ground vehicles (squat / nose dip, roll in turns, suspension
     // bounce, engine tremble, recoil; dust when setting off with Modern effects); Original = the rigid
@@ -229,28 +294,36 @@ struct Settings {
     // look; the Enhanced-only values are inert there and kept); Enhanced = our best 2D (terrain
     // Designed, Modern effects, soft shroud, health bars Selected, panel opaque, classic view
     // Hold, art = the chosen redesign pack or the original sprites - never an upscale);
-    // ThreeD = the Enhanced values plus graphics 3D, 3D terrain Designed and sun shadows (the 3D
-    // models choice is left alone). Custom = anything else. Display values (resolution, UI scale,
+    // ThreeD = the Enhanced values plus graphics 3D, 3D terrain Faithful, sun shadows, the art pack's
+    // models and the Reimagined look ("3D (Reimagined)"; the "lite" iPads: Reimagined off);
+    // ThreeDClassic = "3D Classic", the same with the original 1998 tiles on the heightfield
+    // (terrain Tiles) and Reimagined off (owner decision 2026-11-18). Custom = anything else -
+    // also the legacy 3D terrains (Designed, plain non-Reimagined Faithful), which get no new
+    // upgrades. Display values (resolution, UI scale,
     // fullscreen, render resolution) are not part of a preset. settings.ini "graphicsPreset"
-    // (original|enhanced|3d|custom); a stored preset whose values no longer match reads as the
+    // (original|enhanced|3d|3d-classic|custom); a stored preset whose values no longer match reads as the
     // preset the values match, else Custom. New players (no settings.ini) get Enhanced; the
     // struct defaults stay as they were (one-frame / screenshot / simtest runs use them).
-    enum class GraphicsPreset { Original, Enhanced, ThreeD, Custom, Auto };  // Auto = not stored: detect
+    // The order is the Graphics page's tab order (menus index tabs / cards by it).
+    enum class GraphicsPreset { Original, Enhanced, ThreeD, ThreeDClassic, Custom, Auto };  // Auto = not stored: detect
     GraphicsPreset graphicsPreset = GraphicsPreset::Auto;
     static const char* graphicsPresetName(GraphicsPreset p) {
         return p == GraphicsPreset::Original ? "original" : p == GraphicsPreset::Enhanced ? "enhanced"
-             : p == GraphicsPreset::ThreeD ? "3d" : p == GraphicsPreset::Custom ? "custom" : "";
+             : p == GraphicsPreset::ThreeD ? "3d" : p == GraphicsPreset::ThreeDClassic ? "3d-classic"
+             : p == GraphicsPreset::Custom ? "custom" : "";
     }
     static GraphicsPreset graphicsPresetFrom(const std::string& v) {
         return v == "original" ? GraphicsPreset::Original : v == "enhanced" ? GraphicsPreset::Enhanced
-             : v == "3d" ? GraphicsPreset::ThreeD : v == "custom" ? GraphicsPreset::Custom : GraphicsPreset::Auto;
+             : v == "3d" ? GraphicsPreset::ThreeD : v == "3d-classic" ? GraphicsPreset::ThreeDClassic
+             : v == "custom" ? GraphicsPreset::Custom : GraphicsPreset::Auto;
     }
-    // Whether the current values are exactly preset `p` (Original / Enhanced / ThreeD).
+    // Whether the current values are exactly preset `p` (Original / Enhanced / ThreeD / ThreeDClassic).
+    static bool isThreeDPreset(GraphicsPreset p) { return p == GraphicsPreset::ThreeD || p == GraphicsPreset::ThreeDClassic; }
     bool matchesPreset(GraphicsPreset p) const;
     // The preset shown as active: the stored one while it matches (Custom stays Custom), else the
     // first preset the values match, else Custom.
     GraphicsPreset activePreset() const;
-    // Sets the values of preset `p` (Original / Enhanced / ThreeD) and remembers it.
+    // Sets the values of preset `p` (Original / Enhanced / ThreeD / ThreeDClassic) and remembers it.
     void applyPreset(GraphicsPreset p);
     // The values a preset sets, for change detection: an option row that changes any of them
     // marks the preset Custom (noteGraphicsEdit).
@@ -268,6 +341,7 @@ struct Settings {
         TimeOfDay timeOfDay;
         Lighting lighting;
         VehicleAnimation vehicleAnimation;
+        bool reimagined;  // tells 3D (Reimagined) from the plain 3D looks (owner 2026-11-18)
         bool operator==(const PresetValues&) const = default;
     };
     PresetValues presetValues() const;
@@ -331,6 +405,48 @@ struct Settings {
     // controls Alt+left click / Modern controls right click on the ground sets its rally point.
     // settings.ini "rallyPoints".
     bool rallyPoints = true;
+    // Attack-move (not original; game/attack_move.cpp): hold A and click the ground (Original
+    // controls: left click; Modern: right click, or A then a click) - the selected units walk there
+    // and fight what they meet. On in the Enhanced / 3D presets, off in Original (not part of the
+    // preset match). settings.ini "attackMove".
+    bool attackMove = false;
+    // "Unit movement" (not original; game/modern_move.cpp, docs/modern-movement.md): a game rule
+    // chosen per game - Original = the original's tile-by-tile MoveUnit (bit-exact), Modern =
+    // free-angle driving with acceleration, smooth paths and group spreading for ground vehicles.
+    // Used for new campaign / custom games and as the skirmish lobby's default; saved with each
+    // game (GameStart / SaveMeta). Original everywhere by default (not part of any preset).
+    // settings.ini "unitMovement" (original|modern).
+    bool modernMovement = false;
+    // Smooth camera (not original; docs/STATUS.md "Smooth camera", platform/camera_smooth.hpp):
+    // keyboard / edge scrolling accelerates and decelerates, a right-drag pan keeps a little
+    // momentum when released, the wheel zoom glides to its target around the cursor, minimap jumps
+    // glide when near, 3D turn / tilt keys ease, and vehicles' drawn positions ease their starts /
+    // stops (render only). On in the Enhanced / 3D presets, off in Original (the original
+    // scrolling; not part of the preset match). settings.ini "smoothCamera".
+    bool smoothCamera = false;
+    // Smooth driving (not original; docs/STATUS.md "Smooth driving", render/smooth_drive.hpp): ground
+    // vehicles are drawn driving round the corners of their route (curves through the tile centres,
+    // creeping round while the original turns in place), facing where they drive, their turrets
+    // slewing between the 32 steps; render only (needs Smooth unit motion; Enhanced / 3D). On in
+    // the Enhanced / 3D presets, off in Original (not part of the preset match). settings.ini
+    // "smoothDriving".
+    bool smoothDriving = false;
+    // Building placement (Graphics: 3D with models only; not original; docs/3d-mode.md "Drop-in
+    // build-up", "Assemble build-up"): how a placed building's model appears during the original's
+    // build-up time - Rise = out of the rock behind a rising cut (render/buildup_fx.hpp), DropIn = it
+    // comes down folded, lands in a dust cloud and unfolds (render/building_dropin.hpp), Assemble = it
+    // is built up from the ground part by part (render/building_assemble.hpp). Render only, same
+    // duration. Assemble in the Enhanced / 3D presets, Rise in Original (not part of the preset match).
+    // settings.ini "buildingPlacement" (rise|dropin|assemble); --building-placement for one run.
+    enum class BuildingPlacement { Rise, DropIn, Assemble };
+    BuildingPlacement buildingPlacement = BuildingPlacement::Rise;
+    static const char* buildingPlacementName(BuildingPlacement v) {
+        return v == BuildingPlacement::DropIn ? "dropin" : v == BuildingPlacement::Assemble ? "assemble" : "rise";
+    }
+    static BuildingPlacement buildingPlacementFrom(const std::string& v) {
+        if (v == "assemble") return BuildingPlacement::Assemble;
+        return v == "dropin" || v == "drop-in" ? BuildingPlacement::DropIn : BuildingPlacement::Rise;
+    }
     // Limits (not original when on; default Original in every preset). "Order limit": the
     // original gives one group order to at most 64 of the selected units (Generate*Order
     // 0x459450..; re/notes/limits.md), Unlimited = all of them - applies at once. "Unit limit":
@@ -356,7 +472,7 @@ struct Settings {
     std::string language = "en";
     std::string languageText, languageVoices, languageMovies;
     std::string translationDir;
-    // The Russian AI voice set (Русский (AI); tools/voice/gen_ru_ai.py): a folder holding GAMESFX/*.AUD
+    // The Russian AI voice set (Русский (AI); the ru-ai-voices download or tools/voice/gen_ru_ai.py): a folder holding GAMESFX/*.AUD
     // ("" = <pref path>/Voices/ru-ai). "aiVoicesDir".
     std::string aiVoicesDir;
     // Russian text: the Fargus translation with OpenD2K's fixes (artpacks/lang/ru-fixes/Text.uib,

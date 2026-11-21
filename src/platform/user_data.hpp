@@ -6,13 +6,15 @@
 //
 // SDL_GetPrefPath(kPrefOrg, kPrefApp) - fixed strings, NOT the app's display name (D2K_APP_NAME is
 // "OpenD2K" in release builds and "Dune 2000" in development builds: both share this folder):
-//   macOS    ~/Library/Application Support/d2k-mac/Dune 2000/
-//   Windows  %APPDATA%\d2k-mac\Dune 2000\
-//   Linux    $XDG_DATA_HOME/d2k-mac/Dune 2000/ (~/.local/share/d2k-mac/Dune 2000/)
-//   iOS      <app sandbox>/Library/Application Support/d2k-mac/Dune 2000/ (kept across updates)
+//   macOS    ~/Library/Application Support/OpenD2K/Dune 2000/
+//   Windows  %APPDATA%\OpenD2K\Dune 2000\ (roaming profile)
+//   Linux    $XDG_DATA_HOME/OpenD2K/Dune 2000/ (~/.local/share/OpenD2K/Dune 2000/)
+//   iOS      <app sandbox>/Library/Application Support/OpenD2K/Dune 2000/ (kept across updates)
 //   Android  the app's internal storage (files/; kept across updates)
-// Never change these strings: existing players would lose their settings, saves and downloads.
-// (render/art_pack.cpp ArtPack::userDir uses the same pair.)
+// Up to 0.0.2 the folder was ".../d2k-mac/Dune 2000/" (the repo's old name): the first start of a
+// newer build moves it to the new place (migrateOldPrefFolder) so settings, saves and downloads are
+// kept. Never change these strings again without the same kind of move.
+// (render/art_pack.cpp ArtPack::userDir goes through prefPath().)
 //
 // Portable mode (a self-contained private build, tools/release/package_macos_portable.sh): when a
 // "portable" folder ships with the app - macOS <App>.app/Contents/Resources/portable/, Windows/Linux
@@ -30,6 +32,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -37,7 +40,8 @@
 
 namespace d2k::platform {
 
-inline constexpr const char* kPrefOrg = "d2k-mac";
+inline constexpr const char* kPrefOrg = "OpenD2K";
+inline constexpr const char* kOldPrefOrg = "d2k-mac";  // up to 0.0.2
 inline constexpr const char* kPrefApp = "Dune 2000";
 
 namespace user_data_detail {
@@ -64,7 +68,107 @@ inline std::filesystem::path appContainerDir() {
         if (q.extension() == ".app") return q.parent_path();
     return p;
 }
+// Copies the folder `from` into `to` (which must not exist yet) and checks the copy: every regular file of
+// `from` is in `to` with the same size, and `to` holds no other files. False (and `why`) on any error or
+// difference; the caller removes the partial copy. (Fallback of migrateOldPrefFolder.)
+inline bool copyTreeVerified(const std::filesystem::path& from, const std::filesystem::path& to, std::string& why,
+                             std::uintmax_t& files, std::uintmax_t& bytes) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    files = bytes = 0;
+    fs::copy(from, to, fs::copy_options::recursive, ec);
+    if (ec) {
+        why = "copy: " + ec.message();
+        return false;
+    }
+    std::uintmax_t copied = 0;
+    for (auto it = fs::recursive_directory_iterator(from, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        const fs::path dst = to / fs::relative(it->path(), from, ec);
+        const std::uintmax_t size = it->file_size(ec);
+        if (ec || !fs::is_regular_file(dst) || fs::file_size(dst, ec) != size || ec) {
+            why = "verify: " + dst.string() + (ec ? " (" + ec.message() + ")" : " missing or a different size");
+            return false;
+        }
+        ++files;
+        bytes += size;
+    }
+    if (ec) {
+        why = "verify: " + ec.message();
+        return false;
+    }
+    for (auto it = fs::recursive_directory_iterator(to, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+        if (it->is_regular_file(ec)) ++copied;
+    if (ec || copied != files) {
+        why = ec ? "verify: " + ec.message() : "verify: " + std::to_string(copied) + " files in the copy, " + std::to_string(files) + " expected";
+        return false;
+    }
+    return true;
+}
+// Moves the pre-0.0.3 folder <base>/d2k-mac/Dune 2000/ to <base>/OpenD2K/Dune 2000/ (`now`, just
+// created empty by SDL_GetPrefPath) once. Returns the folder to use: `now`, or the old one if the move
+// failed (nothing is lost; the next start tries again). Android's pref path has no org/app parts.
+// When the rename fails - Windows cannot rename a folder onto another drive (e.g. %APPDATA%\d2k-mac as a
+// junction to D:, "Access is denied") - the folder is copied and the copy verified (file count + sizes);
+// only then is the old folder deleted (if that fails, it is left and the new one used). A failed copy is
+// removed again and the old folder stays in use, as before.
+// False in headless / one-frame / recording runs (--simtest, screenshots, --render-previews...; App sets it before
+// the first prefPath()): they never move the player's folder - with a pre-0.0.3 folder present they just read it
+// in place. (A --simtest on the Legion once really migrated the owner's folder.)
+inline bool& migrationAllowed() {
+    static bool allowed = true;
+    return allowed;
+}
+inline std::string migrateOldPrefFolder(const std::string& now) {
+#if defined(SDL_PLATFORM_ANDROID)
+    return now;
+#else
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path cur = fs::path(now);
+    if (cur.filename().empty()) cur = cur.parent_path();          // ".../OpenD2K/Dune 2000"
+    const fs::path base = cur.parent_path().parent_path();
+    const fs::path old = base / kOldPrefOrg / cur.filename();      // ".../d2k-mac/Dune 2000"
+    if (base.empty() || !fs::is_directory(old, ec)) return now;
+    if (!migrationAllowed()) {
+        SDL_Log("User data: %s not moved (test / one-frame run); reading it in place", old.string().c_str());
+        return withSlash(old.string());
+    }
+    if (!fs::is_empty(cur, ec) || ec) {
+        SDL_Log("User data: both %s and %s exist; using the new one", old.string().c_str(), cur.string().c_str());
+        return now;
+    }
+    fs::remove(cur, ec);
+    fs::rename(old, cur, ec);
+    if (ec) {
+        const std::string moveErr = ec.message();
+        std::string why;
+        std::uintmax_t files = 0, bytes = 0;
+        if (copyTreeVerified(old, cur, why, files, bytes)) {
+            fs::remove_all(old, ec);
+            if (ec)
+                SDL_Log("User data: copied %s to %s (%ju files, %ju bytes; the move failed: %s); could not delete the "
+                        "old folder (%s) - left as it is", old.string().c_str(), cur.string().c_str(), files, bytes,
+                        moveErr.c_str(), ec.message().c_str());
+            else
+                SDL_Log("User data: copied %s to %s (%ju files, %ju bytes; the move failed: %s) and deleted the old folder",
+                        old.string().c_str(), cur.string().c_str(), files, bytes, moveErr.c_str());
+            fs::remove(base / kOldPrefOrg, ec);  // only if now empty (a junction: just the link)
+            return now;
+        }
+        fs::remove_all(cur, ec);  // the partial copy; the old folder is untouched
+        SDL_Log("User data: could not move %s to %s (%s), nor copy it (%s); using the old folder", old.string().c_str(),
+                cur.string().c_str(), moveErr.c_str(), why.c_str());
+        fs::create_directories(cur, ec);
+        return withSlash(old.string());
+    }
+    SDL_Log("User data: moved %s to %s", old.string().c_str(), cur.string().c_str());
+    fs::remove(base / kOldPrefOrg, ec);  // only if now empty
+    return now;
+#endif
+}
 }  // namespace user_data_detail
+using user_data_detail::migrationAllowed;
 
 // The portable folder with a trailing separator, "" when this is a normal install (computed once).
 inline const std::string& portableDir() {
@@ -137,12 +241,64 @@ inline std::string prefPath() {
         return d;
     }
     if (isPortable()) return portableWritableDir();
-    std::string s;
-    if (char* p = SDL_GetPrefPath(kPrefOrg, kPrefApp)) {
-        s = p;
-        SDL_free(p);
-    }
+    static const std::string s = [] {
+        std::string d;
+        if (char* p = SDL_GetPrefPath(kPrefOrg, kPrefApp)) {
+            d = p;
+            SDL_free(p);
+        }
+        return d.empty() ? d : user_data_detail::migrateOldPrefFolder(d);
+    }();
     return s;
+}
+
+// A file:// URL for a local folder (for SDL_OpenURL): "/Users/<you>/Library/Application Support/x/" ->
+// "file:///Users/<you>/Library/Application%20Support/x/"; Windows "C:\Users\<you>\AppData\..." ->
+// "file:///C:/Users/<you>/AppData/...". Reserved/unsafe ASCII is percent-encoded; bytes >= 0x80 (UTF-8)
+// are percent-encoded too, except with `windows` where ShellExecuteW takes them as-is (an IRI) and
+// would decode %XX in the ANSI code page.
+inline std::string fileUrl(const std::string& path, bool windows) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string p = path;
+    if (windows)
+        for (char& c : p)
+            if (c == '\\') c = '/';
+    std::string out = "file://";
+    if (!p.empty() && p[0] != '/') out += '/';  // "C:/..." -> "file:///C:/..."
+    for (const unsigned char c : p) {
+        const bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                          c == '/' || c == '-' || c == '.' || c == '_' || c == '~' || c == ':' || (windows && c >= 0x80);
+        if (keep) out += char(c);
+        else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+    }
+    return out;
+}
+inline std::string fileUrl(const std::string& path) {
+#if defined(SDL_PLATFORM_WINDOWS)
+    return fileUrl(path, true);
+#else
+    return fileUrl(path, false);
+#endif
+}
+
+// Shows the per-user data folder (prefPath: settings.ini, saves, GameData...; portable builds: the
+// "OpenD2K Data" folder) in Finder / Explorer / the file manager. Desktop only (the menus hide the
+// button on iOS / Android). Returns false when there is no folder or the system refused.
+inline bool openUserDataFolder() {
+    const std::string d = prefPath();
+    if (d.empty()) return false;
+    const std::string url = fileUrl(d);
+    SDL_Log("Opening the data folder: %s", url.c_str());
+    if (SDL_OpenURL(url.c_str())) return true;
+    SDL_Log("Could not open %s: %s", url.c_str(), SDL_GetError());
+    return false;
+}
+
+// prefPath() for display: without the trailing separator.
+inline std::string userDataFolderForDisplay() {
+    std::string d = prefPath();
+    while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+    return d;
 }
 
 }  // namespace d2k::platform

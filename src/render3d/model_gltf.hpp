@@ -15,6 +15,7 @@
 // points (Model3D::anchors; their world position, size = scale). docs/3d-models.md "New models".
 
 #include "formats/model3d.hpp"
+#include "render3d/model_texture.hpp"
 
 #include <cstdint>
 #include <string>
@@ -53,6 +54,11 @@ struct GltfAdjust {
     // Loader flag (not models.ini): geometry only, no texture decode (pose variants that only
     // swap the body mesh, e.g. variants/HARVESTER_unloadNN.glb).
     bool geometryOnly = false;
+    // Loader flags (not models.ini): turn the decoded images into GPU-ready textures (Model3D::colorTex /
+    // pbrTex / nrmTex: mip chains, block-compressed when texCaps allows, levels the closest zoom never
+    // reaches dropped) and free the decoded copies (render3d/model_texture.hpp; docs/memory.md).
+    bool prepareTextures = false;
+    TexCaps texCaps;
 };
 
 // Also fills Model3D::skeleton (nodes, rest TRS, animations; models with at most 255 nodes) and

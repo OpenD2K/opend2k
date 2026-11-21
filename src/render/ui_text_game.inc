@@ -3,6 +3,7 @@
 // in-game tooltips (render/sidebar.cpp).
 {"PAUSED", "PAUSE", "PAUSE", "PAUSA", "ПАУЗА"},
 {"Resume", "Reprendre", "Weiter", "Continuar", "Продолжить"},
+{"Mission briefing", "Briefing de mission", "Missionsbriefing", "Informe de misión", "Брифинг миссии"},
 {"Restart mission", "Recommencer la mission", "Mission neu starten", "Reiniciar misión", "Начать миссию заново"},
 {"Quit to main menu", "Quitter vers le menu", "Zum Hauptmenü", "Salir al menú", "Выйти в главное меню"},
 {"Quit game", "Quitter le jeu", "Spiel beenden", "Salir del juego", "Выйти из игры"},

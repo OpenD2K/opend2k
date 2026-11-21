@@ -3,6 +3,7 @@
 // skirmish lobby, options, and the "where is the game data?" screen. Drawn with the original
 // menu artwork from data/UI_GFX and FONT.FNT through the Ui toolkit.
 
+#include "platform/artpack_download.hpp"
 #include "platform/campaign_screens.hpp"
 #include "platform/catalog.hpp"
 #include "platform/community_menu.hpp"
@@ -143,9 +144,14 @@ private:
     MenuResult pageWelcome();
     bool welcomeDue() const;
     void finishWelcome();
+    // Its Download: the main pack, + the 3D Reimagined extras when that look was chosen.
+    bool welcomeWantsReimagined() const;
+    void welcomeDownload();
+    std::string welcomeDownloadSize(const ArtPackDownloader::Status& s) const;
     // --menu-page welcome[-downloading|-installed|-failed|-cutscenes-*][-step2] (-step2: the phone Downloads step)
     bool openWelcomePreview(const std::string& name);
     bool welcomeWants3d_ = false;  // 3D picked on the welcome page: the 3D preset once the pack is installed
+    int welcomeWanted3d_ = 2;      // which one (Settings::GraphicsPreset as int: ThreeD or ThreeDClassic)
     // The welcome page's "Cutscenes (optional)" box (stage units): status, Get cutscenes (the
     // Gruntmods page), Add cutscene installer... (the data-folder page's import), the progress.
     void welcomeCutscenes(MenuResult& res, float x, float y, float w, float h);

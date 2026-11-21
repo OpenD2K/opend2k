@@ -18,10 +18,16 @@
 #include "formats/templates.hpp"
 #include "render/effect_anchors.hpp"
 #include "render3d/camera3d.hpp"
+#include "render3d/cinematic_fx.hpp"
+#include "render3d/ssao.hpp"
+#include "render3d/ground_clutter.hpp"
 #include "render3d/light_buffer.hpp"
 #include "render3d/lights.hpp"
+#include "render3d/surround.hpp"
 #include "render3d/terrain.hpp"
 #include "render3d/terrain_v2.hpp"
+#include "render3d/track_marks.hpp"
+#include "render3d/wrecks.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -48,6 +54,7 @@ class Bloom;
 class Hdr;
 class TtfFont;
 class VehicleMotion;
+class SmoothDrive;
 struct SceneLight;
 struct Sprite;
 }  // namespace d2k::render
@@ -84,6 +91,14 @@ struct ModelFrame {
     SDL_GPUSampler* shadowSampler = nullptr;
     SDL_GPUTextureFormat shadowFormat = SDL_GPU_TEXTUREFORMAT_INVALID;
     float shadow[4] = {};
+    // drawShadowDepth only: skip models standing outside this world rectangle (x0, z0, x1, z1; x0 > x1 = off) -
+    // the cinematic particles' half-resolution depth needs the models round the smoke only.
+    float depthCull[4] = {1, 1, 0, 0};
+    // Screen-space ambient occlusion (render3d/ssao.*; nullptr = none: PointLightsU::ssao is then 0 too).
+    SDL_GPUTexture* ssao = nullptr;
+    SDL_GPUSampler* ssaoSampler = nullptr;
+    // drawShadowDepth only: the shadow map's depth bias (false: exact depth, e.g. seen from the camera).
+    bool depthBias = true;
     // Dynamic lights (render3d/lights.hpp): fragment uniform buffer 1 of model_fs (nullptr = none) and the
     // light grid, fragment storage buffer 0 (nullptr = a stand-in; no lights are read then).
     const PointLightsU* lights = nullptr;
@@ -92,6 +107,10 @@ struct ModelFrame {
     // strength (render::SceneLight::lamps; 0 = none, Day + Classic) and the effect clock (s) for pulses.
     float lamps = 0;
     double time = 0;
+    // Building life (docs/3d-mode.md "Building life"; Reimagined + Modern effects): spinning parts by node name,
+    // the idle turrets' scan. frameDt = real seconds since the last frame (frozen while the game is paused).
+    bool buildingLife = false;
+    float frameDt = 0;
 };
 
 class ModelHook {
@@ -145,12 +164,24 @@ public:
     }
     // models.ini glow = blink of the building type's model (render::EffectAnchors::buildingGlowBlink).
     virtual int buildingGlowBlink(int /*buildingType*/) const { return 0; }
+    // Track marks (render3d/track_marks.hpp): the track / tyre bands of the unit type's model, from its
+    // running gear. False = no model or no running gear found (the renderer falls back to its table).
+    virtual bool unitTrackContact(int /*unitType*/, TrackContact& /*out*/) const { return false; }
     // "Vehicle animation: Modern" (render/vehicle_motion.hpp): the hull poses the unit models are
     // drawn (and their anchors placed) with this frame; nullptr = rigid.
     virtual void setVehicleMotion(const render::VehicleMotion* /*vm*/) {}
     // Modern effects (nullptr = Classic): the eased facings of ground vehicles (Effects::unitVisual)
     // the unit models are turned by, as the 2D sprites, headlights and muzzles are.
     virtual void setEffects(const render::Effects* /*fx*/) {}
+    // Smooth driving (render/smooth_drive.hpp; nullptr = off): the drawn facings and the distance
+    // driven (wheel nodes spin with it).
+    virtual void setSmoothDrive(const render::SmoothDrive* /*d*/) {}
+    // Smooth motion (render/motion.hpp): the time since the last tick in ticks (0..1; 0 = the tick's own state),
+    // so the infantry's frame-map poses advance between the ticks as their positions do.
+    virtual void setTickPhase(float /*phase*/) {}
+    // Vehicle wrecks (render3d/wrecks.hpp; nullptr = off): the hulks of destroyed vehicles, drawn with their
+    // own models; a dying unit a hulk was made of gives it its drawn pose and is not drawn itself.
+    virtual void setWrecks(Wrecks* /*w*/) {}
     // Before the render pass (uploads, own copy pass on `cmd`), then inside it right after the
     // terrain (opaque, depth-writing meshes; the billboards follow). draw returns its draw calls.
     virtual void prepare(SDL_GPUDevice* /*dev*/, SDL_GPUCommandBuffer* /*cmd*/, const ModelFrame& /*f*/) {}
@@ -205,6 +236,42 @@ public:
         // Settings "Sun shadows": a real shadow map (terrain, rocks and models cast; everything
         // receives); false = the baked heightfield shadows of stage 1.
         bool shadowMap = true;
+        // Settings "Reimagined (experimental)" (docs/3d-mode.md "Reimagined"): with the faithful terrain taller
+        // cliffs, a lower sun, procedural terrain detail; with Modern effects the cinematic particles
+        // (render3d/cinematic_fx.*).
+        bool reimagined = false;
+        // Settings "Ground detail" (docs/3d-mode.md "Ground clutter"; Reimagined only): 0 off, 1 low (half the
+        // pieces), 2 high - the Reimagined ground clutter (render3d/ground_clutter.*).
+        int groundDetail = 2;
+        // Settings "Dust haze" (docs/3d-mode.md "Dust haze"; Reimagined only): drifting airborne dust veils that dim
+        // and warm the light on the terrain, models and billboards (shaders: dustHaze, PointLightsU::haze).
+        bool dustHaze = true;
+        // Settings "Ground dust" (docs/3d-mode.md "Vehicle dust trails", "Placement dust ring"; Reimagined + Modern
+        // effects): the cinematic particles' dust behind moving ground vehicles and round newly placed buildings.
+        bool groundDust = true;
+        // Settings "Aerial haze" (docs/3d-mode.md "Aerial haze"; Reimagined only): the far part of a tilted view fades
+        // towards a warm desert-sky haze (by view distance; capped), and a gentle bloom on the brightest sand.
+        bool aerialHaze = true;
+        // Settings "World beyond the map" (docs/3d-mode.md; Reimagined only): a decorative landscape around the
+        // battlefield instead of the black void (render3d/surround.*).
+        bool mapSurroundings = true;
+        bool mapSurroundingsFull = false;  // the whole landscape (else a band that fades to dark)
+        // Settings "Realistic grade" (docs/3d-mode.md; Reimagined terrain only): the natural colour grade - calmer
+        // ground palette, rust spice, darker models with sand dust, the filmic grade of the picture, ground
+        // occlusion round buildings and under vehicles. D2K_GRADE_OFF=1 switches it off.
+        bool naturalGrade = true;
+        // Settings "Photo terrain" (docs/3d-mode.md "Photo terrain"; Reimagined terrain only): real photographed
+        // ground (the photo terrain pack's CC0 scans) instead of the procedural detail; without the pack the
+        // procedural look stays. D2K_PHOTO_OFF=1 switches it off.
+        bool photoTerrain = true;
+        // Settings "Ambient occlusion" (docs/3d-mode.md "Ambient occlusion"; Reimagined terrain only): screen-space
+        // ambient occlusion on the sky light of terrain, rocks and models. D2K_SSAO_OFF=1 switches it off.
+        bool ambientOcclusion = true;
+        // Reimagined + Modern effects + 3D models (docs/3d-mode.md "Vehicle wrecks"; Settings::vehicleWrecks): a
+        // destroyed ground vehicle's model stays for a few seconds as a burning hulk (render only).
+        bool vehicleWrecks = true;
+        // Building placement: Drop-in with models (the landing raises its own dust: no placement ring).
+        bool dropInPlacement = false;
         // Time of day / Modern lighting (render/lighting.hpp; nullptr = the old light): the sun's
         // direction and colour, the sky, the haze; lamps (render/scene_lights.*: spot / point
         // lights + flare billboards); bloom over the picture (render/bloom.*).
@@ -215,6 +282,9 @@ public:
         const render::EffectAnchors* packAnchors = nullptr;
         render::Bloom* bloom = nullptr;
         render::Hdr* hdr = nullptr;  // the tone map of an HDR scene (Quality::hdr; render/hdr.*)
+        // "Realistic grade" without an HDR scene: the same shader grades the 8-bit picture (render/hdr.hpp Grade;
+        // nullptr = no GPU renderer shader: the picture is then drawn ungraded).
+        render::Hdr* gradePass = nullptr;
         // 3D resolution (docs/3d-mode.md "Performance"): the 3D pass renders at this fraction of the
         // view's pixels per axis (0.25..1) and is scaled up (linear) into the view; the UI and the
         // overlays stay at the full resolution.
@@ -232,6 +302,10 @@ public:
     // pick() snaps to a unit drawn under the cursor (its position), else the terrain point.
     bool screenToGround(float sx, float sy, float& wx, float& wy) const;
     bool pick(const game::World& w, float sx, float sy, float& wx, float& wy) const;
+    // World beyond the map: is it drawn (last render())? Does the view pixel show land outside the map - then
+    // its point there (world px; for the red cross: picking and orders never use it).
+    bool surroundActive() const { return surroundOn_; }
+    bool outsidePoint(float sx, float sy, float& wx, float& wy) const;
     // World pixel (+ height above the terrain) -> view pixel.
     bool worldToScreen(float wx, float wy, float above, float& sx, float& sy) const;
     // A tinted cell-aligned rectangle lying on the terrain (placement footprint), SDL_Renderer.
@@ -256,6 +330,12 @@ public:
     void setVehicleMotion(const render::VehicleMotion* vm) {
         vm_ = vm;
         if (models_) models_->setVehicleMotion(vm);
+    }
+    void setSmoothDrive(const render::SmoothDrive* d) {
+        if (models_) models_->setSmoothDrive(d);
+    }
+    void setTickPhase(float phase) {
+        if (models_) models_->setTickPhase(phase);
     }
     // A screen-space line / flag helper for overlays: view pixels per world pixel at a ground point.
     float pixelsPerWorld(float wx, float wy) const { return ppwAt(wx, wy, 0); }
@@ -283,7 +363,9 @@ private:
 
     // kEmit: straight alpha like kAlpha, but unlit (no sun shadow / time-of-day tint / point lights):
     // things that glow on their own (the Modern effects' flames, render::Effects::Blend::Glow).
-    enum Pipe : std::uint8_t { kAlpha, kAdd, kSub, kMul, kLight, kEmit, kPipeCount };
+    // kRelief: a lit relief decal (track marks): dst * 2 * src, the shader shades the texture's normals by the
+    // sun given in the vertex colour (render3d/track_marks.hpp).
+    enum Pipe : std::uint8_t { kAlpha, kAdd, kSub, kMul, kLight, kEmit, kRelief, kPipeCount };
     struct Inst {
         SDL_GPUTexture* tex = nullptr;
         Pipe pipe = kAlpha;
@@ -294,6 +376,7 @@ private:
         float gx[4] = {}, gy[4] = {};  // per corner: the map point whose shroud darkness applies
         float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
         float r = 1, g = 1, b = 1, a = 1, flash = 0;
+        float ka[4] = {1, 1, 1, 1};  // per corner: alpha multiplier
         float depth = 0;         // billboards: sort key (view depth)
         int seq = 0;
     };
@@ -303,6 +386,8 @@ private:
     bool pointHidden(float wx, float wy) const { return cellHidden(int(std::floor(wx / 32)), int(std::floor(wy / 32))); }
     bool buildingHidden(const game::Building& b) const;
     void addEffects(const render::Effects& fx);
+    // Track marks (render3d/track_marks.hpp): the vehicles' trails as relief strips (kRelief decals).
+    void addTrackMarks(const render::Effects& fx);
     // The frame's dynamic lights (the Modern effects' light list + the lamps of the time of day) binned into the
     // light grid and uploaded (its own copy pass; call before the main render pass). dt: frame seconds for the
     // lamps' fades; snap: no fades (loads, one-frame runs).
@@ -313,7 +398,7 @@ private:
     LightGridBuffer lightFallback_;
     struct LightCand {
         float score;
-        int src;  // 0 = effect light, 1 = lamp (index into the lamp list)
+        int src;  // 0 = effect light, 1 = lamp (index into the lamp list), 2 = cinematic light (cineLights_)
         int index;
     };
     std::vector<LightCand> lightCand_;
@@ -352,8 +437,15 @@ private:
     void decalTex(SDL_GPUTexture* t, float x0, float y0, float w, float h, Pipe pipe, float flatY, float r, float g,
                   float b, float a);
     // A rotated rectangle lying on the terrain (centre, half sizes, angle in radians).
+    // Both decalTex (on the terrain) and groundQuad go through pushGroundInst: the rectangle o + u s + v t
+    // (s, t in 0..1; world x / z) `lift` px over the ground, split into an n x n grid of quads (each with its
+    // part of the uv rect) where the ground under it is not flat, so it follows slopes and cliff edges instead of
+    // spanning them as one plane of its four corners (docs/3d-mode.md "Ground marks on slopes").
+    // fade: per corner Terrain::markFade against the centre's height (scorch / craters: none on steep faces or up
+    // walls; not for shadows, selection rings or contact blots).
+    void pushGroundInst(Inst& in, float ox, float oz, float ux, float uz, float vx, float vz, float lift, bool fade = false);
     void groundQuad(SDL_GPUTexture* t, float cx, float cy, float hw, float hh, float angle, Pipe pipe, float r, float g,
-                    float b, float a, float u0, float v0, float u1, float v1);
+                    float b, float a, float u0, float v0, float u1, float v1, bool fade = true);
     // Depth along the eye ray through `p` of the first terrain hit, searching heights
     // [p.y - below, p.y + above]; false if none.
     bool terrainDepthThrough(const Vec3& p, float& depth) const;
@@ -371,6 +463,12 @@ private:
     std::unique_ptr<DesignedTerrain> designed_;  // created on first use ("3D terrain: Designed")
     bool designedFailed_ = false;
     bool ensureDesigned();
+    // Reimagined ground clutter (created on first use; nullptr without its pack). Rebuilt with the terrain
+    // (terrainGen_ counts the terrain builds) or a new Ground detail.
+    std::unique_ptr<GroundClutter> clutter_;
+    bool clutterFailed_ = false;
+    int terrainGen_ = 0, clutterGen_ = -1, clutterDetail_ = -1;
+    bool clutterOn_ = false;
     // Sun shadow map: an orthographic light frustum fitted to the visible ground every frame.
     static constexpr int kShadowSize = 4096;
     bool initShadows();
@@ -379,10 +477,15 @@ private:
     SDL_GPUTextureFormat shadowFmt_ = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     SDL_GPUSampler* shadowSampler_ = nullptr;
     SDL_GPUGraphicsPipeline* terrainDepthPipe_ = nullptr;
+    // The same without the shadow map's slope bias: the ambient occlusion's depth seen from the camera (a slope
+    // bias there offsets each triangle by its own screen slope - steps between triangles read as occluders).
+    SDL_GPUGraphicsPipeline* terrainViewDepthPipe_ = nullptr;
     float terrainTop_ = 0;  // highest terrain vertex
     double shadowMs_ = 0;
     const game::World* world_ = nullptr;
     bool terrainBuilt_ = false, terrainDirty_ = false;
+    std::pair<int, int> terrainRows_{-1, -1};
+    int terrainIndexGen_ = -1;  // Terrain::indexGen of the uploaded index buffer  // terrainDirty_ by the spice relief only: the vertex rows to upload
     Vec3 sun_ = Terrain::sunDirection();  // this frame's sun (the faithful terrain: from the south-west)
     Vec3 baseSun_ = Terrain::sunDirection();  // the terrain style's own sun (time of day turns it)
     float fogRgb_[3] = {};                    // this frame's haze colour
@@ -409,7 +512,33 @@ private:
     SDL_GPUTexture* white_ = nullptr;
     SDL_GPUTexture* clearMask_ = nullptr;  // shroud off: alpha 0
     SDL_GPUTexture* ring_ = nullptr;
+    SDL_GPUTexture* blob_ = nullptr;         // a soft round blot (Realistic grade: the contact shadow under ground units)
+    // Realistic grade (docs/3d-mode.md "Realistic grade"): on this frame (the setting, a Reimagined terrain)?
+    bool gradeOn_ = false;
+    // Photo terrain / ambient occlusion (docs/3d-mode.md): on this frame?
+    bool photoOn_ = false, ssaoWanted_ = false, ssaoOn_ = false;
+    std::unique_ptr<Ssao> ssao_;
+    // ... its contact shadows under the ground units: half width / half length (world px) of a unit type's blot
+    // (from its model's running gear; looked up again every few seconds - models can arrive late).
+    std::vector<float> blobSize_;
+    int blobAge_ = 0;
+    void addContactShadows(const game::World& w, const Options& o);
+    SDL_GPUTexture* trackTex_ = nullptr;     // track marks relief (render3d/track_marks.hpp)
+    SDL_GPUSampler* trackSampler_ = nullptr;  // linear, mipmapped, repeats along v
+    int trackTexW_ = 0;
+    std::vector<TrackContact> trackContacts_;     // per unit type (this frame)
+    std::vector<std::uint8_t> trackContactSeen_;
     bool smallTexturesUploaded_ = false;
+    // The world beyond the map (render3d/surround.*; docs/3d-mode.md): built with the terrain, re-stitched when
+    // the map's heights change.
+    Surround surround_;
+    bool surroundOn_ = false, surroundNew_ = false, surroundDirty_ = false;
+    int surroundGen_ = -1;
+    int clutterBeyondGen_ = -2;  // the surround the clutter's scatter beyond the map was placed for (-1 none)
+    SDL_GPUBuffer* surroundVB_ = nullptr;
+    SDL_GPUBuffer* surroundIB_ = nullptr;
+    SDL_GPUTexture* surroundTex_ = nullptr;
+    SDL_GPUSampler* linearMirror_ = nullptr;
     SDL_GPUBuffer* terrainVB_ = nullptr;
     SDL_GPUBuffer* terrainIB_ = nullptr;
     std::uint32_t terrainIndexCount_ = 0;
@@ -458,6 +587,31 @@ private:
     SDL_Texture* glareGhostTex_ = nullptr;
     double cpuMs_ = 0;
     int drawCalls_ = 0;
+    // "Reimagined" with Modern effects: the cinematic particles (render3d/cinematic_fx.*), created on first use.
+    std::unique_ptr<CinematicFx> cine_;
+    Wrecks wrecks_;                               // vehicle wrecks (Options::vehicleWrecks)
+    bool cineFailed_ = false;
+    bool cineActive_ = false;                     // the cinematic particles run this frame
+    std::vector<CinematicFx::Light> cineLights_;  // their point lights (fireballs), for buildPointLights
+    // Building life (docs/3d-mode.md "Building life"; Reimagined + Modern effects + models): spinning parts
+    // (ModelFrame::buildingLife), the working stacks / vents / beacons found by the models' anchors (buildingLifeFx).
+    bool buildingLifeOn_ = false;
+    static bool buildingLifeOff() {
+        static const bool off = [] {
+            const char* e = std::getenv("D2K_BUILDING_LIFE_OFF");
+            return e && e[0] == '1';
+        }();
+        return off;
+    }
+    void buildingLifeFx(const game::World& w, const Options& o);
+    std::vector<std::int8_t> lifeMask_;  // per building type: which life anchors its model has (-1 = not looked yet)
+    const ModelHook* lifeMaskOf_ = nullptr;
+    std::uint32_t lifeMaskTick_ = 0;
+    std::vector<ModelHook::AnchorWorld> lifeAnchors_;
+    std::vector<CinematicFx::LifeSource> lifeSrc_;
+public:
+    int lastCinematicParticles() const { return cine_ ? cine_->count() : 0; }
+private:
 };
 
 }  // namespace d2k::render3d

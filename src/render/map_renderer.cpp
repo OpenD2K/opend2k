@@ -228,7 +228,7 @@ void MapRenderer::draw(const game::World& w, const game::Scenario& s, const Came
         for (int ui = side.firstUnit; ui >= 0; ui = side.nextObject(ui)) {
             const auto& u = side.units[ui];
             // Ground units only: not flying/carried (0x140), not hidden (0x200000/0x1000000).
-            if (u.alive && !(u.flags & 0x1000000) && !(u.flags & 0x200140))
+            if (u.alive && !(u.flags & 0x1000000) && !(u.flags & 0x200140) && !fxHideUnits())
                 list.push_back({game::fixToPixel(u.posY - u.posZ), order++, nullptr, &u});
         }
     }

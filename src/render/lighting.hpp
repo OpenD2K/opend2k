@@ -66,6 +66,11 @@ struct SpriteShadowWarp {
 };
 SpriteShadowWarp spriteShadowWarp(const SceneLight& l);
 
+// The Reimagined "Realistic grade" (docs/3d-mode.md "Realistic grade"): the Modern day's warm cast held back -
+// the sun a paler straw yellow instead of orange, the haze halfway to neutral, no extra saturation - weighted by how much of the day is
+// in l (dawn, dusk and night keep their colours). The identity light (Classic day) is left alone.
+void calmDayCast(SceneLight& l);
+
 // The light for a setting; cycleSeconds: effect seconds (game ticks / 20) for TimeOfDay::Cycle
 // (one day lasts cycleLength() seconds). lite: the iPad lite profile (no bloom, no lamps).
 SceneLight sceneLight(TimeOfDay t, LightingStyle s, double cycleSeconds = 0, bool lite = false);

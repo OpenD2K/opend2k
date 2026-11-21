@@ -1,4 +1,5 @@
 #include "formats/mission_ini.hpp"
+#include "formats/utf8_bom.hpp"
 
 #include "formats/io.hpp"
 #include "formats/language.hpp"
@@ -33,6 +34,7 @@ std::string child(const std::string& dir, const std::string& name) {
 }  // namespace
 
 IniFile parseIni(const std::string& text) {
+    if (text.compare(0, kUtf8Bom.size(), kUtf8Bom) == 0) return parseIni(text.substr(kUtf8Bom.size()));  // utf8_bom.hpp
     IniFile out;
     std::string cur;
     std::size_t i = 0;

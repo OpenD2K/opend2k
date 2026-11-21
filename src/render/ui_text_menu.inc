@@ -95,6 +95,7 @@
 {"MCV only", "MCV seul", "Nur MCV", "Solo MCV", "Только ПЗК"},
 {"MCV + %d", "MCV + %d", "MCV + %d", "MCV + %d", "ПЗК + %d"},
 {"Starting units", "Unités de départ", "Starteinheiten", "Unidades iniciales", "Стартовые войска"},
+{"Unit movement", "Déplacement des unités", "Einheitenbewegung", "Movimiento de unidades", "Движение юнитов"},
 
 // Options page (the rows below the volume sliders are ui_text_options.inc).
 {"Fullscreen", "Plein écran", "Vollbild", "Pantalla completa", "Полный экран"},
@@ -121,6 +122,8 @@
  "o el instalador de Gruntmods Edition (.exe): se extrae una sola vez.",
  "или установщик Gruntmods Edition (.exe): он распакуется один раз."},
 {"Current data folder:", "Dossier de données actuel :", "Aktueller Datenordner:", "Carpeta de datos actual:", "Текущая папка данных:"},
+{"Settings and saves:", "Paramètres et sauvegardes :", "Einstellungen und Spielstände:", "Ajustes y partidas guardadas:", "Настройки и сохранения:"},
+{"Open data folder", "Ouvrir le dossier des données", "Datenordner öffnen", "Abrir carpeta de datos", "Открыть папку данных"},
 {"Looked in:", "Cherché dans :", "Gesucht in:", "Buscado en:", "Поиск в:"},
 {"No Dune 2000 data found in %s", "Aucune donnée de Dune 2000 dans %s", "Keine Dune-2000-Daten in %s",
  "No hay datos de Dune 2000 en %s", "Нет данных Dune 2000 в %s"},

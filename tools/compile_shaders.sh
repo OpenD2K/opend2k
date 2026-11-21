@@ -30,7 +30,7 @@ spirv_val="$(command -v spirv-val || true)"
 # entry point : stage (the list is also in cmake/CompileShadersDXIL.cmake and render3d/shader_blobs.cpp)
 entries=(terrain_vs:vert terrain_fs:frag sprite_vs:vert sprite_fs:frag
          model_vs:vert model_shadow_vs:vert model_fs:frag shadow_fs:frag
-         terrain2_fs:frag rock_vs:vert rock_fs:frag depth_fs:frag terrain3_fs:frag tonemap_fs:frag)
+         terrain2_fs:frag rock_vs:vert rock_fs:frag depth_fs:frag terrain3_fs:frag tonemap_fs:frag fx_vs:vert fx_fs:frag fxc_vs:vert fxc_fs:frag model_pbr_fs:frag clutter_vs:vert clutter_fs:frag ssao_fs:frag ssaoblur_fs:frag)
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

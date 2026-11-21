@@ -128,7 +128,12 @@
     // Toggles
     {"Reveal the whole map", "Révéler toute la carte", "Ganze Karte aufdecken", "Revelar todo el mapa", "Открыть всю карту"},
     {"Map revealed", "Carte révélée", "Karte aufgedeckt", "Mapa revelado", "Карта открыта"},
-    {"Instant build for this side", "Construction instantanée pour ce camp", "Sofortbau für diese Seite",
+    {"Hide the shroud (view only)", "Masquer le brouillard (affichage seulement)", "Schleier ausblenden (nur Ansicht)",
+ "Ocultar la niebla (solo vista)", "Скрыть туман войны (только вид)"},
+{"Debug markers (starts, worm spawners, blooms)", "Marqueurs de débogage (départs, vers, efflorescences)",
+ "Debug-Marker (Startpunkte, Wurm-Spawner, Blüten)", "Marcadores de depuración (inicios, gusanos, floraciones)",
+ "Отладочные метки (старты, черви, цветение пряности)"},
+{"Instant build for this side", "Construction instantanée pour ce camp", "Sofortbau für diese Seite",
      "Construcción instantánea para este bando", "Мгновенная стройка для стороны"},
     {"Instant build on", "Construction instantanée activée", "Sofortbau an", "Construcción instantánea activada", "Мгновенная стройка: вкл"},
     {"Instant build off", "Construction instantanée désactivée", "Sofortbau aus", "Construcción instantánea desactivada",

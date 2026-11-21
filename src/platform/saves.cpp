@@ -178,6 +178,7 @@ GameStart gameStartOf(const game::SaveMeta& m) {
     g.campaignHouse = m.campaignHouse;
     g.missionIndex = m.missionIndex;
     g.playAsSide = m.playAsSide;
+    g.movement = m.modernMovement ? 1 : 0;
     return g;
 }
 
@@ -198,6 +199,7 @@ game::SaveMeta saveMetaOf(const GameStart& start, int playerSide) {
     m.missionIndex = start.missionIndex;
     m.playerSide = playerSide;
     m.playAsSide = start.playAsSide;
+    m.modernMovement = start.modernMovement();
     return m;
 }
 

@@ -127,6 +127,24 @@ void effectsChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
         s.effects = fx == 1 ? Settings::Effects::Modern : Settings::Effects::Classic;
 }
 
+// The Reimagined ground clutter (docs/3d-mode.md "Ground clutter"; render3d/ground_clutter.*).
+void groundDetailChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
+    int gd = static_cast<int>(s.groundDetail);
+    if (ui.choice(r, tr("Ground detail"), gd, trList({"Off", "Sparse", "Dense"}))) s.groundDetail = static_cast<Settings::GroundDetail>(gd);
+}
+// How much of the Modern effects a busy screen gets (render/fx_budget.hpp; not part of any preset).
+// The Reimagined atmosphere (docs/3d-mode.md "Dust haze", "Vehicle dust trails", "Placement dust ring"; render only).
+void dustRows(Ui& ui, Settings& s, const SDL_FRect& haze, const SDL_FRect& dust) {
+    ui.toggle(haze, tr("Dust haze"), s.dustHaze);
+    ui.toggle(dust, tr("Ground dust"), s.groundDust);
+}
+
+void effectsIntensityChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
+    int v = static_cast<int>(s.effectsIntensity);
+    if (ui.choice(r, tr("Intensity"), v, trList({"Clean", "Balanced", "Cinematic"})))
+        s.effectsIntensity = static_cast<Settings::EffectsIntensity>(v);
+}
+
 // Render-only hull motion of ground vehicles (render/vehicle_motion.hpp).
 void vehicleAnimationChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
     int va = s.vehicleAnimation == Settings::VehicleAnimation::Modern ? 1 : 0;
@@ -161,6 +179,15 @@ void terrain2dChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
     int tt = static_cast<int>(s.terrain2d);
     if (ui.choice(r, tr("Terrain"), tt, trList({"Original tiles", "Upscaled", "Designed", "Faithful"})))
         s.terrain2d = static_cast<Settings::Terrain2D>(tt);
+}
+
+// The world beyond the map (docs/3d-mode.md "World beyond the map"): Off | Near (a band that fades to dark) | Full.
+void surroundChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
+    int v = !s.mapSurroundings ? 0 : s.mapSurroundingsFull ? 2 : 1;
+    if (ui.choice(r, tr("World beyond the map"), v, trList({"Off", "Near", "Full"}))) {
+        s.mapSurroundings = v != 0;
+        s.mapSurroundingsFull = v == 2;
+    }
 }
 
 void terrain3dChoice(Ui& ui, Settings& s, const SDL_FRect& r) {
@@ -319,20 +346,27 @@ int gameplayOptionRows(Ui& ui, Settings& s, const std::function<SDL_FRect(int)>&
               Settings::kMaxGameSpeed, std::to_string(s.gameSpeed));
     // ScrollRate 4..40 pixels per frame (default 20).
     ui.slider(row(1), tr("Scroll speed"), s.scrollRate, Settings::kMinScrollRate, Settings::kMaxScrollRate, std::to_string(s.scrollRate));
+    // Mouse controls | attack-move (not original; game/attack_move.cpp).
     int controls = s.controls == Settings::Controls::Modern ? 1 : 0;
-    if (ui.choice(row(2), tr("Mouse controls"), controls, trList({"Original", "Modern"})))
+    if (ui.choice(leftHalf(row(2)), tr("Mouse controls"), controls, trList({"Original", "Modern"})))
         s.controls = controls == 1 ? Settings::Controls::Modern : Settings::Controls::Original;
+    ui.toggle(rightHalf(row(2)), tr("Attack-move (A)"), s.attackMove);
     // Smooth motion (render-only interpolation) | the frame-time overlay (App::drawPerfOverlay).
     ui.toggle(leftHalf(row(3)), tr("Smooth unit motion"), s.smoothMotion);
     ui.toggle(rightHalf(row(3)), tr("Frame time"), s.perfOverlay);
     // Not original: counted / infinite unit queues (re/notes/economy.md §10).
     int pq = s.extendedQueue() ? 1 : 0;
-    if (ui.choice(row(4), tr("Production queue"), pq, trList({"Original", "Extended"})))
+    if (ui.choice(leftHalf(row(4)), tr("Production queue"), pq, trList({"Original", "Extended"})))
         s.productionQueue = pq == 1 ? Settings::ProductionQueue::Extended : Settings::ProductionQueue::Original;
+    // Camera inertia / eased zoom (not original; platform/camera_smooth.hpp).
+    ui.toggle(rightHalf(row(4)), tr("Smooth camera"), s.smoothCamera);
     // Cheats | factory rally points (not original; game/rally.cpp).
     ui.toggle(leftHalf(row(5)), tr("Cheats"), s.cheats);
     ui.toggle(rightHalf(row(5)), tr("Factory rally points"), s.rallyPoints);
     limitChoices(ui, s, row(6), row(7));
+    // Not original: Modern movement (game/modern_move.cpp); a rule of the game, chosen when it starts.
+    int mv = s.modernMovement ? 1 : 0;
+    if (ui.choice(row(8), tr("Unit movement (new games)"), mv, trList({"Original", "Modern"}))) s.modernMovement = mv == 1;
     return kGameplayOptionRows;
 }
 
@@ -343,13 +377,15 @@ int inGameOptionRows(Ui& ui, Settings& s, const std::function<SDL_FRect(int)>& r
               Settings::kMaxGameSpeed, std::to_string(s.gameSpeed));
     ui.slider(row(2), tr("Scroll speed"), s.scrollRate, Settings::kMinScrollRate, Settings::kMaxScrollRate, std::to_string(s.scrollRate));
     int controls = s.controls == Settings::Controls::Modern ? 1 : 0;
-    if (ui.choice(row(3), tr("Mouse controls"), controls, trList({"Original", "Modern"})))
+    if (ui.choice(leftHalf(row(3)), tr("Mouse controls"), controls, trList({"Original", "Modern"})))
         s.controls = controls == 1 ? Settings::Controls::Modern : Settings::Controls::Original;
+    ui.toggle(rightHalf(row(3)), tr("Attack-move (A)"), s.attackMove);
     ui.toggle(leftHalf(row(4)), tr("Smooth unit motion"), s.smoothMotion);
     ui.toggle(rightHalf(row(4)), tr("Frame time"), s.perfOverlay);
     int pq = s.extendedQueue() ? 1 : 0;
-    if (ui.choice(row(5), tr("Production queue"), pq, trList({"Original", "Extended"})))
+    if (ui.choice(leftHalf(row(5)), tr("Production queue"), pq, trList({"Original", "Extended"})))
         s.productionQueue = pq == 1 ? Settings::ProductionQueue::Extended : Settings::ProductionQueue::Original;
+    ui.toggle(rightHalf(row(5)), tr("Smooth camera"), s.smoothCamera);
     ui.toggle(leftHalf(row(6)), tr("Cheats"), s.cheats);
     renderChoice(ui, s, rightHalf(row(6)));
     // Enhanced presentation (docs/enhanced-graphics.md): art | effects, health bars | shroud.
@@ -376,12 +412,39 @@ int inGameOptionRows(Ui& ui, Settings& s, const std::function<SDL_FRect(int)>& r
         else terrain2dChoice(ui, s, rightHalf(row(12)));
         timeOfDayChoice(ui, s, leftHalf(row(13)));
         lightingChoice(ui, s, rightHalf(row(13)));
-        classicViewChoice(ui, s, row(14));
+        if (s.threeD()) {
+            classicViewChoice(ui, s, leftHalf(row(14)));
+            ui.toggle(rightHalf(row(14)), tr("Reimagined (experimental)"), s.reimagined);
+        } else {
+            classicViewChoice(ui, s, row(14));
+        }
         touchLayoutChoice(ui, s, leftHalf(row(15)));
         phoneUiSizeChoice(ui, s, rightHalf(row(15)));
+        // Effects intensity | 3D: the Reimagined ground clutter (both apply live).
+        if (s.threeD()) {
+            effectsIntensityChoice(ui, s, leftHalf(row(16)));
+            groundDetailChoice(ui, s, rightHalf(row(16)));
+        } else {
+            effectsIntensityChoice(ui, s, row(16));
+        }
+        // 3D: the Reimagined atmosphere - dust haze | ground dust (docs/3d-mode.md "Dust haze", "Vehicle dust trails"),
+        // then the aerial haze (docs/3d-mode.md "Aerial haze") | the world beyond the map ("World beyond the map").
+        int r0 = 17;
+        if (s.threeD()) {
+            dustRows(ui, s, leftHalf(row(17)), rightHalf(row(17)));
+            ui.toggle(leftHalf(row(18)), tr("Aerial haze"), s.aerialHaze);
+            surroundChoice(ui, s, rightHalf(row(18)));
+            // docs/3d-mode.md "Realistic grade" | "Vehicle wrecks"
+            ui.toggle(leftHalf(row(19)), tr("Realistic grade"), s.naturalGrade);
+            ui.toggle(rightHalf(row(19)), tr("Vehicle wrecks"), s.vehicleWrecks);
+            // docs/3d-mode.md "Photo terrain" | "Ambient occlusion"
+            ui.toggle(leftHalf(row(20)), tr("Photo terrain"), s.photoTerrain);
+            ui.toggle(rightHalf(row(20)), tr("Ambient occlusion"), s.ambientOcclusion);
+            r0 = 21;
+        }
         // Display adjustments: the battlefield behind the options shows them live.
-        displayAdjustRows(ui, s, [&](int i) { return row(16 + i); });
-        n = kInGameOptionRows;
+        displayAdjustRows(ui, s, [&](int i) { return row(r0 + i); });
+        n = s.threeD() ? kInGameOptionRows : kInGameOptionRows - 4;
     }
     s.noteGraphicsEdit(before);
     return n;
@@ -488,8 +551,15 @@ float graphicsOptionList(Ui& ui, Settings& s, const OptionListLayout& L, float y
     }
     row([&](const SDL_FRect& r) { pic(PictureOption::Art, [&] { artChoice(ui, s, r); }); });
     y += header(ui, L, y, "Effects", enhancedOnly);
-    row([&](const SDL_FRect& r) { pic(PictureOption::Effects, [&] { effectsChoice(ui, s, r); }); });
-    row([&](const SDL_FRect& r) { vehicleAnimationChoice(ui, s, r); });
+    row([&](const SDL_FRect& r) {
+        pic(PictureOption::Effects, [&] { effectsChoice(ui, s, leftHalf(r)); });
+        effectsIntensityChoice(ui, s, rightHalf(r));
+    });
+    row([&](const SDL_FRect& r) {
+        vehicleAnimationChoice(ui, s, leftHalf(r));
+        // Vehicles drive round corners, turrets slew (render/smooth_drive.hpp; not part of the preset match).
+        ui.toggle(rightHalf(r), tr("Smooth driving"), s.smoothDriving);
+    });
     y += header(ui, L, y, "Lighting", enhancedOnly);
     row([&](const SDL_FRect& r) {
         pic(PictureOption::TimeOfDay, [&] { timeOfDayChoice(ui, s, leftHalf(r)); });
@@ -516,6 +586,36 @@ float graphicsOptionList(Ui& ui, Settings& s, const OptionListLayout& L, float y
     row([&](const SDL_FRect& r) {
         pic(PictureOption::Shadows, [&] { ui.toggle(leftHalf(r), tr("Sun shadows"), s.shadows3d); });
         pic(PictureOption::Models3D, [&] { models3dChoice(ui, s, rightHalf(r)); });
+    });
+    // The "Reimagined" look (docs/3d-mode.md "Reimagined"): the 3D preset has it, 3D Classic not (part of their match).
+    row([&](const SDL_FRect& r) { ui.toggle(r, tr("Reimagined look (experimental)"), s.reimagined); });
+    // Its ground clutter (docs/3d-mode.md "Ground clutter"; render3d/ground_clutter.*).
+    row([&](const SDL_FRect& r) { groundDetailChoice(ui, s, r); });
+    // Its atmosphere: drifting dust haze | dust behind vehicles and round new buildings.
+    row([&](const SDL_FRect& r) { dustRows(ui, s, leftHalf(r), rightHalf(r)); });
+    // Its aerial perspective: the far part of a tilted view fades into a warm desert haze (+ a gentle bloom).
+    row([&](const SDL_FRect& r) { ui.toggle(r, tr("Aerial haze"), s.aerialHaze); });
+    // Its world beyond the map: a decorative desert around the battlefield instead of the void, and a little
+    // camera travel past the edges (docs/3d-mode.md "World beyond the map"; render3d/surround.*).
+    row([&](const SDL_FRect& r) { surroundChoice(ui, s, r); });
+    // Its natural colour grade (docs/3d-mode.md "Realistic grade"): calmer ground, rust spice, darker dusty models,
+    // a filmic grade, ground occlusion. Off = the vivid look.
+    row([&](const SDL_FRect& r) { ui.toggle(r, tr("Realistic grade"), s.naturalGrade); });
+    // Its vehicle wrecks (docs/3d-mode.md "Vehicle wrecks"; with Modern effects and 3D models): a destroyed vehicle's
+    // model stays a few seconds as a burning hulk. Off = it vanishes in its explosion.
+    row([&](const SDL_FRect& r) { ui.toggle(r, tr("Vehicle wrecks"), s.vehicleWrecks); });
+    // Its photographed ground (docs/3d-mode.md "Photo terrain": the CC0 scans of the photo terrain pack instead of
+    // the procedural detail; without the pack the procedural ground stays) | its screen-space ambient occlusion
+    // (docs/3d-mode.md "Ambient occlusion": soft creases where things meet, on the sky light only).
+    row([&](const SDL_FRect& r) {
+        ui.toggle(leftHalf(r), tr("Photo terrain"), s.photoTerrain);
+        ui.toggle(rightHalf(r), tr("Ambient occlusion"), s.ambientOcclusion);
+    });
+    // How placed building models appear (render/building_dropin.hpp, render/building_assemble.hpp; not part of the preset match).
+    row([&](const SDL_FRect& r) {
+        int bp = static_cast<int>(s.buildingPlacement);
+        if (ui.choice(r, tr("Building placement"), bp, trList({"Rise from rock", "Drop-in", "Assemble"})))
+            s.buildingPlacement = static_cast<Settings::BuildingPlacement>(bp);
     });
     y += header(ui, L, y, "Display", "Not part of a preset");
     y += displayOptionList(ui, s, L, y, window);

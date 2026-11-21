@@ -52,6 +52,9 @@ public:
     // Placement mode (after Result::Place): spawning, or the drop point of a reinforcement ----
     bool placing() const { return placing_; }
     void cancelPlacing() { placing_ = false; }
+    // View-only debug switches shown on the Toggles tab (were the M / F keys): the battlefield's debug
+    // markers and the shroud drawing (MapRenderer::showMarkers / showShroud).
+    void setViewFlags(bool* markers, bool* shroud) { markers_ = markers; shroud_ = shroud; }
     const Spawn& spawn() const { return spawn_; }
     // Top-left footprint tile for the cursor at world pixel (wx, wy) (buildings centred like
     // the normal placement cursor; units: the tile under the cursor).
@@ -132,6 +135,8 @@ private:
     // page shows until the world reflects them. Key: kind * 1000 + side * 100 + type.
     std::map<int, int> pending_;
     int shown(int key, int worldValue);
+    bool* markers_ = nullptr;
+    bool* shroud_ = nullptr;
 };
 
 }  // namespace d2k::platform

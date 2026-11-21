@@ -1,6 +1,7 @@
 #include "render/scene_lights.hpp"
 
 #include "game/world.hpp"
+#include "render/building_dropin.hpp"
 #include "render/buildup_fx.hpp"
 #include "render/effect_anchors.hpp"
 #include "render/effects.hpp"
@@ -545,9 +546,15 @@ void SceneLights::addBuilding(const game::World& w, int s, int i, float k, doubl
     const float X0 = float((b.tileX + c0) * 32), Y0 = float((b.tileY + r0) * 32);
     const float W = float((c1 - c0 + 1) * 32), H = float((r1 - r0 + 1) * 32);
     if (hidden(w, X0 + W * 0.5f, Y0 + H * 0.5f) && hidden(w, X0, Y0) && hidden(w, X0 + W, Y0 + H)) return;
-    // A redesigned building rising (render/buildup_fx.hpp): no lamps yet. A 3D model's construction
-    // band glows; the 2D rubble build-up has only a dim work light over the heap.
-    if (const float p = redesigned ? buildupProgress(t_, b) : -1.0f; p >= 0) {
+    // A building model dropping in (render/building_dropin.hpp): its lamps come on at the end of
+    // the unfold, fading in (selling: going out first).
+    if (const float pd = dropIn_ ? dropIn_->buildingDropIn(w, s, i) : -1.0f; pd >= 0) {
+        const float on = dropInPose(pd, false, 0).light;
+        if (on <= 0) return;
+        k *= on;
+    } else if (const float p = redesigned ? buildupProgress(t_, b) : -1.0f; p >= 0) {
+        // A redesigned building rising (render/buildup_fx.hpp): no lamps yet. A 3D model's construction
+        // band glows; the 2D rubble build-up has only a dim work light over the heap.
         if (p > 0.02f && p < 0.98f) {
             if (redesigned == 2) pool(X0 + W * 0.5f, Y0 + H * 0.6f, 6 + 30 * p, 0.6f * std::max(W, H), kGlowOrange, 0.3f * k, 1.2f);
             else pool(X0 + W * 0.5f, Y0 + H * 0.7f, 14, 0.45f * std::max(W, H), kWarm, 0.12f * k, 1.0f);

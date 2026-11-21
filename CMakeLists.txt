@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(CMAKE_CONFIGURATION_TYPES "RelWithDebInfo;Release;Debug" CACHE STRING "Xcode configurations (first = default)" FORCE)
 endif()
-project(d2k VERSION 0.0.2 LANGUAGES C CXX)  # the release version (CHANGELOG.md, docs/release.md)
+project(d2k VERSION 0.0.3 LANGUAGES C CXX)  # the release version (CHANGELOG.md, docs/release.md)
 # Apple: Objective-C++ (platform/http_client_apple.mm) enabled here, before the fetched SDL3 subdirectory is added:
 # enabled only further down, the generate step fails with D2K_FETCH_SDL=ON ("CMAKE_OBJCXX_COMPILE_OBJECT" not set).
 if(APPLE)
@@ -93,8 +93,13 @@ add_library(d2k_core STATIC
     src/game/scenario.cpp
     src/game/world.cpp
     src/render/lighting.cpp  # pure (no SDL): the time of day model, tested by game_test
+    src/render/camera_smooth.cpp  # pure (no SDL): Smooth camera motion model, tested by game_test
+    src/render/motion.cpp  # pure (no SDL): tick interpolation, tested by game_test
+    src/render/smooth_drive.cpp  # pure (no SDL): Smooth driving, tested by game_test
+    src/render3d/model_texture.cpp  # pure (no SDL): model texture mips + BC encoding, tested by game_test
     src/game/spawn.cpp
     src/game/movement.cpp
+    src/game/modern_move.cpp
     src/game/pathfind.cpp
     src/game/combat.cpp
     src/game/projectiles.cpp
@@ -103,6 +108,7 @@ add_library(d2k_core STATIC
     src/game/production.cpp
     src/game/cheats.cpp
     src/game/rally.cpp
+    src/game/attack_move.cpp
     src/game/shroud.cpp
     src/game/mission.cpp
     src/game/mission_ext.cpp
@@ -189,12 +195,16 @@ set(D2K_APP_SOURCES
     src/render/effects_weapons.cpp
     src/render/effects_events.cpp
     src/render/effects_fire.cpp
+    src/render/effects_budget.cpp
     src/render/effects_craters.cpp
     src/render/map_renderer.cpp
     src/render/soft_shroud.cpp
     src/render/scene_lights.cpp
     src/render/weld_fx.cpp
     src/render/buildup_fx.cpp
+    src/render/building_dropin.cpp
+    src/render/effects_dropin.cpp
+    src/render/effects_assemble.cpp
     src/render/bloom.cpp
     src/render/hdr.cpp
     src/render/minimap.cpp
@@ -208,20 +218,30 @@ set(D2K_APP_SOURCES
     src/render/phone_hud.cpp
     src/render/classic_sidebar.cpp
     src/render/image.cpp
+    src/render/mem_stats.cpp
     src/render/map_preview.cpp
-    src/render/motion.cpp
     src/render/vehicle_motion.cpp
     src/render/muzzle_tips.cpp
     src/render/cursor.cpp
     src/render3d/gpu.cpp
     src/render3d/camera3d.cpp
     src/render3d/terrain.cpp
+    src/render3d/surround.cpp
     src/render3d/terrain_v2.cpp
+    src/render3d/ground_clutter.cpp
+    src/render3d/photo_terrain.cpp
+    src/render3d/ssao.cpp
     src/render3d/terrain_guide.cpp
     src/render3d/terrain_bake.cpp
     src/render3d/renderer3d.cpp
+    src/render3d/cinematic_fx.cpp
+    src/render3d/wrecks.cpp
     src/render3d/models.cpp
+    src/render3d/models_life.cpp
     src/render3d/model_gltf.cpp
+    src/render3d/model_assembly.cpp
+    src/render3d/model_drive.cpp
+    src/render3d/track_marks.cpp
     src/render3d/model_anim.cpp
     src/render3d/shader_blobs.cpp
 )
@@ -229,6 +249,10 @@ set(D2K_APP_SOURCES
 # million pixels of image processing): fast even in Debug builds (as the LZMA decoder above).
 if(NOT MSVC)
     set_source_files_properties(src/render3d/terrain_guide.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+    # The world beyond the map: a few hundred thousand noise samples at map start.
+    set_source_files_properties(src/render3d/surround.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+    # Model textures are block-compressed on the loader threads (render3d/model_texture.*): seconds in -O0.
+    set_source_files_properties(src/render3d/model_texture.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 endif()
 # The Enhanced UI's fonts (third_party/fonts, OFL) compiled in; stb_truetype rasterises them.
 include(cmake/EmbedFonts.cmake)
@@ -268,7 +292,7 @@ endif()
 target_compile_definitions(d2k_frontend PRIVATE "D2K_VERSION=\"${PROJECT_VERSION}\"")
 # Desktop app name: the macOS bundle name and the window title. Development builds keep "Dune 2000";
 # release builds (tools/release/package_*.sh) pass -DD2K_APP_NAME=OpenD2K. Settings, saves and
-# unpacked data stay in SDL_GetPrefPath("d2k-mac", "Dune 2000") either way.
+# unpacked data stay in SDL_GetPrefPath("OpenD2K", "Dune 2000") either way.
 set(D2K_APP_NAME "Dune 2000" CACHE STRING "Desktop app name (macOS bundle, window title)")
 target_compile_definitions(d2k_frontend PRIVATE "D2K_APP_TITLE=\"${D2K_APP_NAME}\"")
 # cgltf (MIT, Johannes Kuhlmann) for glTF model packs (src/render3d/model_gltf.cpp).
@@ -376,3 +400,17 @@ add_test(NAME game_test COMMAND game_test)
 foreach(t formats_test game_test)
     d2k_project_options(${t})
 endforeach()
+# MSVC caps a string literal piece at ~16 KB (C2026); the embedded shader sources must stay split.
+# Clang / GCC accept longer ones, so this check guards the Windows build from any platform.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME msvc_literal_check
+             COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/tools/check_msvc_literals.py"
+                     "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/tests")
+endif()
+
+# terrain_scan (dev tool, needs the original game data): the 3D faithful terrain's slopes and pits on
+# the cells ground units use, every campaign + skirmish map (docs/3d-mode.md "Passable ground").
+add_executable(terrain_scan tests/terrain_scan.cpp)
+target_link_libraries(terrain_scan PRIVATE d2k_frontend)
+d2k_project_options(terrain_scan)

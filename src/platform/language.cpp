@@ -9,6 +9,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <atomic>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -41,9 +42,17 @@ lang::Selection languageSelection(const Settings& s) {
     return sel;
 }
 
+namespace {
+std::atomic<int> gAiVoicesGeneration{0};
+}
+
+void noteAiVoicesChanged() { ++gAiVoicesGeneration; }
+int aiVoicesGeneration() { return gAiVoicesGeneration.load(); }
+
 std::string languageKey(const Settings& s) {
+    const int voicesGen = aiVoicesGeneration();  // (only after a download this run: keeps the preview cache keys)
     return s.language + "|" + s.languageText + "|" + s.languageVoices + "|" + s.languageMovies + "|" + s.translationDir + "|" + s.aiVoicesDir + "|" +
-           s.ps1Image + "|" + (s.russianTextFixes ? "fixes" : "fargus");
+           s.ps1Image + "|" + (s.russianTextFixes ? "fixes" : "fargus") + (voicesGen ? "|voices" + std::to_string(voicesGen) : std::string());
 }
 
 std::string defaultTranslationDir(const std::string& dataDir) {

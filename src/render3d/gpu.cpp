@@ -12,6 +12,7 @@ namespace {
 bool gDepthClamp = false;
 bool gAnisotropy = false;
 bool gHdrOk = true;
+bool gRenderStateOk = true;
 
 // SDL_CreateGPURenderer with options. `ourFormats`: ask only for a GPU device that accepts the
 // shader formats this build carries for the 3D mode (render3d/shader_blobs.*). On Windows without
@@ -122,6 +123,15 @@ bool createWindowAndRenderer(const char* title, int w, int h, SDL_WindowFlags fl
         const char* h = std::getenv("D2K_D3D12_HDR");
         gHdrOk = !d3d12 || (h && h[0] == '1');
         if (!gHdrOk) SDL_Log("Direct3D 12: HDR (half-float 3D scene, extended-range output) off - 8-bit / SDR");
+        // Direct3D 12 (SDL 3.4.20): the pipeline for our custom fragment shader of SDL's GPU renderer
+        // (SDL_GPURenderState: render/hdr.* tone map / grade / display adjustments) fails to create
+        // (CreateGraphicsPipelineState E_INVALIDARG, every frame), so whatever it draws is lost: a dark
+        // Reimagined battlefield (Realistic grade), a black screen with a brightness / contrast / gamma /
+        // saturation adjustment. Its signature, root signature and signing match SDL's own shaders; the cause
+        // is not known. Off there - the callers draw without it. D2K_D3D12_RENDERSTATE=1 retests it.
+        const char* rs = std::getenv("D2K_D3D12_RENDERSTATE");
+        gRenderStateOk = !d3d12 || (rs && rs[0] == '1');
+        if (!gRenderStateOk) SDL_Log("Direct3D 12: custom renderer shaders off (no Realistic grade, no display adjustments)");
         SDL_Log("Renderer: SDL GPU renderer on %s (depth clamp %s, anisotropy %s)", SDL_GetGPUDeviceDriver(dev),
                 gDepthClamp ? "on" : "off", gAnisotropy ? "on" : "off");
     }
@@ -133,6 +143,18 @@ bool createWindowAndRenderer(const char* title, int w, int h, SDL_WindowFlags fl
 bool gpuDepthClamp() { return gDepthClamp; }
 bool gpuAnisotropy() { return gAnisotropy; }
 bool gpuHdrOk() { return gHdrOk; }
+bool gpuRenderStateOk() { return gRenderStateOk; }
+
+TexCaps modelTextureCaps(SDL_GPUDevice* dev) {
+    TexCaps c;
+    if (!dev) return c;
+    if (const char* e = std::getenv("D2K_TEX_BC"); e && e[0] == '0') return c;
+    c.bc = true;
+    for (SDL_GPUTextureFormat f : {SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM, SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM,
+                                   SDL_GPU_TEXTUREFORMAT_BC5_RG_UNORM})
+        c.bc = c.bc && SDL_GPUTextureSupportsFormat(dev, f, SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    return c;
+}
 
 SDL_GPUDevice* gpuDeviceOf(SDL_Renderer* r) {
     if (!r) return nullptr;

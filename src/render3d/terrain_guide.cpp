@@ -2,6 +2,7 @@
 
 #include "game/world.hpp"
 #include "render/tileset.hpp"
+#include "render3d/terrain.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -122,6 +123,105 @@ void classifyTile(const TileReader& rd, int tile, const Model& m, TileInfo& t) {
     box3(rug0, rug1);
     for (int i = 0; i < PP; ++i) t.rug[std::size_t(i)] = std::uint8_t(sat(rug1[i]) * 255.0f);
     t.sandFrac = float(sandCount) / float(PP);
+}
+
+// Reimagined (docs/3d-mode.md "Passable ground"): the height channel for Terrain::reliefHeight(g, true) and the
+// shader's macroH. rv: the relief per pixel in the plain units (1 = kCliffHeight; the tiles' sand pixels on
+// passable cells already lifted to their cells' level); pass: the pixel lies on ground units' cells. Target:
+// the Reimagined curve R(v) everywhere (cliff tops up to 2.4x, plateaus level with them), except that on the
+// passable pixels no ramp is steeper than kReimRamp: D = L, the lower envelope of R rising kReimRamp per px
+// along paths through passable pixels (chamfer passes; L <= R) - a plateau keeps its full height where it can
+// ramp down to its shores gently; two passable pixels differ by at most kReimRamp x the length of a passable
+// path between them (no holes, no walls). What that lowers (R - D) fades out into the cliff cells beside over
+// endPx (taken from the nearest passable pixel), so a cliff meets the ground beside it and rises to its full
+// height behind. Stored as the curve's inverse (8 bits: under 0.4 px per step).
+void encodeReimagined(const std::vector<float>& rv, const std::vector<std::uint8_t>& pass, std::vector<std::uint8_t>& hm,
+                      int W, int H, float endPx) {
+    const std::size_t N = rv.size();
+    auto curve = [](float g) { return Terrain::reliefHeight(g, true) / Terrain::kCliffHeight; };
+    std::vector<float> R(N), L(N);
+    for (std::size_t i = 0; i < N; ++i) {
+        R[i] = curve(rv[i]);
+        L[i] = pass[i] ? R[i] : 1e9f;
+    }
+    // The envelope: relax towards the 4 earlier (forward) / later (backward) neighbours, passable to passable.
+    const float s1 = TerrainGuide::kReimRamp / Terrain::kCliffHeight, s2 = s1 * 1.41421356f;
+    const int ox[4] = {-1, 0, -1, 1}, oy[4] = {0, -1, -1, -1};
+    const float oc[4] = {s1, s1, s2, s2};
+    for (int it = 0; it < 8; ++it) {
+        bool changed = false;
+        for (int dir = 0; dir < 2; ++dir) {
+            const int sg = dir == 0 ? 1 : -1;
+            for (int yy = 0; yy < H; ++yy) {
+                const int y = dir == 0 ? yy : H - 1 - yy;
+                for (int xx = 0; xx < W; ++xx) {
+                    const int x = dir == 0 ? xx : W - 1 - xx;
+                    const std::size_t i = std::size_t(y) * W + x;
+                    if (!pass[i]) continue;
+                    for (int k = 0; k < 4; ++k) {
+                        const int nx = x + ox[k] * sg, ny = y + oy[k] * sg;
+                        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                        const std::size_t j = std::size_t(ny) * W + nx;
+                        if (pass[j] && L[j] + oc[k] < L[i]) {
+                            L[i] = L[j] + oc[k];
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!changed) break;
+    }
+    // Passable: D; the lowering, carried into the cliff pixels from the nearest passable one (chamfer 1 / 1.4).
+    std::vector<float> D(N), dl(N, 0.0f), nd(N, 1e9f);
+    for (std::size_t i = 0; i < N; ++i)
+        if (pass[i]) {
+            D[i] = std::min(R[i], L[i]);
+            dl[i] = R[i] - D[i];
+            nd[i] = 0;
+        }
+    const float c[4] = {1.0f, 1.0f, 1.41421356f, 1.41421356f};
+    for (int dir = 0; dir < 2; ++dir) {
+        const int sg = dir == 0 ? 1 : -1;
+        for (int yy = 0; yy < H; ++yy) {
+            const int y = dir == 0 ? yy : H - 1 - yy;
+            for (int xx = 0; xx < W; ++xx) {
+                const int x = dir == 0 ? xx : W - 1 - xx;
+                const std::size_t i = std::size_t(y) * W + x;
+                if (pass[i]) continue;
+                for (int k = 0; k < 4; ++k) {
+                    const int nx = x + ox[k] * sg, ny = y + oy[k] * sg;
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                    const std::size_t j = std::size_t(ny) * W + nx;
+                    if (nd[j] + c[k] < nd[i] && nd[j] < endPx) {
+                        nd[i] = nd[j] + c[k];
+                        dl[i] = dl[j];
+                    }
+                }
+            }
+        }
+    }
+    for (std::size_t i = 0; i < N; ++i)
+        if (!pass[i]) {
+            const float t = sat(nd[i] / endPx);
+            D[i] = R[i] - dl[i] * (1.0f - t * t * (3.0f - 2.0f * t));
+        }
+    // The curve's inverse (monotonic): a table over g, searched.
+    constexpr int kT = 1024;
+    std::array<float, kT + 1> tab{};
+    for (int k = 0; k <= kT; ++k) tab[std::size_t(k)] = curve(float(k) / kT);
+    for (std::size_t i = 0; i < N; ++i) {
+        const float y = std::clamp(D[i], 0.0f, tab[kT]);
+        const auto it = std::lower_bound(tab.begin(), tab.end(), y);
+        const int k = int(it - tab.begin());
+        float g = 1.0f;
+        if (k <= 0) g = 0.0f;
+        else if (k <= kT) {
+            const float a = tab[std::size_t(k - 1)], b = tab[std::size_t(k)];
+            g = (float(k - 1) + (b > a ? (y - a) / (b - a) : 0.0f)) / kT;
+        }
+        hm[i] = std::uint8_t(std::clamp(g, 0.0f, 1.0f) * 255.0f + 0.5f);
+    }
 }
 
 }  // namespace
@@ -474,6 +574,24 @@ bool TerrainGuide::build(const game::World& w, const render::TileAtlas* atlas, c
         return wsum > 1e-4f ? sum / wsum : 0.0f;
     };
     auto plateauAt = [&](int px, int py) { return levelField(px, py, true); };
+    // Reimagined: the passable level over the sand cells as well (they lie at 0), so the ground stays
+    // continuous across sand cells, shores and raised passable rock.
+    auto passLevelAt = [&](int px, int py) {
+        const float u = (float(px) + 0.5f) / P - 0.5f, v = (float(py) + 0.5f) / P - 0.5f;
+        const int x0 = int(std::floor(u)), y0 = int(std::floor(v));
+        const float fx = u - float(x0), fy = v - float(y0);
+        float sum = 0, wsum = 0;
+        for (int j = 0; j < 2; ++j)
+            for (int i = 0; i < 2; ++i) {
+                const int cx = std::clamp(x0 + i, 0, cw_ - 1), cy = std::clamp(y0 + j, 0, ch_ - 1);
+                const std::size_t ci = std::size_t(cy) * cw_ + cx;
+                if (ck[ci] == kCCliff && !interior[ci]) continue;
+                const float wgt = (i ? fx : 1 - fx) * (j ? fy : 1 - fy);
+                sum += (ck[ci] == kCSand ? 0.0f : level[ci]) * wgt;
+                wsum += wgt;
+            }
+        return wsum > 1e-4f ? sum / wsum : 0.0f;
+    };
 
     // ---- the faces' profile: an anisotropic distance into the rock (Dial's algorithm) ------
     // 1.0 = a full face width from the outline: a step that travels north (enters from the south
@@ -577,6 +695,11 @@ bool TerrainGuide::build(const game::World& w, const render::TileAtlas* atlas, c
     // level over most of its own cell (no step against the plateau behind it, a sloping end
     // towards a shore), so no relief reaches a passable cell.
     std::vector<std::uint8_t> hm(N, 0), wall(prm.topDown ? N : 0, 0);
+    // Reimagined: the relief 0..1 in the plain units per pixel (sand pixels too) and whether the pixel lies
+    // on the ground units' cells (passable, or a plateau outcrop).
+    const bool reim = prm.reimagined && !prm.topDown;
+    std::vector<float> rv(reim ? N : 0, 0.0f);
+    std::vector<std::uint8_t> rpass(reim ? N : 0, 0);
     {
         constexpr float kPlateau = 4.0f / 30.0f;  // of the cliff height
         constexpr float kStepPx = 8.0f;           // the step's width along the outline
@@ -587,17 +710,22 @@ bool TerrainGuide::build(const game::World& w, const render::TileAtlas* atlas, c
             const int cy = y / P;
             for (int x = 0; x < W; ++x) {
                 const std::size_t i = std::size_t(y) * W + x;
-                if (sand[i]) continue;
+                if (sand[i] && !reim) continue;
                 const int cx = x / P;
                 const std::size_t ci = std::size_t(cy) * cw_ + cx;
-                const float out = float(dOut[i]) / kUnit;  // px
+                const float out = float(dOut[i]) / kUnit;  // px (0 on sand)
                 const float step = sat(out / kStepPx);
                 const float base = kPlateau * step * step * (3 - 2 * step);
                 float f, cast = 0;  // the relief 0..1 above the base; what casts a shadow
                 if (ck[ci] != kCCliff || interior[ci]) {
-                    f = plateauAt(x, y);
+                    // Reimagined: the passable level field over the sand cells too (level 0), and on the tiles'
+                    // sand pixels as well - pale sand reaching into raised passable rock is no hole there.
+                    f = reim ? passLevelAt(x, y) : plateauAt(x, y);
+                    if (reim) rpass[i] = 1;
                 } else {
-                    f = cast = levelField(x, y, false) * profile(i);
+                    // (Reimagined: a sand pixel in a cliff cell lies on the ground, but meets the passable
+                    // neighbours' level like the rock below.)
+                    f = cast = sand[i] ? 0.0f : levelField(x, y, false) * profile(i);
                     // The passable rock cells around (within kEndPx): meet their level - the
                     // nearer a cell, the more it counts.
                     float dmin = 1e9f, lsum = 0, wsum = 0;
@@ -623,8 +751,9 @@ bool TerrainGuide::build(const game::World& w, const render::TileAtlas* atlas, c
                     }
                 }
                 hm[i] = std::uint8_t(sat(base + (1.0f - base) * f) * 255.0f + 0.5f);
+                if (reim) rv[i] = sat(base + (1.0f - base) * f);
                 if (prm.topDown) wall[i] = std::uint8_t(sat(base + (kWall - base) * cast) * 255.0f + 0.5f);
-                if (cls[ci] != kMixed || rug[i] < 96) continue;
+                if (sand[i] || cls[ci] != kMixed || rug[i] < 96) continue;
                 const float tn = float(tone[i]) / 127.0f;
                 int lv = 0;
                 while (lv < kLevels - 1 && tn >= kLevelEdge[lv]) ++lv;
@@ -635,6 +764,7 @@ bool TerrainGuide::build(const game::World& w, const render::TileAtlas* atlas, c
                 cnt[lv] += 1;
             }
         }
+        if (reim) encodeReimagined(rv, rpass, hm, W, H, kEndPx);
         // Fallback for a level the map hardly has: the plain rock, darker / towards the sand.
         static constexpr float kMul[kLevels] = {0.27f, 0.57f, 0.82f, 1.0f, 1.0f};
         for (int lv = 0; lv < kLevels; ++lv)

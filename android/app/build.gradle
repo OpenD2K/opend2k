@@ -22,8 +22,8 @@ android {
         applicationId "com.opend2k.app"
         minSdkVersion 26          // Android 8.0; Vulkan is available on most devices from here
         targetSdkVersion 35
-        versionCode 2
-        versionName "0.0.2"
+        versionCode 3
+        versionName "0.0.3"
         externalNativeBuild {
             cmake {
                 arguments "-DANDROID_PLATFORM=android-26", "-DANDROID_STL=c++_shared",

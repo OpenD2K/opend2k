@@ -1,4 +1,7 @@
 #include "render3d/models.hpp"
+#include "formats/utf8_bom.hpp"
+
+#include "render3d/model_assembly.hpp"
 
 #include "formats/ps1_disc.hpp"
 #include "formats/ps1_models.hpp"
@@ -6,8 +9,11 @@
 #include "render/art_pack.hpp"
 #include "render/buildup_fx.hpp"
 #include "render/effects.hpp"
+#include "render/mem_stats.hpp"
 #include "render/scene_lights.hpp"
+#include "render/smooth_drive.hpp"
 #include "render/vehicle_motion.hpp"
+#include "render3d/flight.hpp"
 #include "render3d/gpu.hpp"
 #include "render3d/model_anim.hpp"
 #include "render3d/model_gltf.hpp"
@@ -22,6 +28,7 @@
 #include <fstream>
 #include <atomic>
 #include <map>
+#include <set>
 #include <thread>
 #include <unordered_set>
 
@@ -31,8 +38,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// pos3 nrm3 uv2 rgba4 params4 pbr2 + joints (4 bytes) + weights (4 bytes) in the last two floats
-constexpr int kVertexFloats = 20;
+// pos3 nrm3 uv2 rgba4 params4 pbr2 + joints (4 bytes) + weights (4 bytes) in the next two floats
+// + the Assemble part (render3d/model_assembly.hpp): pivot xyz + param (4 floats) and 4 bytes (t0, dur,
+// motion, direction; all 0 = not a part).
+constexpr int kVertexFloats = 25;
 constexpr float kTwoPi = 6.28318530717959f;
 constexpr float kPoseFps = 24.0f;  // pose / frame-map times: frames at 24 fps (as Blender exports them)
 
@@ -43,21 +52,24 @@ struct ModelVU {
     float sun[4] = {};    // model_shadow_vs: towards the sun
     float plane[4] = {};  // model_shadow_vs: ground plane
     float skin[4] = {-1, 0, 0, 0};  // x = first palette entry, < 0 = not skinned
+    float drive[4] = {};            // running gear (render3d/model_drive.hpp): 1 = on, odometer px, spin radians
 };
 using ShadowVU = ModelVU;
 
 // The model vertex layout (both pipelines + the shadow depth pipeline).
 struct VertexLayout {
     SDL_GPUVertexBufferDescription vbd{0, kVertexFloats * 4, SDL_GPU_VERTEXINPUTRATE_VERTEX, 0};
-    SDL_GPUVertexAttribute at[8] = {{0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0},
+    SDL_GPUVertexAttribute at[10] = {{0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0},
                                     {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 12},
                                     {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, 24},
                                     {3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, 32},
                                     {4, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, 48},
                                     {5, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, 64},
                                     {6, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 72},
-                                    {7, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 76}};
-    SDL_GPUVertexInputState state() const { return {&vbd, 1, at, 8}; }
+                                    {7, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 76},
+                                    {8, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, 80},
+                                    {9, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 96}};
+    SDL_GPUVertexInputState state() const { return {&vbd, 1, at, 10}; }
 };
 struct ModelFU {
     float house[4];
@@ -70,6 +82,8 @@ struct ModelFU {
     float shadow[4];
     float walk[4];      // walkable cells: x0, z0 of the footprint's top-left cell, cell mask, min height
     float walkMode[4];  // x: 0 everything, 1 all but the walkable cells' parts, 2 only them
+    float gplane[4];    // the model's ground plane (Realistic grade: the sand dust over its foot)
+    float dust[4];      // x = 1 / the foot band's height (px; 0 = none), y = the dust's share
 };
 
 std::string trim(std::string s) {
@@ -90,6 +104,7 @@ std::string underscored(std::string s) {
 std::map<std::string, GltfAdjust> readAdjust(const fs::path& file) {
     std::map<std::string, GltfAdjust> out;
     std::ifstream in(file);
+    formats::skipUtf8Bom(in);
     std::string line, section;
     while (std::getline(in, line)) {
         if (const auto c = line.find_first_of(";#"); c != std::string::npos) line.erase(c);  // comments
@@ -135,11 +150,12 @@ bool planBounds(const formats::Model3D& m, float& x0, float& z0, float& x1, floa
     x0 = z0 = 1e30f;
     x1 = z1 = -1e30f;
     for (const auto* part : {&m.body, &m.turret, &m.house})
-        for (const auto& v : part->tris) {
-            x0 = std::min(x0, v.pos[0]);
-            x1 = std::max(x1, v.pos[0]);
-            z0 = std::min(z0, v.pos[2]);
-            z1 = std::max(z1, v.pos[2]);
+        for (std::size_t i = 0; i < part->corners(); ++i) {
+            const float* v = part->pos(i);
+            x0 = std::min(x0, v[0]);
+            x1 = std::max(x1, v[0]);
+            z0 = std::min(z0, v[2]);
+            z1 = std::max(z1, v[2]);
         }
     return x1 >= x0;
 }
@@ -239,7 +255,7 @@ void fitToFootprint(formats::Model3D& m, const formats::BuildingTemplate& t, con
         p[1] = s * p[1];
         p[2] = s * p[2] + tz;
     };
-    for (auto* part : {&m.body, &m.turret, &m.shadow, &m.house})
+    for (auto* part : {&m.body, &m.turret, &m.shadow, &m.house, &m.lodBody, &m.lodTurret, &m.lodHouse})
         for (auto& v : part->tris) apply(v.pos);
     for (auto& part : m.bodyPoses)
         for (auto& v : part.tris) apply(v.pos);
@@ -324,6 +340,13 @@ Mat4 scaleY(float k) {
     m.m[5] = k;
     return m;
 }
+Mat4 scaleXYZ(float x, float y, float z) {
+    Mat4 m;
+    m.m[0] = x;
+    m.m[5] = y;
+    m.m[10] = z;
+    return m;
+}
 // Squashed by k towards the height y0 (a building's shadow caster during its build-up).
 Mat4 squashAbove(float y0, float k) {
     if (k >= 1) return Mat4{};
@@ -350,6 +373,21 @@ Mat4 tiltTo(const Vec3& n) {
     m.m[10] = c + k.z * k.z * t;
     return m;
 }
+// Rotation by `a` radians about the unit axis k (Rodrigues, column-major).
+Mat4 axisAngleM(const Vec3& k, float a) {
+    const float c = std::cos(a), s = std::sin(a), t = 1 - c;
+    Mat4 m;
+    m.m[0] = c + k.x * k.x * t;
+    m.m[1] = k.y * k.x * t + k.z * s;
+    m.m[2] = k.z * k.x * t - k.y * s;
+    m.m[4] = k.x * k.y * t - k.z * s;
+    m.m[5] = c + k.y * k.y * t;
+    m.m[6] = k.z * k.y * t + k.x * s;
+    m.m[8] = k.x * k.z * t + k.y * s;
+    m.m[9] = k.y * k.z * t - k.x * s;
+    m.m[10] = c + k.z * k.z * t;
+    return m;
+}
 float facingAngle(int facing) { return float(facing & 31) * (kTwoPi / 32); }
 float facingAngle(float facing) { return facing * (kTwoPi / 32); }
 
@@ -357,22 +395,56 @@ float facingAngle(float facing) { return facing * (kTwoPi / 32); }
 
 ModelRenderer::ModelRenderer(const formats::Templates& t, const formats::HouseColours& colours)
     : t_(t), colours_(colours), unitModel_(formats::kMaxUnitTypes, -1), buildingModel_(formats::kMaxBuildingTypes, -1) {
-    // "Modern animation" (not a setting yet): infantry poses blend between the original frames.
-    // Off = the original's steps (one pose per 2D frame).
-    if (const char* e = std::getenv("D2K_MODERN_ANIM")) smoothAnim_ = e[0] == '1';
+    // Infantry poses blend between the original frames (models.hpp smoothAnim_); D2K_MODERN_ANIM=0 = the
+    // original's steps (one pose per 2D frame).
+    if (const char* e = std::getenv("D2K_MODERN_ANIM")) smoothAnim_ = e[0] != '0';
     // D2K_ANIM_OFF=1: every model in its rest pose (A/B measurements of the skinning cost).
     if (const char* e = std::getenv("D2K_ANIM_OFF")) animOff_ = e[0] == '1';
+    // D2K_BUILDING_LIFE_OFF=1: no building life (docs/3d-mode.md "Building life").
+    if (const char* e = std::getenv("D2K_BUILDING_LIFE_OFF")) lifeOff_ = e[0] == '1';
+    // Reimagined models: D2K_MODEL_LOD=px (simplified-version threshold), D2K_PBR="normal green spec env ao"
+    // (model_pbr_fs strengths, 1 = as authored; green -1 flips the normal map's y).
+    if (const char* e = std::getenv("D2K_MODEL_LOD")) lodPxPerTile_ = std::strtof(e, nullptr);
+    if (const char* e = std::getenv("D2K_PBR"))
+        std::sscanf(e, "%f %f %f %f %f", &pbrK_[0], &pbrK_[1], &pbrK_[2], &pbrK_[3], &pbrK_[4]);
+}
+
+void ModelRenderer::account() {
+    std::int64_t geom = 0, img = 0;
+    auto part = [&](const formats::MeshPart& p) {
+        geom += std::int64_t(p.tris.capacity() * sizeof(formats::MeshVertex) + p.slimPos.capacity() * sizeof(float));
+    };
+    for (const auto& m : models_) {
+        for (const auto* p : {&m.body, &m.turret, &m.shadow, &m.house, &m.lodBody, &m.lodTurret, &m.lodHouse}) part(*p);
+        for (const auto& p : m.bodyPoses) part(p);
+        img += std::int64_t((m.texture.capacity() + m.pbrTexture.capacity() + m.normalTexture.capacity()) * 4);
+        img += std::int64_t(m.colorTex.data.capacity() + m.pbrTex.data.capacity() + m.nrmTex.data.capacity());
+    }
+    using render::mem::Cat;
+    render::mem::add(Cat::ModelCpuGeometry, geom - countedCpuGeom_);
+    render::mem::add(Cat::ModelCpuImages, img - countedCpuImg_);
+    render::mem::add(Cat::ModelGpuTextures, gpuTexBytes_ - countedGpuTex_);
+    render::mem::add(Cat::ModelGpuBuffers, gpuBufBytes_ - countedGpuBuf_);
+    countedCpuGeom_ = geom;
+    countedCpuImg_ = img;
+    countedGpuTex_ = gpuTexBytes_;
+    countedGpuBuf_ = gpuBufBytes_;
 }
 
 ModelRenderer::~ModelRenderer() {
     releaseGpu();
+    models_.clear();
+    account();
     if (dev_) {
         if (meshPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, meshPipe_);
         if (shadowPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, shadowPipe_);
         if (projShadowPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, projShadowPipe_);
         if (depthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, depthPipe_);
+        if (viewDepthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, viewDepthPipe_);
         if (walkPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, walkPipe_);
         if (meshOpaquePipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, meshOpaquePipe_);
+        for (SDL_GPUGraphicsPipeline* p : {pbrPipe_, pbrOpaquePipe_, pbrWalkPipe_})
+            if (p) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
         if (nearest_) SDL_ReleaseGPUSampler(dev_, nearest_);
         if (linear_) SDL_ReleaseGPUSampler(dev_, linear_);
         if (white_) SDL_ReleaseGPUTexture(dev_, white_);
@@ -382,19 +454,22 @@ ModelRenderer::~ModelRenderer() {
 void ModelRenderer::releaseGpu() {
     if (!dev_) return;
     for (auto& g : gpu_)
-        if (g.tex) SDL_ReleaseGPUTexture(dev_, g.tex);
+        for (SDL_GPUTexture* t : {g.tex, g.pbrTex, g.nrmTex})
+            if (t) SDL_ReleaseGPUTexture(dev_, t);
     gpu_.clear();
-    if (vb_) SDL_ReleaseGPUBuffer(dev_, vb_);
-    vb_ = nullptr;
-    if (ib_) SDL_ReleaseGPUBuffer(dev_, ib_);
-    ib_ = nullptr;
+    for (const Page& pg : pages_)
+        for (SDL_GPUBuffer* b : {pg.vb, pg.ib})
+            if (b) SDL_ReleaseGPUBuffer(dev_, b);
+    pages_.clear();
     if (palette_) SDL_ReleaseGPUBuffer(dev_, palette_);
     if (paletteTb_) SDL_ReleaseGPUTransferBuffer(dev_, paletteTb_);
     lightFallback_.release();
     palette_ = nullptr;
     paletteTb_ = nullptr;
     paletteCap_ = 0;
-    uploaded_ = false;
+    uploadedModels_ = 0;
+    gpuTexBytes_ = gpuBufBytes_ = 0;
+    account();
 }
 
 int ModelRenderer::unitModels() const {
@@ -403,11 +478,19 @@ int ModelRenderer::unitModels() const {
 int ModelRenderer::buildingModels() const {
     return int(std::count_if(buildingModel_.begin(), buildingModel_.end(), [](int i) { return i >= 0; }));
 }
+// A pending type (in the pack, read when it first appears: loadPending) counts: the model pass draws it.
 bool ModelRenderer::hasUnitModel(int type) const {
-    return active() && type >= 0 && type < int(unitModel_.size()) && unitModel_[std::size_t(type)] >= 0;
+    return active() && type >= 0 && type < int(unitModel_.size()) &&
+           (unitModel_[std::size_t(type)] >= 0 || (std::size_t(type) < unitPending_.size() && unitPending_[std::size_t(type)]));
+}
+bool ModelRenderer::unitTrackContact(int type, TrackContact& out) const {
+    if (!active() || type < 0 || type >= int(unitModel_.size())) return false;
+    const int m = unitModel_[std::size_t(type)];
+    return m >= 0 && std::size_t(m) < contacts_.size() && trackContactFromGear(contacts_[std::size_t(m)], out);
 }
 bool ModelRenderer::hasBuildingModel(int type) const {
-    return active() && type >= 0 && type < int(buildingModel_.size()) && buildingModel_[std::size_t(type)] >= 0;
+    return active() && type >= 0 && type < int(buildingModel_.size()) &&
+           (buildingModel_[std::size_t(type)] >= 0 || (std::size_t(type) < bldPending_.size() && bldPending_[std::size_t(type)]));
 }
 int ModelRenderer::buildingGlowBlink(int type) const {
     if (!hasBuildingModel(type)) return 0;
@@ -439,12 +522,12 @@ static std::string builtInModelsDir() {
 float ModelRenderer::unitModelHeight(int type) const {
     if (!hasUnitModel(type)) return -1;
     const int m = unitModel_[std::size_t(type)];
-    return m < int(modelTop_.size()) ? modelTop_[std::size_t(m)] : -1;
+    return m >= 0 && m < int(modelTop_.size()) ? modelTop_[std::size_t(m)] : -1;
 }
 float ModelRenderer::buildingModelHeight(int type) const {
     if (!hasBuildingModel(type)) return -1;
     const int m = buildingModel_[std::size_t(type)];
-    return m < int(modelTop_.size()) ? modelTop_[std::size_t(m)] : -1;
+    return m >= 0 && m < int(modelTop_.size()) ? modelTop_[std::size_t(m)] : -1;
 }
 
 std::vector<std::string> ModelRenderer::availablePacks() {
@@ -457,6 +540,8 @@ std::vector<std::string> ModelRenderer::availablePacks() {
     }
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
+    // The Reimagined pack only overlays another pack (setOverlayPack): not a choice of its own.
+    names.erase(std::remove(names.begin(), names.end(), std::string(kReimaginedPack)), names.end());
     if (builtIn && std::find(names.begin(), names.end(), kBuiltInPack) == names.end())
         names.insert(names.begin(), kBuiltInPack);
     return names;
@@ -486,8 +571,17 @@ bool ModelRenderer::load(Source s, const std::string& ps1Image, const std::strin
     glowBlink_.clear();
     poseCache_.clear();
     frameSlots_.clear();
+    dockTip_.clear();
+    assembly_.clear();
+    wheels_.clear();
+    pickBoxes_.clear();
+    fitted_.clear();
+    loadedFiles_.clear();
+    pre_.clear();
     std::fill(unitModel_.begin(), unitModel_.end(), -1);
     std::fill(buildingModel_.begin(), buildingModel_.end(), -1);
+    unitPending_.assign(formats::kMaxUnitTypes, 0);
+    bldPending_.assign(formats::kMaxBuildingTypes, 0);
     source_ = s;
     if (s == Source::Sprites) return true;
     std::vector<std::string> unitKey(formats::kMaxUnitTypes), bldName(formats::kMaxBuildingTypes),
@@ -544,137 +638,255 @@ bool ModelRenderer::load(Source s, const std::string& ps1Image, const std::strin
             if (!bldGroup[std::size_t(i)].empty())
                 buildingModel_[std::size_t(i)] = find(formats::ps1::modelForBuilding(bldName[std::size_t(i)], bldGroup[std::size_t(i)]));
     } else {
+        // glTF pack: the files are resolved now, read only for the types this game wants (setWanted: the
+        // types on the map and the houses in play; everything without it); the others are read the
+        // first time one of them shows up (loadPending, docs/memory.md).
         std::error_code ec0;  // art packs: <pack>/models/...; the built-in pack: assets/models/...
-        const fs::path root = fs::is_directory(fs::path(packDir) / "models", ec0) ? fs::path(packDir) / "models" : fs::path(packDir);
-        const auto adjust = readAdjust(fs::path(packDir) / "models.ini");
-        std::map<std::string, int> loaded;  // file -> model index
-        // Reading a .glb (parse + PNG texture decode) is most of the load time (seconds for a full pack):
-        // every file the lookups below can ask for is read up front on worker threads, then taken in
-        // the same order as before, so the result is the same as reading them one by one.
-        struct Read {
-            bool ok = false;
-            formats::Model3D m;
-            std::string err;
+        packDir_ = packDir;
+        root_ = (fs::is_directory(fs::path(packDir) / "models", ec0) ? fs::path(packDir) / "models" : fs::path(packDir)).string();
+        baseAdjust_ = readAdjust(fs::path(packDir) / "models.ini");
+        // The Reimagined overlay pack (setOverlayPack): its file of a key wins; its models.ini section too,
+        // else the main pack's (the same design: same anchors / fit).
+        overlayRoot_ = overlayDir_.empty() ? std::string() : (fs::path(overlayDir_) / "models").string();
+        overlayAdjust_ = overlayDir_.empty() ? std::map<std::string, GltfAdjust>{} : readAdjust(fs::path(overlayDir_) / "models.ini");
+        overlayModels_ = 0;
+        rUnitName_ = unitName;
+        rUnitKey_ = unitKey;
+        rBldName_ = bldName;
+        rBldGroup_ = bldGroup;
+        // Reading a .glb (parse + PNG decode + texture compression) is most of the load time: every file
+        // the wanted types can ask for is read up front on worker threads, then taken in type order.
+        std::vector<std::pair<std::string, std::string>> want;  // (file, adjust key)
+        std::set<std::string> seenFiles;
+        auto add = [&](const char* kind, const std::string& key) {
+            if (key.empty()) return;
+            const std::string f = fileFor(kind, key);
+            std::error_code ec;
+            if (fs::exists(f, ec) && seenFiles.insert(f).second) want.emplace_back(f, key);
         };
-        std::map<std::string, Read> pre;
-        {
-            std::vector<std::pair<std::string, std::string>> want;  // (file, adjust key)
-            auto add = [&](const char* kind, const std::string& key) {
-                if (key.empty()) return;
-                const fs::path f = root / kind / (key + ".glb");
-                std::error_code ec;
-                if (fs::exists(f, ec) && !pre.count(f.string())) {
-                    pre[f.string()];
-                    want.emplace_back(f.string(), key);
-                }
-            };
-            for (int i = 0; i < formats::kMaxUnitTypes; ++i) {
-                add("unit", underscored(t_.bin.unitNames[i]));
+        auto hasFile = [&](const char* kind, const std::string& a, const std::string& b) {
+            std::error_code ec;
+            return (!a.empty() && fs::exists(fileFor(kind, a), ec)) || (!b.empty() && fs::exists(fileFor(kind, b), ec));
+        };
+        for (int i = 0; i < formats::kMaxUnitTypes; ++i)
+            if (wantedUnit(i)) {
+                add("unit", underscored(unitName[std::size_t(i)]));
                 add("unit", unitKey[std::size_t(i)]);
             }
-            for (int i = 0; i < formats::kMaxBuildingTypes; ++i) {
+        for (int i = 0; i < formats::kMaxBuildingTypes; ++i)
+            if (wantedBuilding(i)) {
                 add("building", underscored(bldName[std::size_t(i)]));
                 add("building", bldGroup[std::size_t(i)]);
             }
-            std::atomic<std::size_t> next{0};
-            auto worker = [&] {
-                for (std::size_t j; (j = next.fetch_add(1)) < want.size();) {
-                    Read& r = pre[want[j].first];  // the map is not modified any more: lookups only
-                    const auto a = adjust.find(want[j].second);
-                    r.ok = loadGltfModel(want[j].first, a != adjust.end() ? a->second : GltfAdjust{}, r.m, r.err);
-                }
-            };
-            const unsigned n = std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
-            std::vector<std::thread> pool;
-            for (unsigned t = 1; t < n && t < want.size(); ++t) pool.emplace_back(worker);
-            worker();
-            for (auto& t : pool) t.join();
-        }
-        auto get = [&](const char* kind, const std::string& key) -> int {
-            if (key.empty()) return -1;
-            const fs::path f = root / kind / (key + ".glb");
-            std::error_code ec;
-            if (!fs::exists(f, ec)) return -1;
-            if (auto it = loaded.find(f.string()); it != loaded.end()) return it->second;
-            formats::Model3D m;
-            std::string err;
-            const auto a = adjust.find(key);
-            bool ok = false;
-            if (auto p = pre.find(f.string()); p != pre.end() && (p->second.ok || !p->second.err.empty())) {
-                ok = p->second.ok;
-                m = std::move(p->second.m);
-                err = std::move(p->second.err);
-                pre.erase(p);
-            } else {
-                ok = loadGltfModel(f.string(), a != adjust.end() ? a->second : GltfAdjust{}, m, err);
-            }
-            if (!ok) {
-                SDL_Log("3D models: %s", err.c_str());
-                return loaded[f.string()] = -1;
-            }
-            m.name = key;
-            models_.push_back(std::move(m));
-            const int mi = int(models_.size()) - 1;
-            anim_.resize(models_.size());
-            glowBlink_.resize(models_.size(), 0);
-            glowBlink_[std::size_t(mi)] = a != adjust.end() ? a->second.glowBlink : 0;
-            // Animated infantry: the frame map next to the glb (docs/art-pipeline.md "Animated models").
-            const fs::path fm = root / kind / (key + ".anim.json");
-            if (fs::exists(fm, ec) && !models_.back().skeleton.empty()) {
-                AnimInfo& ai = anim_.back();
-                if (loadFrameMap(fm.string(), ai.frameMap, err)) {
-                    int missing = 0;
-                    for (const auto& e : ai.frameMap.frames) {
-                        const int ia = e.anim.empty() ? -1 : models_.back().skeleton.find(e.anim);
-                        if (!e.anim.empty() && ia < 0) ++missing;
-                        ai.frameAnim.push_back(ia);
-                    }
-                    SDL_Log("3D models: %s: frame map, %zu frames, %d glTF animations%s", key.c_str(), ai.frameMap.frames.size(),
-                            int(models_.back().skeleton.animations.size()),
-                            missing ? " (some frames name a missing animation: rest pose)" : "");
-                } else {
-                    SDL_Log("3D models: %s", err.c_str());
-                }
-            }
-            loadVariants(mi, packDir, key, f.string(), a != adjust.end() ? a->second : GltfAdjust{});
-            return loaded[f.string()] = mi;
-        };
+        readAhead(want);
         for (int i = 0; i < formats::kMaxUnitTypes; ++i) {
-            int m = get("unit", underscored(unitName[std::size_t(i)]));
-            if (m < 0) m = get("unit", unitKey[std::size_t(i)]);
-            unitModel_[std::size_t(i)] = m;
+            if (wantedUnit(i)) resolveUnit(i);
+            else unitPending_[std::size_t(i)] = hasFile("unit", underscored(unitName[std::size_t(i)]), unitKey[std::size_t(i)]);
         }
-        std::vector<bool> fitted;
         for (int i = 0; i < formats::kMaxBuildingTypes; ++i) {
-            std::string key = underscored(bldName[std::size_t(i)]);
-            int m = get("building", key);
-            if (m < 0) m = get("building", key = bldGroup[std::size_t(i)]);
-            buildingModel_[std::size_t(i)] = m;
-            // On its cells: fitted once per model, to the first template that uses it (house
-            // variants share the footprint).
-            if (m < 0) continue;
-            if (fitted.size() <= std::size_t(m)) fitted.resize(std::size_t(m) + 1, false);
-            if (fitted[std::size_t(m)]) continue;
-            fitted[std::size_t(m)] = true;
-            const auto ai = adjust.find(key);
-            float dx = 0, dz = 0, sc = 1;
-            fitToFootprint(models_[std::size_t(m)], t_.bin.buildings[i], ai != adjust.end() ? ai->second : GltfAdjust{}, dx, dz, sc);
-            if (dx != 0 || dz != 0 || sc != 1)
-                SDL_Log("3D models: %s placed on its cells: moved %.1f px east, %.1f px south, scaled %.3f", key.c_str(), double(dx),
-                        double(dz), double(sc));
-            if (const char* e = std::getenv("D2K_MODEL_FIT_REPORT"); e && e[0] == '1')
-                footprintReport(models_[std::size_t(m)], t_.bin.buildings[i], key);
+            if (wantedBuilding(i)) resolveBuilding(i);
+            else bldPending_[std::size_t(i)] = hasFile("building", underscored(bldName[std::size_t(i)]), bldGroup[std::size_t(i)]);
+        }
+        pre_.clear();
+    }
+    finishModels(0);
+    anyPending_ = std::count(unitPending_.begin(), unitPending_.end(), 1) + std::count(bldPending_.begin(), bldPending_.end(), 1) > 0;
+    const int pending = int(std::count(unitPending_.begin(), unitPending_.end(), 1) + std::count(bldPending_.begin(), bldPending_.end(), 1));
+    SDL_Log("3D models: %s, %d models, %d unit types, %d building types%s", s == Source::Ps1 ? "PS1 disc" : packDir.c_str(),
+            int(models_.size()), unitModels(), buildingModels(),
+            pending ? (" (" + std::to_string(pending) + " more types read when they appear)").c_str() : "");
+    account();
+    render::mem::releaseFreeMemory();  // the decoded images (freed once compressed) and the parse buffers
+    return !models_.empty() || pending > 0;
+}
+
+// The before / after check of a test redesign (docs/3d-models.md "Wind trap redesign (test)"): the Reimagined pack
+// may keep the previous version of a model beside the new one, as <pack>/models/<kind>/previous/KEY.glb (+
+// KEY_lod1.glb). D2K_MODEL_PREVIOUS=KEY[,KEY...] (or "all") shows those instead; D2K_WINDTRAP_OLD=1 is short for
+// D2K_MODEL_PREVIOUS=ATREIDES_WIND_TRAP. A key named there (not "all") without a previous/ file is taken from the
+// main pack: the model shown before the Reimagined pack had that key (HARKONNEN_WIND_TRAP). Without the variables
+// nothing changes.
+static bool wantsPrevious(const std::string& key, bool named = false) {  // named: by its key, not by "all"
+    static const std::string list = [] {
+        std::string l;
+        if (const char* e = std::getenv("D2K_MODEL_PREVIOUS")) l = e;
+        if (const char* e = std::getenv("D2K_WINDTRAP_OLD"); e && e[0] == '1') l += ",ATREIDES_WIND_TRAP";
+        return "," + l + ",";
+    }();
+    if (list.size() <= 2) return false;
+    return (!named && list.find(",all,") != std::string::npos) || list.find("," + key + ",") != std::string::npos;
+}
+
+std::string ModelRenderer::fileFor(const char* kind, const std::string& key) const {
+    std::error_code ec;
+    if (!overlayRoot_.empty()) {
+        if (wantsPrevious(key)) {
+            const fs::path p = fs::path(overlayRoot_) / kind / "previous" / (key + ".glb");
+            if (fs::exists(p, ec)) return p.string();
+            if (const fs::path m = fs::path(root_) / kind / (key + ".glb"); wantsPrevious(key, true) && fs::exists(m, ec))
+                return m.string();
+        }
+        const fs::path f = fs::path(overlayRoot_) / kind / (key + ".glb");
+        if (fs::exists(f, ec)) return f.string();
+    }
+    return (fs::path(root_) / kind / (key + ".glb")).string();
+}
+
+bool ModelRenderer::isOverlay(const std::string& file) const {
+    if (overlayRoot_.empty()) return false;
+    const fs::path dir = fs::path(file).parent_path();
+    return dir.parent_path() == fs::path(overlayRoot_) ||
+           (dir.filename() == "previous" && dir.parent_path().parent_path() == fs::path(overlayRoot_));
+}
+
+// models.ini adjustments of a key as read from file f
+GltfAdjust ModelRenderer::adjustFor(const std::string& file, const std::string& key) const {
+    if (isOverlay(file))
+        if (const auto o = overlayAdjust_.find(key); o != overlayAdjust_.end()) return o->second;
+    const auto b = baseAdjust_.find(key);
+    return b != baseAdjust_.end() ? b->second : GltfAdjust{};
+}
+
+void ModelRenderer::readAhead(const std::vector<std::pair<std::string, std::string>>& want) {
+    std::vector<std::pair<std::string, std::string>> todo;
+    for (const auto& w : want)
+        if (!loadedFiles_.count(w.first) && !pre_.count(w.first)) {
+            pre_[w.first];
+            todo.push_back(w);
+        }
+    std::atomic<std::size_t> next{0};
+    auto worker = [&] {
+        for (std::size_t j; (j = next.fetch_add(1)) < todo.size();) {
+            PreRead& r = pre_[todo[j].first];  // the map is not modified any more: lookups only
+            GltfAdjust a = adjustFor(todo[j].first, todo[j].second);
+            a.prepareTextures = true;
+            a.texCaps = texCaps_;
+            r.ok = loadGltfModel(todo[j].first, a, r.m, r.err);
+            r.done = true;
+        }
+    };
+    const unsigned n = std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
+    std::vector<std::thread> pool;
+    for (unsigned t = 1; t < n && t < todo.size(); ++t) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+}
+
+int ModelRenderer::getModel(const char* kind, const std::string& key) {
+    if (key.empty()) return -1;
+    const std::string f = fileFor(kind, key);
+    std::error_code ec;
+    if (!fs::exists(f, ec)) return -1;
+    if (auto it = loadedFiles_.find(f); it != loadedFiles_.end()) return it->second;
+    formats::Model3D m;
+    std::string err;
+    GltfAdjust adj = adjustFor(f, key);
+    adj.prepareTextures = true;
+    adj.texCaps = texCaps_;
+    const bool overlay = isOverlay(f);
+    bool ok = false;
+    if (auto p = pre_.find(f); p != pre_.end() && p->second.done) {
+        ok = p->second.ok;
+        m = std::move(p->second.m);
+        err = std::move(p->second.err);
+        pre_.erase(p);
+    } else {
+        ok = loadGltfModel(f, adj, m, err);
+    }
+    if (!ok) {
+        SDL_Log("3D models: %s", err.c_str());
+        return loadedFiles_[f] = -1;
+    }
+    m.name = key;
+    if (overlay) {  // its simplified version: same nodes, UVs and textures (geometry only)
+        ++overlayModels_;
+        const fs::path lf = fs::path(f).parent_path() / (key + "_lod1.glb");
+        if (fs::exists(lf, ec)) {
+            GltfAdjust ga = adj;
+            ga.geometryOnly = true;
+            formats::Model3D l;
+            std::string lerr;
+            if (loadGltfModel(lf.string(), ga, l, lerr)) {
+                m.lodBody = std::move(l.body);
+                m.lodTurret = std::move(l.turret);
+                m.lodHouse = std::move(l.house);
+            } else {
+                SDL_Log("3D models: %s", lerr.c_str());
+            }
+        }
+        SDL_Log("3D models: %s from the Reimagined pack (%zu triangles%s%s)", key.c_str(),
+                (m.body.tris.size() + m.turret.tris.size() + m.house.tris.size()) / 3, m.hasPbrMaps() ? ", PBR maps" : "",
+                m.lodBody.empty() ? "" : (", simplified " + std::to_string((m.lodBody.tris.size() + m.lodTurret.tris.size() + m.lodHouse.tris.size()) / 3)).c_str());
+    }
+    models_.push_back(std::move(m));
+    const int mi = int(models_.size()) - 1;
+    anim_.resize(models_.size());
+    glowBlink_.resize(models_.size(), 0);
+    glowBlink_[std::size_t(mi)] = adj.glowBlink;
+    // Animated infantry: the frame map next to the glb (docs/art-pipeline.md "Animated models").
+    const fs::path fm = fs::path(root_) / kind / (key + ".anim.json");
+    if (fs::exists(fm, ec) && !models_.back().skeleton.empty()) {
+        AnimInfo& ai = anim_.back();
+        if (loadFrameMap(fm.string(), ai.frameMap, err)) {
+            int missing = 0;
+            for (const auto& e : ai.frameMap.frames) {
+                const int ia = e.anim.empty() ? -1 : models_.back().skeleton.find(e.anim);
+                if (!e.anim.empty() && ia < 0) ++missing;
+                ai.frameAnim.push_back(ia);
+            }
+            SDL_Log("3D models: %s: frame map, %zu frames, %d glTF animations%s", key.c_str(), ai.frameMap.frames.size(),
+                    int(models_.back().skeleton.animations.size()),
+                    missing ? " (some frames name a missing animation: rest pose)" : "");
+        } else {
+            SDL_Log("3D models: %s", err.c_str());
         }
     }
+    if (!overlay || !loadVariants(mi, overlayDir_, key, f, adj)) loadVariants(mi, packDir_, key, f, adj);
+    return loadedFiles_[f] = mi;
+}
+
+void ModelRenderer::resolveUnit(int i) {
+    unitPending_[std::size_t(i)] = 0;
+    int m = getModel("unit", underscored(rUnitName_[std::size_t(i)]));
+    if (m < 0) m = getModel("unit", rUnitKey_[std::size_t(i)]);
+    unitModel_[std::size_t(i)] = m;
+}
+
+void ModelRenderer::resolveBuilding(int i) {
+    bldPending_[std::size_t(i)] = 0;
+    std::string key = underscored(rBldName_[std::size_t(i)]);
+    int m = getModel("building", key);
+    if (m < 0) m = getModel("building", key = rBldGroup_[std::size_t(i)]);
+    buildingModel_[std::size_t(i)] = m;
+    // On its cells: fitted once per model, to the first template that uses it (house variants share the
+    // footprint).
+    if (m < 0) return;
+    if (fitted_.size() <= std::size_t(m)) fitted_.resize(std::size_t(m) + 1, false);
+    if (fitted_[std::size_t(m)]) return;
+    fitted_[std::size_t(m)] = true;
+    float dx = 0, dz = 0, sc = 1;
+    fitToFootprint(models_[std::size_t(m)], t_.bin.buildings[i], adjustFor(fileFor("building", key), key), dx, dz, sc);
+    if (dx != 0 || dz != 0 || sc != 1)
+        SDL_Log("3D models: %s placed on its cells: moved %.1f px east, %.1f px south, scaled %.3f", key.c_str(), double(dx),
+                double(dz), double(sc));
+    if (const char* e = std::getenv("D2K_MODEL_FIT_REPORT"); e && e[0] == '1')
+        footprintReport(models_[std::size_t(m)], t_.bin.buildings[i], key);
+}
+
+// What every model read since `first` needs besides its geometry: docking tips, decks, heights.
+void ModelRenderer::finishModels(std::size_t first) {
     anim_.resize(models_.size());
+    glowBlink_.resize(models_.size(), 0);
+    assembly_.resize(models_.size());
     // Docking harvesters: where the unloading pipe ends (anchor fx_nozzle, else the rear-most point
     // of the last pose: the pipe fully out).
-    dockTip_.assign(models_.size(), DockTip{});
+    dockTip_.resize(models_.size(), DockTip{});
     for (int i = 0; i < formats::kMaxUnitTypes; ++i) {
         const int mi = unitModel_[std::size_t(i)];
-        if (mi < 0 || t_.bin.units[i].specialBehavior != 1) continue;
+        if (mi < int(first) || t_.bin.units[i].specialBehavior != 1) continue;
         const formats::Model3D& m = models_[std::size_t(mi)];
         DockTip& d = dockTip_[std::size_t(mi)];
+        if (d.valid) continue;
         for (const auto& an : m.anchors)
             if (an.name.rfind("fx_nozzle", 0) == 0) d = DockTip{true, an.pos[0], an.pos[1], an.pos[2]};
         if (d.valid) continue;
@@ -688,20 +900,82 @@ bool ModelRenderer::load(Source s, const std::string& ps1Image, const std::strin
             if (n) d = DockTip{true, float(sx / n), float(sy / n), best};  // the centre of the pipe's mouth
         }
     }
-    decks_.clear();
-    roofs_.clear();
     for (const int m : buildingModel_)
-        if (m >= 0 && (std::size_t(m) >= decks_.size() || decks_[std::size_t(m)].w == 0)) buildDeck(m);
-    modelTop_.clear();
-    for (const auto& m : models_) {
+        if (m >= int(first) && (std::size_t(m) >= decks_.size() || decks_[std::size_t(m)].w == 0)) buildDeck(m);
+    for (std::size_t mi = modelTop_.size(); mi < models_.size(); ++mi) {
+        const auto& m = models_[mi];
         float top = 0;
         for (const auto* part : {&m.body, &m.turret, &m.house})
-            for (const auto& v : part->tris) top = std::max(top, v.pos[1]);
+            for (std::size_t k = 0; k < part->corners(); ++k) top = std::max(top, part->pos(k)[1]);
         modelTop_.push_back(top);
     }
-    SDL_Log("3D models: %s, %d models, %d unit types, %d building types", s == Source::Ps1 ? "PS1 disc" : packDir.c_str(),
-            int(models_.size()), unitModels(), buildingModels());
-    return !models_.empty();
+}
+
+ModelRenderer::Wanted ModelRenderer::wantedFor(const formats::Templates& t, const game::World& w) {
+    Wanted r;
+    r.units.assign(formats::kMaxUnitTypes, 0);
+    r.buildings.assign(formats::kMaxBuildingTypes, 0);
+    unsigned houses = 0;
+    for (const auto& side : w.sides()) {
+        bool any = false;
+        for (int ui = side.firstUnit; ui >= 0; ui = side.nextObject(ui)) {
+            const auto& u = side.units[std::size_t(ui)];
+            if (u.type >= 0 && u.type < formats::kMaxUnitTypes) r.units[std::size_t(u.type)] = 1;
+            any = true;
+        }
+        for (int bi = side.firstBuilding; bi >= 0; bi = side.nextObject(bi)) {
+            const auto& b = side.buildings[std::size_t(bi)];
+            if (b.type >= 0 && b.type < formats::kMaxBuildingTypes) r.buildings[std::size_t(b.type)] = 1;
+            any = true;
+        }
+        if (any && side.house >= 0 && side.house < 8) houses |= 1u << side.house;
+    }
+    // What the houses in play can build (Templates ownerHouse), the rest when it first appears.
+    for (int i = 0; i < int(t.bin.unitCount) && i < formats::kMaxUnitTypes; ++i)
+        if (t.bin.units[i].ownerHouse & houses) r.units[std::size_t(i)] = 1;
+    for (int i = 0; i < int(t.bin.buildingCount) && i < formats::kMaxBuildingTypes; ++i)
+        if (t.bin.buildings[i].ownerHouse & houses) r.buildings[std::size_t(i)] = 1;
+    return r;
+}
+
+bool ModelRenderer::loadPending(const game::World& w) {
+    if (source_ != Source::Pack) return false;
+    std::vector<int> units, buildings;
+    for (const auto& side : w.sides()) {
+        for (int ui = side.firstUnit; ui >= 0; ui = side.nextObject(ui)) {
+            const int t = side.units[std::size_t(ui)].type;
+            if (t >= 0 && t < formats::kMaxUnitTypes && unitPending_[std::size_t(t)] &&
+                std::find(units.begin(), units.end(), t) == units.end())
+                units.push_back(t);
+        }
+        for (int bi = side.firstBuilding; bi >= 0; bi = side.nextObject(bi)) {
+            const int t = side.buildings[std::size_t(bi)].type;
+            if (t >= 0 && t < formats::kMaxBuildingTypes && bldPending_[std::size_t(t)] &&
+                std::find(buildings.begin(), buildings.end(), t) == buildings.end())
+                buildings.push_back(t);
+        }
+    }
+    if (units.empty() && buildings.empty()) return false;
+    const Uint64 t0 = SDL_GetTicks();
+    const std::size_t first = models_.size();
+    std::vector<std::pair<std::string, std::string>> want;
+    for (const int i : units)
+        for (const std::string& k : {underscored(rUnitName_[std::size_t(i)]), rUnitKey_[std::size_t(i)]})
+            if (!k.empty()) want.emplace_back(fileFor("unit", k), k);
+    for (const int i : buildings)
+        for (const std::string& k : {underscored(rBldName_[std::size_t(i)]), rBldGroup_[std::size_t(i)]})
+            if (!k.empty()) want.emplace_back(fileFor("building", k), k);
+    std::error_code ec;
+    want.erase(std::remove_if(want.begin(), want.end(), [&](const auto& p) { return !fs::exists(p.first, ec); }), want.end());
+    readAhead(want);
+    for (const int i : units) resolveUnit(i);
+    for (const int i : buildings) resolveBuilding(i);
+    pre_.clear();
+    finishModels(first);
+    SDL_Log("3D models: %zu unit + %zu building types appeared, %zu models read in %llu ms", units.size(), buildings.size(),
+            models_.size() - first, (unsigned long long)(SDL_GetTicks() - t0));
+    account();
+    return models_.size() > first;
 }
 
 // Pose variants of a model (docs/3d-models.md "Animation"): <pack>/variants/KEY_poseNN.glb (the
@@ -713,14 +987,14 @@ bool ModelRenderer::load(Source s, const std::string& ps1Image, const std::strin
 // (Model3D::bodyPoses). Optional <pack>/variants/KEY.spec.json or spec.json (with "key": KEY):
 // which pose each building overlay frame / silo fill level / unit art row shows (else pose =
 // frame - 1, frame 0 = rest; rows: pose = row).
-void ModelRenderer::loadVariants(int mi, const std::string& packDir, const std::string& key, const std::string& glbPath,
+bool ModelRenderer::loadVariants(int mi, const std::string& packDir, const std::string& key, const std::string& glbPath,
                                  const GltfAdjust& adj) {
     formats::Model3D& m = models_[std::size_t(mi)];
     AnimInfo& ai = anim_[std::size_t(mi)];
     std::error_code ec;
     fs::path vdir = fs::path(packDir) / "variants";
     if (!fs::is_directory(vdir, ec)) vdir = fs::path(packDir) / "models" / "variants";
-    if (!fs::is_directory(vdir, ec)) return;
+    if (!fs::is_directory(vdir, ec)) return false;
     for (const char* spec : {"KEY.spec.json", "spec.json"}) {
         const std::string name = std::string(spec) == "spec.json" ? spec : key + ".spec.json";
         if (loadPoseSpec((vdir / name).string(), key, ai.animFrames, ai.levels, ai.rowPoses)) break;
@@ -738,10 +1012,10 @@ void ModelRenderer::loadVariants(int mi, const std::string& packDir, const std::
             }
         }
     }
-    if (files.empty()) return;
+    if (files.empty()) return false;
     ai.rows = rowFiles || !ai.rowPoses.empty();
     std::vector<std::string> names;
-    if (!loadGltfNodeNames(glbPath, names) || names.size() != m.skeleton.nodes.size()) return;
+    if (!loadGltfNodeNames(glbPath, names) || names.size() != m.skeleton.nodes.size()) return true;
     auto& sk = m.skeleton;
     const int count = files.rbegin()->first + 1;
     std::vector<std::vector<float>> nodePose(static_cast<std::size_t>(count));  // 10 floats per node, empty = rest
@@ -810,6 +1084,7 @@ void ModelRenderer::loadVariants(int mi, const std::string& packDir, const std::
     SDL_Log("3D models: %s: %d pose variants (%d node poses, %d mesh poses)%s%s", key.c_str(), int(files.size()), nodeVariants,
             meshVariants, ai.rows ? ", unit art rows" : "",
             ai.animFrames.empty() && ai.levels.empty() && ai.rowPoses.empty() ? "" : ", pose spec");
+    return true;
 }
 
 // The pose of a unit's model, chosen from the same state as its 2D frame (MapRenderer::drawUnit):
@@ -837,8 +1112,12 @@ ModelRenderer::UnitPose ModelRenderer::unitPose(const game::Unit& u, int type, i
             if (smoothAnim_) {  // towards the next original frame of the same strip (3 ticks per frame)
                 const int next = (u.animFrame + 1) * dirs + dir;
                 if (std::size_t(next) < ai.frameMap.frames.size() && ai.frameMap.frames[std::size_t(next)].anim == e.anim &&
-                    ai.frameMap.frames[std::size_t(next)].frame == e.frame + 1)
-                    frame += float(std::min<int>(u.animDelay, 2)) / 3.0f;
+                    ai.frameMap.frames[std::size_t(next)].frame == e.frame + 1) {
+                    // The tick phase too (the frame counter only steps per tick); in 1/8 frames, so the cached poses
+                    // (paletteFor) stay few.
+                    const float k = std::min(1.0f, (float(std::min<int>(u.animDelay, 2)) + tickPhase_) / 3.0f);
+                    frame += std::round(k * 8.0f) / 8.0f;
+                }
             }
             p.time = frame / kPoseFps;
             p.yaw = e.yaw;
@@ -865,6 +1144,54 @@ ModelRenderer::UnitPose ModelRenderer::unitPose(const game::Unit& u, int type, i
         pose(ai.rowPoses.empty() ? row : (std::size_t(row) < ai.rowPoses.size() ? ai.rowPoses[std::size_t(row)] : -1));
     }
     return p;
+}
+
+// Infantry (frame-map poses): the drawn yaw eases towards the frame's (the 8 direction columns turned a soldier
+// 45 degrees in one tick), quickly (tau 45 ms: a turn still reads as one) and the short way round. A unit new
+// to its slot, or not drawn for a while, starts at the frame's yaw.
+// Flyers (carryalls, ornithopters, frigates and a carried unit): the original turns them one of 32 facing slots
+// per tick, which in 3D snapped the hull 11.25 degrees at a time; their drawn facing (in slots) eases the same
+// way (tau 90 ms), keyed by the flyer itself so a carryall and its cargo turn together.
+void ModelRenderer::easeInfantryYaw(const ModelFrame& f, const game::Unit& u, int type, int mi) {
+    const UnitPose p = unitPose(u, type, mi);
+    const std::uint32_t key = std::uint32_t(u.side) << 16 | std::uint32_t(u.index);
+    if (!p.framed && (u.flags & 0x140) && smoothAnim_) {
+        if (infantryYaw_.size() > 4096) infantryYaw_.clear();
+        InfantryYaw& y = infantryYaw_[key];
+        const float target = float(u.facing & 31);
+        const double dt = f.time - y.time;
+        if (y.type != -2 - int(u.type) || dt < 0 || dt > 0.5) {
+            y.yaw = target;
+        } else if (dt > 0) {
+            float d = std::fmod(target - y.yaw, 32.0f);
+            if (d > 16) d -= 32;
+            if (d < -16) d += 32;
+            y.yaw += d * float(1.0 - std::exp(-dt / 0.09));
+            if (std::abs(d) < 0.01f) y.yaw = target;
+            y.yaw = std::fmod(y.yaw + 32.0f, 32.0f);
+        }
+        y.time = f.time;
+        y.type = -2 - int(u.type);  // (flyer entries: never equal to an infantry entry's model type)
+        return;
+    }
+    if (!p.framed || !smoothAnim_) {
+        if (!infantryYaw_.empty()) infantryYaw_.erase(key);
+        return;
+    }
+    if (infantryYaw_.size() > 4096) infantryYaw_.clear();
+    InfantryYaw& y = infantryYaw_[key];
+    const double dt = f.time - y.time;
+    if (y.type != type || dt < 0 || dt > 0.5) {
+        y.yaw = p.yaw;
+    } else {
+        float d = std::fmod(p.yaw - y.yaw, 360.0f);
+        if (d > 180) d -= 360;
+        if (d < -180) d += 360;
+        y.yaw += d * float(1.0 - std::exp(-dt / 0.045));
+        if (std::abs(p.yaw - y.yaw) < 0.05f) y.yaw = p.yaw;
+    }
+    y.time = f.time;
+    y.type = type;
 }
 
 // The pose of a building's model: the overlay frame its 2D drawing would show (MapRenderer::
@@ -933,6 +1260,80 @@ int ModelRenderer::paletteFor(int mi, int anim, float time) {
     return base;
 }
 
+// The skeleton wheel nodes of a model and their radii; needs the CPU mesh, so it runs at the upload,
+// before MeshPart::slim drops the vertices (docs/memory.md).
+void ModelRenderer::buildWheels(int mi) {
+    const formats::Model3D& m = models_[std::size_t(mi)];
+    if (wheels_.size() < models_.size()) wheels_.resize(models_.size());
+    Wheels& wh = wheels_[std::size_t(mi)];
+    if (!wh.built && !m.skeleton.empty()) {
+        wh.built = true;
+        std::vector<float> world;
+        restWorld(m.skeleton, world);
+        for (std::size_t n = 0; n < m.skeleton.nodes.size() && n < 255; ++n) {
+            std::string nm = m.skeleton.nodes[n].name;
+            for (char& c : nm) c = char(std::tolower(static_cast<unsigned char>(c)));
+            if (nm.rfind("wheel", 0) != 0 && nm.rfind("sprocket", 0) != 0 && nm.rfind("idler", 0) != 0) continue;
+            float r[16], ri[16];
+            mat4Mul(m.skeleton.place, &world[n * 16], r);
+            if (!mat4Inverse(r, ri)) continue;
+            // Radius: the farthest vertex bound to the node from its axle (the node's local x axis).
+            const float ox = r[12], oy = r[13], oz = r[14];
+            float axl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+            if (axl < 1e-6f) continue;
+            const float axx = r[0] / axl, axy = r[1] / axl, axz = r[2] / axl;
+            float rad = 0;
+            for (const auto& v : m.body.tris) {
+                if (v.joint[0] != n || v.weight[0] == 0) continue;
+                const float dx = v.pos[0] - ox, dy = v.pos[1] - oy, dz = v.pos[2] - oz;
+                const float along = dx * axx + dy * axy + dz * axz;
+                rad = std::max(rad, std::sqrt(std::max(0.0f, dx * dx + dy * dy + dz * dz - along * along)));
+            }
+            if (rad < 0.5f) continue;
+            // Track marks: a ground wheel's tyre (lateral extent of its vertices, round its axle centre).
+            if (std::abs(axx) > 0.9f && nm.find("drum") == std::string::npos) {  // (a harvester's drum: no tyre)
+                float x0 = 1e30f, x1 = -1e30f, ground = 1e30f;
+                for (const auto& v : m.body.tris) {
+                    ground = std::min(ground, v.pos[1]);
+                    if (v.joint[0] != n || v.weight[0] == 0) continue;
+                    x0 = std::min(x0, v.pos[0]), x1 = std::max(x1, v.pos[0]);
+                }
+                if (x1 > x0 && oy - rad <= ground + 0.3f * rad + 0.5f) {
+                    if (contacts_.size() < models_.size()) contacts_.resize(models_.size());
+                    contacts_[std::size_t(mi)].push_back({x0, x1, oz - rad, oz + rad, false});
+                }
+            }
+            wh.node.push_back(int(n));
+            wh.rest.insert(wh.rest.end(), r, r + 16);
+            wh.restInv.insert(wh.restInv.end(), ri, ri + 16);
+            wh.radius.push_back(rad);
+        }
+        if (!wh.node.empty()) SDL_Log("3D models: %s: %zu skeleton wheels", m.name.c_str(), wh.node.size());
+    }
+}
+
+int ModelRenderer::wheelPalette(int mi, int anim, float /*time*/, float odometer, float spin) {
+    const formats::Model3D& m = models_[std::size_t(mi)];
+    if (m.skeleton.empty() || animOff_ || std::size_t(mi) >= wheels_.size()) return -1;
+    const Wheels& wh = wheels_[std::size_t(mi)];
+    if (wh.node.empty() || anim >= 0) return -1;  // (an animated pose - a docking harvester - keeps its palette)
+    const int base = int(paletteData_.size() / 16);
+    const std::size_t n = m.skeleton.nodes.size();
+    static const float kId[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    for (std::size_t i = 0; i < n; ++i) paletteData_.insert(paletteData_.end(), kId, kId + 16);
+    for (std::size_t w = 0; w < wh.node.size(); ++w) {
+        // Forward = the hull's -z (north in the model), the wheel's top moves forward: about +x by -angle.
+        // (Turning: a wheel left of the centre line runs forward in a right turn, render3d/model_drive.hpp.)
+        const float a = -(odometer - spin * wh.rest[w * 16 + 12]) / wh.radius[w], c = std::cos(a), s = std::sin(a);
+        const float rx[16] = {1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1};
+        float t0[16], t1[16];
+        mat4Mul(&wh.rest[w * 16], rx, t0);
+        mat4Mul(t0, &wh.restInv[w * 16], t1);
+        std::copy(t1, t1 + 16, paletteData_.begin() + std::ptrdiff_t((std::size_t(base) + std::size_t(wh.node[w])) * 16));
+    }
+    return base;
+}
+
 // This frame's palette -> vertex storage buffer 0 (grown as needed; at least one matrix so the
 // binding is always valid).
 void ModelRenderer::uploadPalette(SDL_GPUCommandBuffer* cmd) {
@@ -972,26 +1373,34 @@ void ModelRenderer::uploadPalette(SDL_GPUCommandBuffer* cmd) {
 
 bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
     if (pipelineFailed_) return false;
+    const bool anyPbr = std::any_of(models_.begin(), models_.end(), [](const formats::Model3D& m) { return m.hasPbrMaps(); });
     if (meshPipe_ && dev == dev_ && f.colorFormat == colorFmt_ && f.depthFormat == depthFmt_ && f.samples == samples_ &&
-        f.aniso == aniso_)
+        f.aniso == aniso_ && pbrBuilt_ == anyPbr)
         return true;
+    pbrBuilt_ = anyPbr;
     if (dev_ && dev != dev_) return false;  // one device per app
     dev_ = dev;
     if (meshPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, meshPipe_);
     if (shadowPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, shadowPipe_);
     if (projShadowPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, projShadowPipe_);
     if (depthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, depthPipe_);
+    if (viewDepthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, viewDepthPipe_);
     if (walkPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, walkPipe_);
     if (meshOpaquePipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, meshOpaquePipe_);
-    meshPipe_ = shadowPipe_ = projShadowPipe_ = depthPipe_ = walkPipe_ = meshOpaquePipe_ = nullptr;
+    for (SDL_GPUGraphicsPipeline* p : {pbrPipe_, pbrOpaquePipe_, pbrWalkPipe_})
+        if (p) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
+    meshPipe_ = shadowPipe_ = projShadowPipe_ = depthPipe_ = viewDepthPipe_ = walkPipe_ = meshOpaquePipe_ = nullptr;
+    pbrPipe_ = pbrOpaquePipe_ = pbrWalkPipe_ = nullptr;
     depthPipeFmt_ = SDL_GPU_TEXTUREFORMAT_INVALID;
     colorFmt_ = f.colorFormat;
     depthFmt_ = f.depthFormat;
     samples_ = f.samples;
     SDL_GPUShader* vs = createShader(dev_, ShaderId::ModelVs, 0, 1, 1);
-    SDL_GPUShader* fsM = createShader(dev_, ShaderId::ModelFs, 3, 2, 1);
+    SDL_GPUShader* fsM = createShader(dev_, ShaderId::ModelFs, 4, 2, 1);
     SDL_GPUShader* fsS = createShader(dev_, ShaderId::ShadowFs, 3, 1);
     SDL_GPUShader* vsS = createShader(dev_, ShaderId::ModelShadowVs, 0, 1, 1);
+    // Reimagined models (PBR maps): only when a loaded model has them (Reimagined off: never created).
+    SDL_GPUShader* fsP = anyPbr ? createShader(dev_, ShaderId::ModelPbrFs, 6, 3, 1) : nullptr;
     if (vs && fsM && fsS && vsS) {
         SDL_GPUColorTargetDescription ctd{};
         ctd.format = colorFmt_;
@@ -1039,6 +1448,14 @@ bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
             pi.depth_stencil_state.compare_mask = pi.depth_stencil_state.write_mask = 0xFF;
         }
         meshPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+        auto withPbr = [&](SDL_GPUGraphicsPipeline*& out) {  // the same state with model_pbr_fs
+            if (!fsP) return;
+            pi.fragment_shader = fsP;
+            out = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+            if (!out) SDL_Log("3D models: PBR pipeline failed: %s", SDL_GetError());
+            pi.fragment_shader = fsM;
+        };
+        withPbr(pbrPipe_);
         {
             SDL_GPUColorTargetDescription opaque = ctd;
             opaque.blend_state = {};
@@ -1046,6 +1463,7 @@ bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
             opaque.blend_state.color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B;
             pi.target_info.color_target_descriptions = &opaque;
             meshOpaquePipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+            withPbr(pbrOpaquePipe_);
             pi.target_info.color_target_descriptions = &ctd;
         }
         if (stencil) {
@@ -1056,6 +1474,7 @@ bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
             pi.depth_stencil_state.write_mask = 0;
             walkPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
             if (!walkPipe_) SDL_Log("3D models: walkable-cell pipeline failed: %s", SDL_GetError());
+            withPbr(pbrWalkPipe_);
             pi.depth_stencil_state.enable_stencil_test = false;
             pi.depth_stencil_state.compare_mask = pi.depth_stencil_state.write_mask = 0;
         }
@@ -1071,7 +1490,7 @@ bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
         if (!meshPipe_ || !shadowPipe_ || !projShadowPipe_) SDL_Log("3D models: pipeline failed: %s", SDL_GetError());
         SDL_Log("3D models: walkable cells %s", walkPipe_ ? "on (stencil)" : "off");
     }
-    for (SDL_GPUShader* s : {vs, fsM, fsS, vsS})
+    for (SDL_GPUShader* s : {vs, fsM, fsS, vsS, fsP})
         if (s) SDL_ReleaseGPUShader(dev_, s);
     if (linear_ && f.aniso != aniso_) {  // a new anisotropy (Quality): a new sampler
         SDL_ReleaseGPUSampler(dev_, linear_);
@@ -1100,166 +1519,347 @@ bool ModelRenderer::ensurePipelines(SDL_GPUDevice* dev, const ModelFrame& f) {
     return true;
 }
 
+// Uploads the models read since the last upload (the first frame: all of them; later a type that
+// appeared, loadPending) as one page: geometry + textures, then keeps only what picking needs on the CPU.
+void ModelRenderer::upload(SDL_GPUDevice* dev) {
+    if (uploadedModels_ >= models_.size() || !dev || (dev_ && dev != dev_)) return;
+    dev_ = dev;
+    const std::size_t firstModel = uploadedModels_;
+    uploadedModels_ = models_.size();
+    render::mem::checkpoint("3D models: upload starts");
+    std::vector<float> v;
+    std::vector<std::uint32_t> idx;
+    // Equal corners (all 20 floats bit for bit) share one vertex (per part).
+    auto vertexHash = [&](std::uint32_t i) {
+        std::uint64_t h = 1469598103934665603ull;
+        const auto* b = reinterpret_cast<const std::uint8_t*>(&v[std::size_t(i) * kVertexFloats]);
+        for (int k = 0; k < kVertexFloats * 4; ++k) h = (h ^ b[k]) * 1099511628211ull;
+        return std::size_t(h);
+    };
+    auto vertexEq = [&](std::uint32_t a, std::uint32_t b) {
+        return std::memcmp(&v[std::size_t(a) * kVertexFloats], &v[std::size_t(b) * kVertexFloats], kVertexFloats * 4) == 0;
+    };
+    std::unordered_set<std::uint32_t, decltype(vertexHash), decltype(vertexEq)> seen(0, vertexHash, vertexEq);
+    // plan: the model's Assemble parts (buildings; nullptr = none); body: p is the body the plan was
+    // made from (its triangles' parts are known), else each triangle goes to the part that holds it.
+    // gear: the running gear of the part's corners (vehicles; render3d/model_drive.hpp), in the same
+    // vertex attributes (units have no Assemble parts).
+    auto put = [&](const formats::MeshPart& p, const AssemblyPlan* plan = nullptr, bool body = false,
+                   const std::vector<DriveAttr>* gear = nullptr) {
+        Range r{std::uint32_t(idx.size()), std::uint32_t(p.tris.size())};
+        seen.clear();
+        seen.reserve(p.tris.size());
+        float pa[4] = {};
+        std::uint8_t pb[4] = {};
+        for (std::size_t vi = 0; vi < p.tris.size(); ++vi) {
+            const auto& x = p.tris[vi];
+            if (plan && !plan->empty() && vi % 3 == 0) {
+                int part = -1;
+                if (body && vi / 3 < plan->bodyTris.size()) part = plan->bodyTris[vi / 3];
+                else if (vi + 2 < p.tris.size()) {
+                    float c[3];
+                    for (int k = 0; k < 3; ++k) c[k] = (x.pos[k] + p.tris[vi + 1].pos[k] + p.tris[vi + 2].pos[k]) / 3.0f;
+                    part = assemblyPartAt(*plan, c);
+                }
+                if (part >= 0) assemblyVertexAttrs(plan->parts[std::size_t(part)], pa, pb);
+            }
+            if (gear && vi < gear->size()) {
+                std::copy((*gear)[vi].a, (*gear)[vi].a + 4, pa);
+                std::copy((*gear)[vi].b, (*gear)[vi].b + 4, pb);
+            }
+            float f16[kVertexFloats] = {x.pos[0], x.pos[1], x.pos[2], x.nrm[0], x.nrm[1], x.nrm[2], x.uv[0], x.uv[1],
+                                        x.rgba[0], x.rgba[1], x.rgba[2], x.rgba[3], x.house, x.lit, x.textured, x.oneSided,
+                                        x.gloss, x.metal, 0, 0, pa[0], pa[1], pa[2], pa[3], 0};
+            std::memcpy(&f16[18], x.joint, 4);   // UBYTE4_NORM joints
+            std::memcpy(&f16[19], x.weight, 4);  // UBYTE4_NORM weights
+            std::memcpy(&f16[24], pb, 4);        // UBYTE4_NORM Assemble timing / motion / direction
+            const std::uint32_t at = std::uint32_t(v.size() / kVertexFloats);
+            v.insert(v.end(), f16, f16 + kVertexFloats);
+            const auto [it, added] = seen.insert(at);
+            if (!added) v.resize(v.size() - kVertexFloats);  // an equal corner is there already
+            idx.push_back(*it);
+        }
+        return r;
+    };
+    // Textures: GPU-ready ones (glTF packs: Model3D::colorTex / pbrTex / nrmTex with their mip chains,
+    // render3d/model_texture.*) as they are; raw RGBA8 ones (PS1 models, white) get their mip chain
+    // generated on the GPU after the upload: a unit is a few dozen pixels across while its texture is
+    // 1-2k - without mips every pixel read far-apart texels (cache misses: the model pass cost most
+    // of a frame with a few dozen tanks in view, and the textures shimmered).
+    struct TexUp {
+        SDL_GPUTexture* tex = nullptr;
+        const std::vector<std::uint32_t>* px = nullptr;  // raw RGBA8 (level 0)
+        int w = 0, h = 0;
+        PreparedTexture* prep = nullptr;  // or every level of this
+        bool mips = false;                // generate the mip chain on the GPU
+    };
+    std::vector<TexUp> texUps;
+    auto makeTex = [&](int w, int h) {
+        SDL_GPUTextureCreateInfo ci{};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = Uint32(w);
+        ci.height = Uint32(h);
+        ci.layer_count_or_depth = 1;
+        ci.num_levels = 1;
+        if (w > 1 || h > 1) {
+            for (int m = std::max(w, h); m > 1; m >>= 1) ++ci.num_levels;
+            ci.usage |= SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;  // SDL_GenerateMipmapsForGPUTexture blits into the levels
+        }
+        SDL_GPUTexture* t = SDL_CreateGPUTexture(dev_, &ci);
+        if (t) gpuTexBytes_ += render::mem::textureBytes(w, h, 4.0, int(ci.num_levels));
+        return t;
+    };
+    auto addRaw = [&](const std::vector<std::uint32_t>& px, int w, int h) -> SDL_GPUTexture* {
+        SDL_GPUTexture* t = makeTex(w, h);
+        if (t) texUps.push_back({t, &px, w, h, nullptr, w > 1 || h > 1});
+        return t;
+    };
+    auto addPrepared = [&](PreparedTexture& p) -> SDL_GPUTexture* {
+        if (p.empty()) return nullptr;
+        SDL_GPUTextureCreateInfo ci{};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.format = p.format == TexFormat::BC1   ? SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM
+                    : p.format == TexFormat::BC3 ? SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM
+                    : p.format == TexFormat::BC5 ? SDL_GPU_TEXTUREFORMAT_BC5_RG_UNORM
+                                                 : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = Uint32(p.w);
+        ci.height = Uint32(p.h);
+        ci.layer_count_or_depth = 1;
+        ci.num_levels = Uint32(p.levels);
+        SDL_GPUTexture* t = SDL_CreateGPUTexture(dev_, &ci);
+        if (!t) {
+            SDL_Log("3D models: texture %dx%d failed: %s", p.w, p.h, SDL_GetError());
+            return nullptr;
+        }
+        gpuTexBytes_ += std::int64_t(p.bytes());
+        texUps.push_back({t, nullptr, p.w, p.h, &p, false});
+        return t;
+    };
+    static const std::vector<std::uint32_t> kWhite{0xFFFFFFFFu};
+    if (!white_) white_ = addRaw(kWhite, 1, 1);
+    // Assemble build-up (render/building_assemble.hpp): the parts of every building model.
+    assembly_.resize(models_.size());
+    for (const int mi : buildingModel_)
+        if (mi >= int(firstModel) && std::size_t(mi) < models_.size() && assembly_[std::size_t(mi)].empty())
+            assembly_[std::size_t(mi)] = planAssembly(models_[std::size_t(mi)]);
+    {
+        int plans = 0, parts = 0;
+        for (std::size_t k = firstModel; k < assembly_.size(); ++k)
+            if (!assembly_[k].empty()) ++plans, parts += int(assembly_[k].parts.size());
+        if (plans) SDL_Log("3D models: Assemble parts for %d building models (%.1f parts each)", plans, double(parts) / plans);
+    }
+    // Running gear (render3d/model_drive.hpp): the wheels and track links of the unit models.
+    std::vector<char> isUnit(models_.size(), 0);
+    for (const int mi : unitModel_)
+        if (mi >= int(firstModel) && std::size_t(mi) < models_.size()) isUnit[std::size_t(mi)] = 1;
+    for (std::size_t mi = firstModel; mi < models_.size(); ++mi) {
+        auto& m = models_[mi];
+        const AssemblyPlan* plan = assembly_[mi].empty() ? nullptr : &assembly_[mi];
+        DriveGear gear, lodGear;
+        static const bool gearOff = std::getenv("D2K_GEAR_OFF") != nullptr;  // A/B checks: no running gear
+        if (isUnit[mi] && !plan && !gearOff) {
+            std::vector<std::uint8_t> skip(m.skeleton.nodes.size(), 0);  // skeleton wheel nodes turn themselves
+            for (std::size_t k = 0; k < skip.size(); ++k) {
+                std::string nm = m.skeleton.nodes[k].name;
+                for (char& c : nm) c = char(std::tolower(static_cast<unsigned char>(c)));
+                skip[k] = nm.rfind("wheel", 0) == 0 || nm.rfind("sprocket", 0) == 0 || nm.rfind("idler", 0) == 0;
+            }
+            gear = planDriveGear({&m.body, &m.house}, skip);
+            if (!m.lodBody.empty()) lodGear = planDriveGear({&m.lodBody, &m.lodHouse}, skip);
+            if (contacts_.size() < models_.size()) contacts_.resize(models_.size());
+            contacts_[mi] = !gear.contacts.empty() ? gear.contacts : lodGear.contacts;
+            if (!gear.empty() || !lodGear.empty()) {
+                const std::string lod = m.lodBody.empty() ? std::string()
+                                                          : ", simplified " + std::to_string(lodGear.wheels) + " / " +
+                                                                std::to_string(lodGear.loops) + " (" + std::to_string(lodGear.links) + ")";
+                SDL_Log("3D models: %s running gear: %d wheels, %d track loops (%d links)%s", m.name.c_str(), gear.wheels, gear.loops,
+                        gear.links, lod.c_str());
+            }
+        }
+        auto gearOf = [](const DriveGear& dg, std::size_t k) {
+            return k < dg.parts.size() && !dg.parts[k].empty() ? &dg.parts[k] : nullptr;
+        };
+        GpuModel g;
+        g.anchor = m.anchor;
+        g.body = put(m.body, plan, true, gearOf(gear, 0));
+        g.turret = put(m.turret, plan);
+        g.shadow = put(m.shadow);
+        g.house = put(m.house, plan, false, gearOf(gear, 1));
+        for (const auto& bp : m.bodyPoses) g.bodyPoses.push_back(put(bp, plan));
+        std::memcpy(g.pivot, m.turretPivot, sizeof g.pivot);
+        g.point = m.pointSample;
+        g.houseOnTurret = m.houseOnTurret;
+        g.projectShadow = m.shadow.empty();
+        g.emissive = m.emissiveInAlpha;
+        for (const formats::MeshPart* part : {&m.body, &m.turret, &m.house})
+            for (const auto& vx : part->tris) g.top = std::max(g.top, vx.pos[1]);
+        if (!m.colorTex.empty()) g.tex = addPrepared(m.colorTex);
+        else if (!m.texture.empty() && m.texW > 0 && m.texH > 0) g.tex = addRaw(m.texture, m.texW, m.texH);
+        // Reimagined models: the PBR maps (model_pbr_fs) and the simplified version.
+        if (m.hasPbrMaps() && g.tex) {
+            if (!m.pbrTex.empty()) {
+                g.pbrTex = addPrepared(m.pbrTex);
+                g.nrmTex = addPrepared(m.nrmTex);
+            } else {
+                g.pbrTex = addRaw(m.pbrTexture, m.pbrW, m.pbrH);
+                g.nrmTex = addRaw(m.normalTexture, m.nrmW, m.nrmH);
+            }
+        }
+        if (!m.lodBody.empty()) {
+            g.lodBody = put(m.lodBody, plan, false, gearOf(lodGear, 0));
+            g.lodTurret = put(m.lodTurret, plan);
+            g.lodHouse = put(m.lodHouse, plan, false, gearOf(lodGear, 1));
+            g.hasLod = true;
+        }
+        gpu_.push_back(g);
+    }
+    for (std::size_t k = firstModel; k < assembly_.size(); ++k)
+        std::vector<std::uint16_t>().swap(assembly_[k].bodyTris);  // only the parts stay (Effects)
+    seen.clear();
+    seen.rehash(0);
+    const Uint32 vbytes = Uint32(v.size() * 4), ibytes = Uint32(idx.size() * 4);
+    SDL_GPUBuffer* vb_ = nullptr;
+    SDL_GPUBuffer* ib_ = nullptr;
+    if (vbytes > 0 && ibytes > 0) {
+        SDL_GPUBufferCreateInfo bi{};
+        bi.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
+        bi.size = vbytes;
+        vb_ = SDL_CreateGPUBuffer(dev_, &bi);
+        bi.usage = SDL_GPU_BUFFERUSAGE_INDEX;
+        bi.size = ibytes;
+        ib_ = SDL_CreateGPUBuffer(dev_, &bi);
+        if (!ib_ && vb_) {
+            SDL_ReleaseGPUBuffer(dev_, vb_);
+            vb_ = nullptr;
+        }
+        SDL_Log("3D models: %zu triangles, %zu vertices after sharing equal corners (%.1f MB)", idx.size() / 3,
+                v.size() / kVertexFloats, double(vbytes + ibytes) / 1048576.0);
+    }
+    // Staged in transfer buffers of at most kChunk bytes (a bigger piece gets its own): the whole pack
+    // in one (~1.3 GB for opend2k-redesign) exceeds Direct3D 12's resource size limit on cards with less
+    // VRAM. Every batch goes in its own command buffer that is waited for before the next one: the
+    // staging memory stays at one chunk (all of it alive until the frame's command buffer completed used
+    // to double the pack's memory at mission start) and each model's CPU texture copy is freed as soon
+    // as it is on the GPU (docs/memory.md). Offsets 512-aligned (D3D12 placement alignment).
+    constexpr Uint32 kChunk = 64u << 20;
+    struct Up {
+        const std::uint8_t* data;
+        Uint32 size;
+        Uint32 vbOff;      // buffer: offset in it
+        const TexUp* tex;  // texture: this level of it
+        int level;
+        SDL_GPUBuffer* buf;
+    };
+    std::vector<Up> ups;
+    if (vb_) {
+        const auto* vp = reinterpret_cast<const std::uint8_t*>(v.data());
+        for (Uint32 o = 0; o < vbytes; o += kChunk) ups.push_back({vp + o, std::min(kChunk, vbytes - o), o, nullptr, 0, vb_});
+        const auto* ip = reinterpret_cast<const std::uint8_t*>(idx.data());
+        for (Uint32 o = 0; o < ibytes; o += kChunk) ups.push_back({ip + o, std::min(kChunk, ibytes - o), o, nullptr, 0, ib_});
+        for (const auto& t : texUps) {
+            if (t.prep) {
+                for (int l = 0; l < t.prep->levels; ++l)
+                    ups.push_back({t.prep->data.data() + t.prep->levelOffset(l), Uint32(t.prep->levelBytes(l)), 0, &t, l, nullptr});
+            } else {
+                ups.push_back({reinterpret_cast<const std::uint8_t*>(t.px->data()), Uint32(t.w * t.h * 4), 0, &t, 0, nullptr});
+            }
+        }
+    }
+    auto align = [](Uint32 x) { return (x + 511u) & ~511u; };
+    SDL_GPUTransferBuffer* tb = nullptr;
+    Uint32 tbSize = 0;
+    for (std::size_t i = 0; i < ups.size();) {
+        std::size_t j = i;
+        Uint32 size = 0;
+        while (j < ups.size() && (j == i || align(size) + ups[j].size <= kChunk)) size = align(size) + ups[j++].size;
+        if (!tb || tbSize < size) {
+            if (tb) SDL_ReleaseGPUTransferBuffer(dev_, tb);
+            tbSize = std::max(size, kChunk);
+            SDL_GPUTransferBufferCreateInfo ti{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, tbSize, 0};
+            tb = SDL_CreateGPUTransferBuffer(dev_, &ti);
+        }
+        SDL_GPUCommandBuffer* ucmd = tb ? SDL_AcquireGPUCommandBuffer(dev_) : nullptr;
+        auto* p = ucmd ? static_cast<std::uint8_t*>(SDL_MapGPUTransferBuffer(dev_, tb, false)) : nullptr;
+        if (p) {
+            Uint32 off = 0;
+            for (std::size_t k = i; k < j; off += ups[k++].size) {
+                off = align(off);
+                std::memcpy(p + off, ups[k].data, ups[k].size);
+            }
+            SDL_UnmapGPUTransferBuffer(dev_, tb);
+            SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(ucmd);
+            off = 0;
+            for (std::size_t k = i; k < j; off += ups[k++].size) {
+                off = align(off);
+                if (const TexUp* t = ups[k].tex) {
+                    const int l = ups[k].level;
+                    SDL_GPUTextureTransferInfo tsrc{tb, off, 0, 0};  // tightly packed
+                    SDL_GPUTextureRegion treg{};
+                    treg.texture = t->tex;
+                    treg.mip_level = Uint32(l);
+                    treg.w = Uint32(t->prep ? t->prep->levelW(l) : t->w);
+                    treg.h = Uint32(t->prep ? t->prep->levelH(l) : t->h);
+                    treg.d = 1;
+                    SDL_UploadToGPUTexture(cp, &tsrc, &treg, false);
+                } else {
+                    SDL_GPUTransferBufferLocation src{tb, off};
+                    SDL_GPUBufferRegion reg{ups[k].buf, ups[k].vbOff, ups[k].size};
+                    SDL_UploadToGPUBuffer(cp, &src, &reg, false);
+                }
+            }
+            SDL_EndGPUCopyPass(cp);
+            for (std::size_t k = i; k < j; ++k)
+                if (const TexUp* t = ups[k].tex; t && t->mips && ups[k].level == 0) SDL_GenerateMipmapsForGPUTexture(ucmd, t->tex);
+            // Waited for: the transfer buffer is reused and the CPU copies are freed below.
+            if (SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(ucmd)) {
+                SDL_WaitForGPUFences(dev_, true, &fence, 1);
+                SDL_ReleaseGPUFence(dev_, fence);
+            }
+        } else {
+            if (ucmd) SDL_CancelGPUCommandBuffer(ucmd);
+            SDL_Log("3D models: upload buffer of %u bytes failed: %s", size, SDL_GetError());
+        }
+        // The CPU copies of the textures whose last level went in this batch.
+        for (std::size_t k = i; k < j; ++k)
+            if (const TexUp* t = ups[k].tex; t && t->prep && ups[k].level == t->prep->levels - 1)
+                std::vector<std::uint8_t>().swap(t->prep->data);
+        i = j;
+    }
+    if (tb) SDL_ReleaseGPUTransferBuffer(dev_, tb);
+    std::vector<float>().swap(v);
+    std::vector<std::uint32_t>().swap(idx);
+    // What stays on the CPU: positions for picking / roofs (MeshPart::slim); nothing of the parts only
+    // the GPU draws (shadow polygons, pose meshes, simplified versions); no textures.
+    for (std::size_t mi = firstModel; mi < models_.size(); ++mi) {
+        auto& m = models_[mi];
+        buildWheels(int(mi));  // (reads the body's vertices)
+        buildLife(int(mi));    // (too)
+        for (formats::MeshPart* part : {&m.body, &m.turret, &m.house}) part->slim();
+        for (formats::MeshPart* part : {&m.shadow, &m.lodBody, &m.lodTurret, &m.lodHouse}) part->release();
+        for (auto& bp : m.bodyPoses) bp.release();
+        for (auto* t : {&m.texture, &m.pbrTexture, &m.normalTexture}) std::vector<std::uint32_t>().swap(*t);
+        for (auto* t : {&m.colorTex, &m.pbrTex, &m.nrmTex}) std::vector<std::uint8_t>().swap(t->data);
+    }
+    if (vb_) {
+        gpuBufBytes_ += std::int64_t(vbytes) + std::int64_t(ibytes);
+        pages_.push_back({vb_, ib_});
+    }
+    for (std::size_t mi = firstModel; mi < gpu_.size(); ++mi) gpu_[mi].vb = vb_, gpu_[mi].ib = ib_;
+    account();
+    render::mem::releaseFreeMemory();  // the full vertices and the staging copies
+    render::mem::checkpoint("3D models uploaded");
+}
+
 void ModelRenderer::prepare(SDL_GPUDevice* dev, SDL_GPUCommandBuffer* cmd, const ModelFrame& f) {
     draws_.clear();
     if (!active() || !ensurePipelines(dev, f)) return;
-    if (!uploaded_) {
-        uploaded_ = true;
-        std::vector<float> v;
-        std::vector<std::uint32_t> idx;
-        // Equal corners (all 20 floats bit for bit) share one vertex (per part).
-        auto vertexHash = [&](std::uint32_t i) {
-            std::uint64_t h = 1469598103934665603ull;
-            const auto* b = reinterpret_cast<const std::uint8_t*>(&v[std::size_t(i) * kVertexFloats]);
-            for (int k = 0; k < kVertexFloats * 4; ++k) h = (h ^ b[k]) * 1099511628211ull;
-            return std::size_t(h);
-        };
-        auto vertexEq = [&](std::uint32_t a, std::uint32_t b) {
-            return std::memcmp(&v[std::size_t(a) * kVertexFloats], &v[std::size_t(b) * kVertexFloats], kVertexFloats * 4) == 0;
-        };
-        std::unordered_set<std::uint32_t, decltype(vertexHash), decltype(vertexEq)> seen(0, vertexHash, vertexEq);
-        auto put = [&](const formats::MeshPart& p) {
-            Range r{std::uint32_t(idx.size()), std::uint32_t(p.tris.size())};
-            seen.clear();
-            seen.reserve(p.tris.size());
-            for (const auto& x : p.tris) {
-                float f16[kVertexFloats] = {x.pos[0], x.pos[1], x.pos[2], x.nrm[0], x.nrm[1], x.nrm[2], x.uv[0], x.uv[1],
-                                            x.rgba[0], x.rgba[1], x.rgba[2], x.rgba[3], x.house, x.lit, x.textured, x.oneSided,
-                                            x.gloss, x.metal, 0, 0};
-                std::memcpy(&f16[18], x.joint, 4);   // UBYTE4_NORM joints
-                std::memcpy(&f16[19], x.weight, 4);  // UBYTE4_NORM weights
-                const std::uint32_t at = std::uint32_t(v.size() / kVertexFloats);
-                v.insert(v.end(), f16, f16 + kVertexFloats);
-                const auto [it, added] = seen.insert(at);
-                if (!added) v.resize(v.size() - kVertexFloats);  // an equal corner is there already
-                idx.push_back(*it);
-            }
-            return r;
-        };
-        struct TexUp { SDL_GPUTexture* tex; const std::vector<std::uint32_t>* px; int w, h; };
-        std::vector<TexUp> texUps;
-        // Model textures with a full mip chain (generated after the upload): a unit is a few dozen
-        // pixels across while its texture is 1-2k - without mips every pixel read far-apart texels
-        // (cache misses: the model pass cost most of a frame with a few dozen tanks in view, and
-        // the textures shimmered).
-        std::vector<SDL_GPUTexture*> mipped;
-        auto makeTex = [&](int w, int h) {
-            SDL_GPUTextureCreateInfo ci{};
-            ci.type = SDL_GPU_TEXTURETYPE_2D;
-            ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-            ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
-            ci.width = Uint32(w);
-            ci.height = Uint32(h);
-            ci.layer_count_or_depth = 1;
-            ci.num_levels = 1;
-            if (w > 1 || h > 1) {
-                for (int m = std::max(w, h); m > 1; m >>= 1) ++ci.num_levels;
-                ci.usage |= SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;  // SDL_GenerateMipmapsForGPUTexture blits into the levels
-            }
-            SDL_GPUTexture* t = SDL_CreateGPUTexture(dev_, &ci);
-            if (t && ci.num_levels > 1) mipped.push_back(t);
-            return t;
-        };
-        static const std::vector<std::uint32_t> kWhite{0xFFFFFFFFu};
-        if (!white_) {
-            white_ = makeTex(1, 1);
-            if (white_) texUps.push_back({white_, &kWhite, 1, 1});
-        }
-        for (const auto& m : models_) {
-            GpuModel g;
-            g.anchor = m.anchor;
-            g.body = put(m.body);
-            g.turret = put(m.turret);
-            g.shadow = put(m.shadow);
-            g.house = put(m.house);
-            for (const auto& bp : m.bodyPoses) g.bodyPoses.push_back(put(bp));
-            std::memcpy(g.pivot, m.turretPivot, sizeof g.pivot);
-            g.point = m.pointSample;
-            g.houseOnTurret = m.houseOnTurret;
-            g.projectShadow = m.shadow.empty();
-            g.emissive = m.emissiveInAlpha;
-            for (const formats::MeshPart* part : {&m.body, &m.turret, &m.house})
-                for (const auto& vx : part->tris) g.top = std::max(g.top, vx.pos[1]);
-            if (!m.texture.empty() && m.texW > 0 && m.texH > 0) {
-                g.tex = makeTex(m.texW, m.texH);
-                if (g.tex) texUps.push_back({g.tex, &m.texture, m.texW, m.texH});
-            }
-            gpu_.push_back(g);
-        }
-        const Uint32 vbytes = Uint32(v.size() * 4), ibytes = Uint32(idx.size() * 4);
-        if (vbytes > 0 && ibytes > 0) {
-            SDL_GPUBufferCreateInfo bi{};
-            bi.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
-            bi.size = vbytes;
-            vb_ = SDL_CreateGPUBuffer(dev_, &bi);
-            bi.usage = SDL_GPU_BUFFERUSAGE_INDEX;
-            bi.size = ibytes;
-            ib_ = SDL_CreateGPUBuffer(dev_, &bi);
-            if (!ib_ && vb_) {
-                SDL_ReleaseGPUBuffer(dev_, vb_);
-                vb_ = nullptr;
-            }
-            SDL_Log("3D models: %zu triangles, %zu vertices after sharing equal corners (%.1f MB)", idx.size() / 3,
-                    v.size() / kVertexFloats, double(vbytes + ibytes) / 1048576.0);
-        }
-        // Staged in transfer buffers of at most kChunk bytes (a bigger texture gets its own): the
-        // whole pack in one (~1.3 GB for opend2k-redesign) exceeds Direct3D 12's resource size
-        // limit on cards with less VRAM. Texture offsets 512-aligned (D3D12 placement alignment).
-        constexpr Uint32 kChunk = 64u << 20;
-        struct Up { const std::uint8_t* data; Uint32 size; Uint32 vbOff; const TexUp* tex; SDL_GPUBuffer* buf; };
-        std::vector<Up> ups;
-        if (vb_) {
-            const auto* vp = reinterpret_cast<const std::uint8_t*>(v.data());
-            for (Uint32 o = 0; o < vbytes; o += kChunk) ups.push_back({vp + o, std::min(kChunk, vbytes - o), o, nullptr, vb_});
-            const auto* ip = reinterpret_cast<const std::uint8_t*>(idx.data());
-            for (Uint32 o = 0; o < ibytes; o += kChunk) ups.push_back({ip + o, std::min(kChunk, ibytes - o), o, nullptr, ib_});
-            for (const auto& t : texUps)
-                ups.push_back({reinterpret_cast<const std::uint8_t*>(t.px->data()), Uint32(t.w * t.h * 4), 0, &t, nullptr});
-        }
-        auto align = [](Uint32 x) { return (x + 511u) & ~511u; };
-        SDL_GPUCopyPass* cp = ups.empty() ? nullptr : SDL_BeginGPUCopyPass(cmd);
-        for (std::size_t i = 0; i < ups.size();) {
-            std::size_t j = i;
-            Uint32 size = 0;
-            while (j < ups.size() && (j == i || align(size) + ups[j].size <= kChunk)) size = align(size) + ups[j++].size;
-            SDL_GPUTransferBufferCreateInfo ti{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, size, 0};
-            SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(dev_, &ti);
-            auto* p = tb ? static_cast<std::uint8_t*>(SDL_MapGPUTransferBuffer(dev_, tb, false)) : nullptr;
-            if (p) {
-                Uint32 off = 0;
-                for (std::size_t k = i; k < j; off += ups[k++].size) {
-                    off = align(off);
-                    std::memcpy(p + off, ups[k].data, ups[k].size);
-                }
-                SDL_UnmapGPUTransferBuffer(dev_, tb);
-                off = 0;
-                for (std::size_t k = i; k < j; off += ups[k++].size) {
-                    off = align(off);
-                    if (const TexUp* t = ups[k].tex) {
-                        SDL_GPUTextureTransferInfo tsrc{tb, off, Uint32(t->w), Uint32(t->h)};
-                        SDL_GPUTextureRegion treg{};
-                        treg.texture = t->tex;
-                        treg.w = Uint32(t->w);
-                        treg.h = Uint32(t->h);
-                        treg.d = 1;
-                        SDL_UploadToGPUTexture(cp, &tsrc, &treg, false);
-                    } else {
-                        SDL_GPUTransferBufferLocation src{tb, off};
-                        SDL_GPUBufferRegion reg{ups[k].buf, ups[k].vbOff, ups[k].size};
-                        SDL_UploadToGPUBuffer(cp, &src, &reg, false);
-                    }
-                }
-            } else {
-                SDL_Log("3D models: upload buffer of %u bytes failed: %s", size, SDL_GetError());
-            }
-            if (tb) SDL_ReleaseGPUTransferBuffer(dev_, tb);
-            i = j;
-        }
-        if (cp) SDL_EndGPUCopyPass(cp);
-        for (SDL_GPUTexture* t : mipped) SDL_GenerateMipmapsForGPUTexture(cmd, t);
-        if (!vb_) gpu_.clear();
-    }
-    if (!vb_) return;
+    // Types that appeared since (pending, docs/memory.md): read now, uploaded below as a page of their own.
+    if (f.world) loadPending(*f.world);
+    upload(dev);
+    if (pages_.empty()) return;
     paletteData_.clear();
     frameSlots_.clear();
     const Uint64 t0 = SDL_GetTicksNS();
@@ -1296,7 +1896,10 @@ void ModelRenderer::drawnFacing(const game::Unit& u, int type, float& body, floa
     body = float(u.facing & 31);
     turret = float((barrel ? u.facingTurret : u.facing) & 31);
     // (A carryall's cargo is drawn with the carrier's slot: only the unit's own type is eased.)
-    if (const render::Effects::UnitVisual* v = fx_ && type == u.type ? fx_->unitVisual(u.side, u.index) : nullptr) {
+    if (const render::SmoothDrive::Out* d = drive_ && type == u.type ? drive_->out(u.side, u.index) : nullptr) {
+        body = d->facing;  // Smooth driving: the drawn path's facings (also with Classic effects)
+        turret = barrel ? d->turret : d->facing;
+    } else if (const render::Effects::UnitVisual* v = fx_ && type == u.type ? fx_->unitVisual(u.side, u.index) : nullptr) {
         body = v->facing;
         turret = barrel ? v->turret : v->facing;
     }
@@ -1307,12 +1910,15 @@ bool ModelRenderer::unitPlacement(const Terrain& terr, const game::World& w, con
     if (type < 0 || type >= int(unitModel_.size())) return false;
     const int mi = unitModel_[std::size_t(type)];
     if (mi < 0 || mi >= int(models_.size())) return false;
-    float gx = float(game::fixToPixel(u.posX)), gy = float(game::fixToPixel(u.posY));
+    // Sub-pixel (the tick interpolation's positions, render/motion.hpp): whole pixels made a soldier walking
+    // 1 px per tick step at the tick rate (20 Hz at GameSpeed 75) instead of gliding.
+    float gx = float(u.posX) / 65536.0f, gy = float(u.posY) / 65536.0f;
     // On a building's deck (a refinery's dock pad, a repair pad): on top of it, not inside it. A
     // docking harvester backs onto the refinery's inlet (dockOffset); the deck stays its dock cell's.
     const int cellX = int(std::floor(gx / 32)), cellY = int(std::floor(gy / 32));
     if (float ox, oz; !flying && dockOffset(w, u, mi, gx, gy, ox, oz)) gx += ox, gy += oz;
-    const float ground = terr.height(gx, gy) + (flying || !active() ? 0.0f : deckAt(w, gx, gy, cellX, cellY));
+    // Flyers: above the flight ground (render3d/flight.hpp: clear of nearby cliffs, no jumps at their edges).
+    const float ground = flying ? flyerGround(terr, u) : terr.height(gx, gy) + (!active() ? 0.0f : deckAt(w, gx, gy, cellX, cellY));
     at = Vec3{gx, ground + height, gy};
     // Ground vehicles lean with the terrain slope.
     tilt = Mat4{};
@@ -1324,6 +1930,12 @@ bool ModelRenderer::unitPlacement(const Terrain& terr, const game::World& w, con
     }
     float bodyF = 0, turretF = 0;
     drawnFacing(u, type, bodyF, turretF);
+    if (flying && (u.flags & 0x140))  // eased flyer facing (easeInfantryYaw)
+        if (const auto it = infantryYaw_.find(std::uint32_t(u.side) << 16 | std::uint32_t(u.index));
+            it != infantryYaw_.end() && it->second.type == -2 - int(u.type)) {
+            const float d = it->second.yaw - bodyF;
+            bodyF += d, turretF += d;
+        }
     body = translate(at.x, at.y, at.z) * tilt * yawM(facingAngle(bodyF));
     // Vehicle animation: Modern (render/vehicle_motion.hpp): the hull's pitch / roll about its
     // ground origin, its bounce and its recoil against the last shot; the turret recoils further.
@@ -1338,13 +1950,34 @@ bool ModelRenderer::unitPlacement(const Terrain& terr, const game::World& w, con
         // figure; upright (the original's soldiers do not lean with the ground).
         Mat4 s;
         s.m[0] = s.m[5] = s.m[10] = p.scale;
+        // Crushed (CrushInfantry 0x49f8f0: anim 13): the 2D squash frames lie under the vehicle that ran the
+        // soldier over (drawn before it). The upright death pose stood inside the hull and poked out through
+        // it, so it is flattened onto the ground here (the tank's hull and tracks then cover it).
+        if (u.animType == 13) s.m[5] = p.scale * 0.08f;
         tilt = Mat4{};
-        body = translate(at.x + p.shiftE, at.y, at.z - p.shiftN) * yawM(radians(p.yaw)) * s;
+        float yaw = p.yaw;
+        if (const auto it = infantryYaw_.find(std::uint32_t(u.side) << 16 | std::uint32_t(u.index));
+            it != infantryYaw_.end() && it->second.type == type)
+            yaw = it->second.yaw;
+        body = translate(at.x + p.shiftE, at.y, at.z - p.shiftN) * yawM(radians(yaw)) * s;
     }
     const formats::Model3D& m = models_[std::size_t(mi)];
     turret = body * translate(m.turretPivot[0], m.turretPivot[1], m.turretPivot[2]) * yawM(facingAngle(turretF - bodyF)) *
              translate(0, 0, turretKick) * translate(-m.turretPivot[0], -m.turretPivot[1], -m.turretPivot[2]);
     return true;
+}
+
+// A model with a simplified version (Reimagined pack, KEY_lod1.glb) uses it while a tile at its place
+// spans fewer than lodPxPerTile_ view pixels (D2K_MODEL_LOD=px: another threshold, 0 = always the full
+// model, 9999 = always the simplified one).
+bool ModelRenderer::smallOnScreen(const ModelFrame& f, const GpuModel& g, const Vec3& at) const {
+    if (!g.hasLod) return false;
+    float x0, y0, x1, y1, x2, y2;
+    if (!f.camera->project(at, x0, y0) || !f.camera->project(Vec3{at.x + 32, at.y, at.z}, x1, y1) ||
+        !f.camera->project(Vec3{at.x, at.y, at.z + 32}, x2, y2))
+        return false;
+    const float px = std::max(std::hypot(x1 - x0, y1 - y0), std::hypot(x2 - x0, y2 - y0));
+    return px < lodPxPerTile_;
 }
 
 void ModelRenderer::addUnit(const ModelFrame& f, const game::World& w, int sideIdx, const game::Unit& u, int type,
@@ -1364,8 +1997,10 @@ void ModelRenderer::addUnit(const ModelFrame& f, const game::World& w, int sideI
     d.flash = (u.flicker & 2) ? 0.43f : 0.0f;
     Mat4 tilt;
     Vec3 at;
+    easeInfantryYaw(f, u, type, mi);
     if (!unitPlacement(*f.terrain, w, u, type, height, flying, d.bodyM, d.turretM, tilt, at)) return;
-    const float ground = at.y - height, gx = at.x, gy = at.z;  // (a docking harvester: shifted)
+    const float gx = at.x, gy = at.z;  // (a docking harvester: shifted)
+    const float ground = flying ? f.terrain->height(gx, gy) : at.y - height;  // the shadow's ground (a flyer's: the real one)
     float sx, sy;
     if (!f.camera->project(at, sx, sy)) return;
     const float margin = 400;
@@ -1378,6 +2013,19 @@ void ModelRenderer::addUnit(const ModelFrame& f, const game::World& w, int sideI
             d.bodyPose = p.bodyPose;
         d.alpha *= p.alpha;
     }
+    if (const render::SmoothDrive::Out* dr = drive_ && type == u.type ? drive_->out(u.side, u.index) : nullptr) {
+        // Smooth driving: the wheels turn and the tracks run as it drives (skeleton wheel nodes: the
+        // palette; wheels / links baked into the body: model_vs, render3d/model_drive.hpp).
+        const float spin = dr->spin * (3.14159265f / 16.0f);
+        if (d.palette < 0 && d.bodyPose < 0) d.palette = wheelPalette(mi, -1, 0, dr->odometer, spin);
+        // D2K_GEAR_ODO=px[,radians] (checks): added to every vehicle's odometer / spin (parked ones show the motion).
+        static const std::pair<float, float> extra = [] {
+            float v[2] = {0, 0};
+            if (const char* e = std::getenv("D2K_GEAR_ODO")) std::sscanf(e, "%f,%f", &v[0], &v[1]);
+            return std::pair<float, float>{v[0], v[1]};
+        }();
+        if (d.bodyPose < 0) d.drive[0] = 1, d.drive[1] = dr->odometer + extra.first, d.drive[2] = spin + extra.second;
+    }
     float bodyF = 0, turretF = 0;
     drawnFacing(u, type, bodyF, turretF);
     d.shadowM = translate(gx, ground + 0.6f, gy) * tilt * yawM(facingAngle(bodyF));
@@ -1389,12 +2037,120 @@ void ModelRenderer::addUnit(const ModelFrame& f, const game::World& w, int sideI
         d.plane[2] = n.z;
         d.plane[3] = n.x * gx + n.y * ground + n.z * gy;
     }
+    if (!flying) d.dustBand = std::clamp(0.15f * g.top, 2.5f, 6.0f);  // Realistic grade: sand over the running gear
     const int house = w.sides()[std::size_t(sideIdx)].house;
     const formats::Rgba c = colours_[std::size_t(std::clamp(house, 0, formats::kHouseCount - 1))][8];
     d.house[0] = float(c & 0xFF) / 255.0f;
     d.house[1] = float((c >> 8) & 0xFF) / 255.0f;
     d.house[2] = float((c >> 16) & 0xFF) / 255.0f;
+    d.lod = d.bodyPose < 0 && smallOnScreen(f, g, at);
     draws_.push_back(d);
+}
+
+// Drop-in (render/building_dropin.hpp): the build-up / sale progress of a building whose model drops
+// in (the setting on, a model, not a wall / concrete), else < 0.
+float ModelRenderer::dropInProgress(const game::Building& b) const {
+    if (!dropIn_ || !active() || b.type < 0 || b.type >= int(buildingModel_.size()) || buildingModel_[std::size_t(b.type)] < 0)
+        return -1;
+    if (!render::dropInType(t_.bin.buildings[b.type])) return -1;
+    return render::buildupProgress(t_, b, tickFrac_);
+}
+
+float ModelRenderer::buildingDropIn(const game::World& w, int side, int building) const {
+    if (side < 0 || side >= int(w.sides().size())) return -1;
+    const auto& sd = w.sides()[std::size_t(side)];
+    if (building < 0 || building >= int(sd.buildings.size())) return -1;
+    const game::Building& b = sd.buildings[std::size_t(building)];
+    if (!b.alive) return -1;
+    if (assemble_) {  // the lamps of an assembling building fade in with the same curve (dropInPose.light)
+        const float p = assembleProgress(side, building, b);
+        return p == -2.0f ? 1.0f : p;
+    }
+    return dropInProgress(b);
+}
+
+// Assemble (render/building_assemble.hpp): buildings in build-up when the renderer first sees a world
+// (mission start, a loaded save, the models arriving late) stand finished; an entry goes once its
+// building is complete or gone.
+bool ModelRenderer::isSettled(int side, int index, const game::Building& b) const {
+    for (const Settled& s : settled_)
+        if (s.side == side && s.index == index && s.type == b.type && s.tileX == b.tileX && s.tileY == b.tileY) return true;
+    return false;
+}
+
+void ModelRenderer::updateSettled(const game::World& w) {
+    constexpr std::uint32_t kBusy = game::building_flags::kBuildup | game::building_flags::kSelling;
+    if (settleNext_) {
+        settleNext_ = false;
+        settled_.clear();
+        // D2K_BUILDUP (the build-up check, platform/session.cpp) puts buildings into build-up before the
+        // first frame on purpose: they are shown, not settled.
+        static const bool check = std::getenv("D2K_BUILDUP") != nullptr;
+        if (!check)
+            for (int s = 0; s < int(w.sides().size()); ++s) {
+                const auto& sd = w.sides()[std::size_t(s)];
+                for (int i = sd.firstBuilding; i >= 0; i = sd.nextObject(i)) {
+                    const auto& b = sd.buildings[std::size_t(i)];
+                    if (b.alive && (b.flags & kBusy)) settled_.push_back({s, i, b.type, b.tileX, b.tileY});
+                }
+            }
+        return;
+    }
+    std::erase_if(settled_, [&](const Settled& e) {
+        if (e.side < 0 || e.side >= int(w.sides().size())) return true;
+        const auto& sd = w.sides()[std::size_t(e.side)];
+        if (e.index < 0 || e.index >= int(sd.buildings.size())) return true;
+        const auto& b = sd.buildings[std::size_t(e.index)];
+        return !b.alive || !(b.flags & game::building_flags::kBuildup) || b.type != e.type || b.tileX != e.tileX ||
+               b.tileY != e.tileY;
+    });
+}
+
+float ModelRenderer::assembleProgress(int side, int index, const game::Building& b) const {
+    if (!assemble_ || !active() || b.type < 0 || b.type >= int(buildingModel_.size())) return -1;
+    const int mi = buildingModel_[std::size_t(b.type)];
+    if (mi < 0 || std::size_t(mi) >= assembly_.size() || assembly_[std::size_t(mi)].empty()) return -1;
+    if (!render::dropInType(t_.bin.buildings[b.type])) return -1;  // walls / concrete keep the rising cut
+    const float p = render::buildupProgress(t_, b, tickFrac_);
+    if (p < 0) return -1;
+    if ((b.flags & game::building_flags::kBuildup) && isSettled(side, index, b)) return -2;
+    return p;
+}
+
+float ModelRenderer::buildingAssembly(const game::World& w, int side, int building,
+                                      std::vector<render::AssemblyPartWorld>* parts) const {
+    if (parts) parts->clear();
+    if (side < 0 || side >= int(w.sides().size())) return -1;
+    const auto& sd = w.sides()[std::size_t(side)];
+    if (building < 0 || building >= int(sd.buildings.size())) return -1;
+    const game::Building& b = sd.buildings[std::size_t(building)];
+    if (!b.alive) return -1;
+    const float p = assembleProgress(side, building, b);
+    if (p < 0 || !parts) return p < 0 ? -1.0f : p;
+    static const Terrain kFlat;  // only the origin is needed (heights are above the building's ground)
+    Mat4 body, turret;
+    float groundY = 0;
+    if (!buildingPlacement(kFlat, b, body, turret, groundY)) return -1;
+    auto xf = [&](const float* q) {
+        const float* m = body.m;
+        return Vec3{m[0] * q[0] + m[4] * q[1] + m[8] * q[2] + m[12], m[1] * q[0] + m[5] * q[1] + m[9] * q[2] + m[13],
+                    m[2] * q[0] + m[6] * q[1] + m[10] * q[2] + m[14]};
+    };
+    for (const AssemblyPart& a : assembly_[std::size_t(buildingModel_[std::size_t(b.type)])].parts) {
+        render::AssemblyPartWorld o;
+        const Vec3 foot = xf(a.pivot);
+        o.x = foot.x;
+        o.y = foot.z;
+        o.z = foot.y - groundY;
+        o.w = a.hi[0] - a.lo[0];
+        o.d = a.hi[2] - a.lo[2];
+        o.h = a.hi[1] - a.lo[1];
+        o.t0 = a.t0;
+        o.t1 = a.t0 + a.dur;
+        o.motion = a.motion;
+        parts->push_back(o);
+    }
+    return p;
 }
 
 // Where a building's model stands (docs/3d-models.md "Placement"): the origin by the model's
@@ -1427,6 +2183,13 @@ bool ModelRenderer::buildingPlacement(const Terrain& terr, const game::Building&
                                 terr.maxHeight(b.tileX, b.tileY, b.tileX + fw - 1, b.tileY + fh - 1));
     // (build-up / selling: the whole model stands; the draw cuts it, render/buildup_fx.hpp)
     body = translate(ox, groundY + 0.75f, oz);
+    // Drop-in (render/building_dropin.hpp): lifted while it falls, squashed on landing, the footprint
+    // spreading about its centre while it unfolds (model_vs unfolds the height bands).
+    if (const float p = dropInProgress(b); p >= 0) {
+        const render::DropInPose dp = render::dropInPose(p, render::dropInFromGround(t), std::max(std::size_t(mi) < modelTop_.size() ? modelTop_[std::size_t(mi)] : 0.0f, 2.0f));
+        const float cx = float(b.tileX * 32) + cox, cz = float(b.tileY * 32) + coz, cy = groundY + 0.75f;
+        body = translate(cx, cy + dp.lift, cz) * scaleXYZ(dp.spread, dp.squash, dp.spread) * translate(-cx, -cy, -cz) * body;
+    }
     const bool turns = t.barrelArt >= 0 || t.actLikeTurret;
     // PS1 turret heads rest facing north (PS1 +z), as facing 0.
     const float a = turns ? facingAngle(b.facing) : 0.0f;
@@ -1573,10 +2336,10 @@ void ModelRenderer::buildDeck(int mi) {
     dk.y.assign(std::size_t(dk.w) * std::size_t(dk.h), -1.0f);
     // Rasterise every triangle top-down; keep per cell the highest surface at most kCap.
     for (const auto* part : {&m.body, &m.house})
-        for (std::size_t t = 0; t + 2 < part->tris.size(); t += 3) {
-            const float* a = part->tris[t].pos;
-            const float* b = part->tris[t + 1].pos;
-            const float* c = part->tris[t + 2].pos;
+        for (std::size_t t = 0; t + 2 < part->corners(); t += 3) {
+            const float* a = part->pos(t);
+            const float* b = part->pos(t + 1);
+            const float* c = part->pos(t + 2);
             if (std::min({a[1], b[1], c[1]}) > Deck::kCap) continue;
             const float ax = (a[0] - dk.x0) / Deck::kRes, az = (a[2] - dk.z0) / Deck::kRes;
             const float bx = (b[0] - dk.x0) / Deck::kRes, bz = (b[2] - dk.z0) / Deck::kRes;
@@ -1621,10 +2384,10 @@ const ModelRenderer::Roof& ModelRenderer::roof(int mi) const {
     rf.y.assign(std::size_t(rf.w) * std::size_t(rf.h), -1.0f);
     // As buildDeck: rasterise every (non-vertical) triangle top-down, keep the highest surface.
     for (const auto* part : {&m.body, &m.house, &m.turret})
-        for (std::size_t t = 0; t + 2 < part->tris.size(); t += 3) {
-            const float* a = part->tris[t].pos;
-            const float* b = part->tris[t + 1].pos;
-            const float* c = part->tris[t + 2].pos;
+        for (std::size_t t = 0; t + 2 < part->corners(); t += 3) {
+            const float* a = part->pos(t);
+            const float* b = part->pos(t + 1);
+            const float* c = part->pos(t + 2);
             const float ax = (a[0] - rf.x0) / Roof::kRes, az = (a[2] - rf.z0) / Roof::kRes;
             const float bx = (b[0] - rf.x0) / Roof::kRes, bz = (b[2] - rf.z0) / Roof::kRes;
             const float cx = (c[0] - rf.x0) / Roof::kRes, cz = (c[2] - rf.z0) / Roof::kRes;
@@ -1731,11 +2494,11 @@ float rayBox(const Vec3& o, const Vec3& d, const Vec3& lo, const Vec3& hi) {
 // Moller-Trumbore), < 0 = none.
 float rayTris(const Vec3& o, const Vec3& d, const formats::MeshPart& part, std::size_t first, std::size_t count) {
     float best = -1;
-    const std::size_t end = std::min(part.tris.size() / 3, first + count);
+    const std::size_t end = std::min(part.corners() / 3, first + count);
     for (std::size_t t = first * 3; t / 3 < end; t += 3) {
-        const float* pa = part.tris[t].pos;
-        const float* pb = part.tris[t + 1].pos;
-        const float* pc = part.tris[t + 2].pos;
+        const float* pa = part.pos(t);
+        const float* pb = part.pos(t + 1);
+        const float* pc = part.pos(t + 2);
         const Vec3 a{pa[0], pa[1], pa[2]};
         const Vec3 e1 = Vec3{pb[0], pb[1], pb[2]} - a, e2 = Vec3{pc[0], pc[1], pc[2]} - a;
         const Vec3 p = cross(d, e2);
@@ -1755,9 +2518,10 @@ float rayTris(const Vec3& o, const Vec3& d, const formats::MeshPart& part, std::
 }
 
 void growBox(const formats::MeshPart& part, Vec3& lo, Vec3& hi) {
-    for (const auto& v : part.tris) {
-        lo = Vec3{std::min(lo.x, v.pos[0]), std::min(lo.y, v.pos[1]), std::min(lo.z, v.pos[2])};
-        hi = Vec3{std::max(hi.x, v.pos[0]), std::max(hi.y, v.pos[1]), std::max(hi.z, v.pos[2])};
+    for (std::size_t i = 0; i < part.corners(); ++i) {
+        const float* v = part.pos(i);
+        lo = Vec3{std::min(lo.x, v[0]), std::min(lo.y, v[1]), std::min(lo.z, v[2])};
+        hi = Vec3{std::max(hi.x, v[0]), std::max(hi.y, v[1]), std::max(hi.z, v[2])};
     }
 }
 }  // namespace
@@ -1775,7 +2539,7 @@ const ModelRenderer::PickBox& ModelRenderer::pickBox(int mi) const {
     constexpr std::uint32_t kRun = 32;
     const formats::MeshPart* parts[3] = {&m.body, &m.house, &m.turret};
     for (std::uint8_t k = 0; k < 3; ++k) {
-        const std::uint32_t n = std::uint32_t(parts[k]->tris.size() / 3);
+        const std::uint32_t n = std::uint32_t(parts[k]->corners() / 3);
         for (std::uint32_t f = 0; f < n; f += kRun) {
             PickBox::Run r;
             r.part = k;
@@ -1784,7 +2548,7 @@ const ModelRenderer::PickBox& ModelRenderer::pickBox(int mi) const {
             r.lo = Vec3{1e30f, 1e30f, 1e30f};
             r.hi = Vec3{-1e30f, -1e30f, -1e30f};
             for (std::uint32_t v = f * 3; v < (f + r.count) * 3; ++v) {
-                const float* q = parts[k]->tris[v].pos;
+                const float* q = parts[k]->pos(v);
                 r.lo = Vec3{std::min(r.lo.x, q[0]), std::min(r.lo.y, q[1]), std::min(r.lo.z, q[2])};
                 r.hi = Vec3{std::max(r.hi.x, q[0]), std::max(r.hi.y, q[1]), std::max(r.hi.z, q[2])};
             }
@@ -1912,6 +2676,10 @@ void ModelRenderer::collect(const ModelFrame& f) {
         std::size_t draw;
     };
     std::vector<WalkBuilding> walkers;
+    tickFrac_ = float(f.time * 20.0 - double(w.gameTicks()));  // (buildupProgress clamps it)
+    updateSettled(w);
+    lifeFrame(f);
+    const bool life = f.buildingLife && !lifeOff_;
     // Buildings.
     for (std::size_t si = 0; si < w.sides().size(); ++si) {
         const auto& side = w.sides()[si];
@@ -1938,26 +2706,59 @@ void ModelRenderer::collect(const ModelFrame& f) {
             d.flash = (b.flicker & 2) ? 0.43f : 0.0f;
             d.shadowM = translate(d.bodyM.m[12], groundY + 0.6f, d.bodyM.m[14]);
             d.plane[3] = groundY;
+            d.dustBand = std::clamp(0.15f * g.top, 3.0f, 12.0f);  // Realistic grade: sand drifted against the walls
             d.turret = g.turret.count > 0;
             if (g.emissive)  // thin strips: a bit more
                 d.emit = 1.6f * render::buildingGlow(w, t_, int(si), bi, f.lamps, f.time, true,
                                                      std::size_t(mi) < glowBlink_.size() ? glowBlink_[std::size_t(mi)] : 0);
             // Build-up / selling: a plane rising from the foundation (the flat parts up to 1.5 px stand
-            // from the start) to the top of the model.
-            if (const float p = render::buildupProgress(t_, b, float(f.time * 20.0 - double(w.gameTicks()))); p >= 0) {
+            // from the start) to the top of the model. Drop-in: buildingPlacement lifted / squashed the
+            // matrices, model_vs unfolds the height bands; the lamps / emission fade in at the end.
+            if (const float pa = assembleProgress(int(si), bi, b); pa >= 0 || pa == -2.0f) {
+                // Assemble (render/building_assemble.hpp): model_vs moves the parts (skin.w = 1 + p); a
+                // settled building (mission start, a save) stands finished.
+                if (pa >= 0) {
+                    d.unfold[1] = std::max(g.top, 2.0f);
+                    d.unfold[2] = 1.0f + pa;
+                    d.emit *= render::assembleLight(pa);
+                }
+            } else if (const float p = dropInProgress(b); p >= 0) {
+                const render::DropInPose dp = render::dropInPose(p, render::dropInFromGround(t), std::max(g.top, 2.0f));
+                d.unfold[0] = 1.0f + dp.unfold;
+                d.unfold[1] = std::max(g.top, 2.0f);
+                d.emit *= dp.light;
+            } else if (const float p2 = render::buildupProgress(t_, b, tickFrac_); p2 >= 0) {
+                const float p = p2;
                 d.build[0] = groundY + 0.75f + 1.5f + p * (std::max(g.top, 2.0f) - 1.5f + 0.5f);
                 d.build[1] = 4.0f * std::clamp(std::min(p, 1.0f - p) * 12.0f, 0.0f, 1.0f) + 0.001f;
                 d.build[2] = float(std::fmod(f.time * 6.0, 3.0));
                 d.buildK = std::max(p, 0.02f);
             }
-            if (const int pose = buildingPose(w, b, mi); pose >= 0) {  // animation frame / silo level
+            // Building life (docs/3d-mode.md "Building life"; models_life.cpp): spinning parts by node name (a dish
+            // replaces the original animation's stepped pose), the idle turret's scan.
+            const bool lifeDish = life && std::size_t(mi) < life_.size() && life_[std::size_t(mi)].dish;
+            if (const int pose = lifeDish ? -1 : buildingPose(w, b, mi); pose >= 0) {  // animation frame / silo level
                 d.palette = paletteFor(mi, anim_[std::size_t(mi)].poseAnim, float(pose) / kPoseFps);
                 if (std::size_t(pose) < g.bodyPoses.size() && g.bodyPoses[std::size_t(pose)].count) d.bodyPose = pose;
+            }
+            if (life) {
+                const bool turns = d.turret && (t.barrelArt >= 0 || t.actLikeTurret);
+                const bool building = (b.flags & 0x6) || d.unfold[0] > 0 || d.unfold[2] > 0 || d.build[1] > 0;
+                float off = 0;
+                const int pal = buildingLife(w, int(si), bi, b, mi, building, turns, off);
+                if (pal >= 0 && d.palette < 0) d.palette = pal;
+                if (off != 0) {
+                    const formats::Model3D& m = models_[std::size_t(mi)];
+                    d.turretM = d.bodyM * translate(m.turretPivot[0], m.turretPivot[1], m.turretPivot[2]) *
+                                yawM(facingAngle(b.facing) + off) *
+                                translate(-m.turretPivot[0], -m.turretPivot[1], -m.turretPivot[2]);
+                }
             }
             const formats::Rgba c = colours_[std::size_t(std::clamp(side.house, 0, formats::kHouseCount - 1))][8];
             d.house[0] = float(c & 0xFF) / 255.0f;
             d.house[1] = float((c >> 8) & 0xFF) / 255.0f;
             d.house[2] = float((c >> 16) & 0xFF) / 255.0f;
+            d.lod = d.bodyPose < 0 && smallOnScreen(f, g, Vec3{d.bodyM.m[12], groundY, d.bodyM.m[14]});
             if (walkPipe_)
                 if (const std::uint32_t m = walkMask(b.type); m) {
                     d.walk[0] = float(b.tileX * 32);
@@ -1998,13 +2799,24 @@ void ModelRenderer::collect(const ModelFrame& f) {
         for (int ui = side.firstUnit; ui >= 0; ui = side.nextObject(ui)) {
             const auto& u = side.units[std::size_t(ui)];
             if (!u.alive) continue;
+            // Vehicle wrecks: a dying vehicle a hulk was made of gives the hulk its drawn pose (once); the hulk
+            // is drawn in its place.
+            if (wrecks_ && u.state == game::UnitState::Dead)
+                if (Wrecks::Hulk* h = wrecks_->owner(int(si), ui)) {
+                    if (!h->posed) poseWreck(f, w, *h, &u);
+                    continue;
+                }
             const float gx = float(game::fixToPixel(u.posX)), gy = float(game::fixToPixel(u.posY));
             if (!(u.flags & 0x200140)) {
-                if (hidden(int(std::floor(gx / 32)), int(std::floor(gy / 32)))) continue;
+                if (hidden(int(std::floor(gx / 32)), int(std::floor(gy / 32))) || render::fxHideUnits()) continue;
                 const std::size_t n = draws_.size();
                 addUnit(f, w, int(si), u, u.type, float(game::fixToPixel(u.posZ)), false);
                 if (draws_.size() > n) walkOn(n, gx, gy);
             } else if ((u.flags & 0x140) && !(u.flags & 0x200000)) {
+                // Flyers over a shrouded cell (or outside the map: arriving carryalls / frigates) are not drawn -
+                // the ground point under them decides, as in 2D and Renderer3D::addFlyers. (Without this, enemy
+                // carryalls / ornithopters showed as dark silhouettes over the black shroud.)
+                if (hidden(int(std::floor(gx / 32)), int(std::floor(gy / 32)))) continue;
                 const float h = float(game::fixToPixel(u.posZ) & 0xff);
                 addUnit(f, w, int(si), u, u.type, h, true);
                 if (u.flags & 0x20000000) {
@@ -2015,6 +2827,141 @@ void ModelRenderer::collect(const ModelFrame& f) {
             }
         }
     }
+    if (wrecks_ && wrecks_->any()) addWrecks(f);
+}
+
+// Vehicle wrecks (render3d/wrecks.hpp): the pose of a hulk - the dying unit's as it was drawn (Smooth driving's /
+// the Modern effects' eased facings, the hull's lean), or, for a unit that left the pool before it was seen, the
+// simulation's facings on the ground where it died.
+void ModelRenderer::poseWreck(const ModelFrame& f, const game::World& w, Wrecks::Hulk& h, const game::Unit* u) {
+    h.posed = true;
+    const int mi = h.type >= 0 && h.type < int(unitModel_.size()) ? unitModel_[std::size_t(h.type)] : -1;
+    if (mi < 0 || mi >= int(models_.size()) || mi >= int(gpu_.size())) {
+        h.life = 0;  // no model: no hulk (its sprite's death stays the effects')
+        return;
+    }
+    const formats::Model3D& m = models_[std::size_t(mi)];
+    Mat4 tilt;
+    Vec3 at;
+    // The turret's pose on the body (a crashing flyer's cargo keeps its turret on).
+    float bodyF = float(h.facing), turretF = float(t_.bin.units[h.type].barrelArt >= 0 ? h.turretFacing : h.facing);
+    if (u && u->type == h.type) drawnFacing(*u, h.type, bodyF, turretF);
+    h.turretRel = translate(m.turretPivot[0], m.turretPivot[1], m.turretPivot[2]) * yawM(facingAngle(turretF - bodyF)) *
+                  translate(-m.turretPivot[0], -m.turretPivot[1], -m.turretPivot[2]);
+    if (h.crash) {
+        // Aircraft crashes: the flyer (or the unit under a carryall) as it was drawn in the air - its place
+        // (motion smoothing, the flight ground) and its pose (the wing beat stops where it was). A delivery's
+        // cargo is no unit: it hangs where the simulation has its carrier.
+        if (u && u->type == h.type && unitPlacement(*f.terrain, w, *u, h.type, float(game::fixToPixel(u->posZ) & 0xff), true, h.body, h.turretM, tilt, at)) {
+            h.from = at;
+            if (const UnitPose p = unitPose(*u, h.type, mi); p.anim >= 0 || p.bodyPose >= 0) {
+                h.poseAnim = p.anim;
+                h.poseTime = p.time;
+                h.bodyPose = p.bodyPose;
+            }
+        } else {
+            h.body = translate(h.from.x, h.from.y, h.from.z) * yawM(facingAngle(bodyF));
+        }
+        h.to.y = std::min(h.to.y, h.from.y);
+    } else if (!u || !unitPlacement(*f.terrain, w, *u, h.type, 0, false, h.body, h.turretM, tilt, at)) {
+        const float e = 8, gy = f.terrain->height(h.x, h.y);
+        const Vec3 n = normalize(Vec3{f.terrain->height(h.x - e, h.y) - f.terrain->height(h.x + e, h.y), 2 * e,
+                                      f.terrain->height(h.x, h.y - e) - f.terrain->height(h.x, h.y + e)});
+        h.body = translate(h.x, gy, h.y) * tiltTo(n) * yawM(facingAngle(h.facing));
+        const bool barrel = t_.bin.units[h.type].barrelArt >= 0;
+        h.turretM = h.body * translate(m.turretPivot[0], m.turretPivot[1], m.turretPivot[2]) *
+                    yawM(facingAngle((barrel ? h.turretFacing : h.facing) - h.facing)) *
+                    translate(-m.turretPivot[0], -m.turretPivot[1], -m.turretPivot[2]);
+    }
+    const Vec4 pv = h.body * Vec4{m.turretPivot[0], m.turretPivot[1], m.turretPivot[2], 1.0f};
+    h.pivot = Vec3{pv.x, pv.y, pv.z};
+    h.pivotY = m.turretPivot[1];
+    h.top = std::max(4.0f, gpu_[std::size_t(mi)].top);
+    h.turret = !h.crash && gpu_[std::size_t(mi)].turret.count > 0;  // (a crash: no turret pop)
+    const int house = w.sides()[std::size_t(std::clamp(h.side, 0, int(w.sides().size()) - 1))].house;
+    const formats::Rgba c = colours_[std::size_t(std::clamp(house, 0, formats::kHouseCount - 1))][8];
+    h.house[0] = float(c & 0xFF) / 255.0f;
+    h.house[1] = float((c >> 8) & 0xFF) / 255.0f;
+    h.house[2] = float((c >> 16) & 0xFF) / 255.0f;
+}
+
+void ModelRenderer::addWrecks(const ModelFrame& f) {
+    const game::World& w = *f.world;
+    for (Wrecks::Hulk& h : wrecks_->hulks()) {
+        if (!h.used) continue;
+        if (!h.posed) poseWreck(f, w, h, nullptr);  // (its unit is gone already)
+        const int mi = h.type >= 0 && h.type < int(unitModel_.size()) ? unitModel_[std::size_t(h.type)] : -1;
+        if (mi < 0 || mi >= int(gpu_.size()) || h.life <= 0) continue;
+        if (f.shroudOn && w.inBounds(int(h.x) >> 5, int(h.y) >> 5) && (w.cell(int(h.x) >> 5, int(h.y) >> 5).shroud & 0xF) == 1) continue;
+        const Wrecks::Pose p = Wrecks::pose(h);
+        const Vec3 at = h.crash ? p.pos : Vec3{h.body.m[12], h.body.m[13], h.body.m[14]};
+        float sx, sy;
+        if (!f.camera->project(at, sx, sy)) continue;
+        const float margin = 400;
+        if (sx < -margin || sy < -margin || sx > f.camera->viewW() + margin || sy > f.camera->viewH() + margin) continue;
+        const GpuModel& g = gpu_[std::size_t(mi)];
+        if (h.crash) {
+            // Aircraft crashes: falling out of control (spinning about the vertical, rolling / pitching about the
+            // hull's middle), then lying askew on the ground where it came down. One draw: nothing comes off.
+            if (p.dissolve >= 0.999f) continue;
+            Draw d;
+            d.model = mi;
+            d.turret = g.turret.count > 0;
+            Mat4 rot = h.body;
+            rot.m[12] = rot.m[13] = rot.m[14] = 0;
+            Mat4 tilt;
+            const float ground = f.terrain->height(at.x, at.z);
+            if (!p.air) {
+                const float e = 8;
+                tilt = tiltTo(normalize(Vec3{f.terrain->height(at.x - e, at.z) - f.terrain->height(at.x + e, at.z), 2 * e,
+                                             f.terrain->height(at.x, at.z - e) - f.terrain->height(at.x, at.z + e)}));
+            }
+            d.bodyM = translate(at.x, at.y + p.lift, at.z) * tilt * yawM(p.spin) * rot * translate(0, p.centre, 0) * rollM(p.roll) *
+                      pitchM(p.pitch) * translate(0, -p.centre, 0);
+            d.turretM = d.bodyM * h.turretRel;
+            d.shadowM = translate(at.x, ground + 0.6f, at.z);
+            d.plane[3] = ground;
+            std::memcpy(d.house, h.house, sizeof d.house);
+            d.wreck[0] = p.charK;
+            d.wreck[1] = p.dissolve > 0 ? -p.dissolve : p.ember;
+            if (h.poseAnim >= 0 || h.bodyPose >= 0) {
+                d.palette = paletteFor(mi, h.poseAnim, h.poseTime);
+                if (h.bodyPose >= 0 && std::size_t(h.bodyPose) < g.bodyPoses.size() && g.bodyPoses[std::size_t(h.bodyPose)].count)
+                    d.bodyPose = h.bodyPose;
+            }
+            d.lod = d.bodyPose < 0 && smallOnScreen(f, g, at);
+            if (p.dissolve > 0.35f) d.alpha = 0.999f;
+            draws_.push_back(d);
+            continue;
+        }
+        Draw d;
+        d.model = mi;
+        d.turret = g.turret.count > 0;
+        d.parts = 1;
+        d.bodyM = translate(0, p.lift, 0) * h.body * rollM(p.roll) * pitchM(p.pitch);
+        d.turretM = d.bodyM;
+        d.shadowM = translate(at.x, at.y + 0.6f, at.z);
+        d.plane[3] = at.y;
+        std::memcpy(d.house, h.house, sizeof d.house);
+        d.wreck[0] = p.charK;
+        d.wreck[1] = p.dissolve > 0 ? -p.dissolve : p.ember;
+        d.lod = smallOnScreen(f, g, at);
+        // (A hulk that is crumbling away casts no shadow any more: alpha just under 1 keeps it out of the casters
+        // and of the opaque group; the shader discards what is gone.)
+        if (p.dissolve > 0.35f) d.alpha = 0.999f;
+        if (p.dissolve < 0.999f) draws_.push_back(d);
+        if (!d.turret || p.turretDissolve >= 0.999f) continue;
+        // The turret, blown off: about its pivot, tumbling.
+        Draw t = d;
+        t.parts = 2;
+        t.alpha = p.turretDissolve > 0.35f ? 0.999f : 1.0f;
+        t.wreck[1] = p.turretDissolve > 0 ? -p.turretDissolve : p.ember;
+        const Vec3 pv = h.pivot;
+        t.turretM = translate(pv.x + p.turretOff.x, pv.y + p.turretOff.y, pv.z + p.turretOff.z) *
+                    axisAngleM(p.turretAxis, p.turretAngle) * yawM(p.turretSpin) * translate(-pv.x, -pv.y, -pv.z) * h.turretM;
+        t.bodyM = t.turretM;  // (culling / sorting read the body matrix's place)
+        draws_.push_back(t);
+    }
 }
 
 int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const ModelFrame& f) {
@@ -2022,7 +2969,7 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
         static PointLightsU none{};
         SDL_PushGPUFragmentUniformData(cmd, 1, f.lights ? f.lights : &none, sizeof(PointLightsU));
     }
-    if (draws_.empty() || !vb_ || !meshPipe_ || !palette_) return 0;
+    if (draws_.empty() || pages_.empty() || !meshPipe_ || !palette_) return 0;
     int calls = 0;
     ModelVU vu;
     std::memcpy(vu.viewProj, f.viewProj.m, sizeof vu.viewProj);
@@ -2050,17 +2997,49 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
     // With the sun shadow map the models cast real shadows (drawShadowDepth): no PS1 shadow
     // polygons / projected glTF shadows on top.
     const bool shadowMap = f.shadow[0] > 0.5f && f.shadowMap;
-    SDL_GPUBufferBinding vb{vb_, 0}, ib{ib_, 0};
+    // The page (vertex + index buffers) of the last bound model; bind() switches it when a model is in another.
+    SDL_GPUBufferBinding vb{pages_.front().vb, 0}, ib{pages_.front().ib, 0};
+    // Reimagined models with PBR maps go through model_pbr_fs (it needs the shadow map bound, which the 3D
+    // renderer always does; without one they fall back to model_fs).
+    auto pbr = [&](const GpuModel& g) { return g.pbrTex && g.nrmTex && f.shadowMap && pbrPipe_ && pbrOpaquePipe_; };
     auto bind = [&](const GpuModel& g) {
-        SDL_GPUTextureSamplerBinding sb[3] = {{g.tex ? g.tex : white_, g.point ? nearest_ : linear_},
-                                              {f.shroud ? f.shroud : white_, f.linearClamp ? f.linearClamp : linear_},
-                                              {f.shadowMap, f.shadowSampler}};
-        SDL_BindGPUFragmentSamplers(pass, 0, sb, f.shadowMap ? 3 : 2);
+        if (g.vb && g.vb != vb.buffer) {
+            vb.buffer = g.vb;
+            ib.buffer = g.ib;
+            SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+            SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        }
+        // The screen-space ambient occlusion (render3d/ssao.*) in the slot after each shader's own textures
+        // (model_fs 3, model_pbr_fs 5); a white stand-in, unread, without it.
+        const SDL_GPUTextureSamplerBinding ao{f.ssao && f.ssaoSampler ? f.ssao : white_, f.ssao && f.ssaoSampler ? f.ssaoSampler : linear_};
+        if (pbr(g)) {
+            SDL_GPUTextureSamplerBinding sb[6] = {{g.tex ? g.tex : white_, g.point ? nearest_ : linear_},
+                                                  {f.shroud ? f.shroud : white_, f.linearClamp ? f.linearClamp : linear_},
+                                                  {f.shadowMap, f.shadowSampler},
+                                                  {g.pbrTex, linear_},
+                                                  {g.nrmTex, linear_},
+                                                  ao};
+            SDL_BindGPUFragmentSamplers(pass, 0, sb, 6);
+        } else {
+            SDL_GPUTextureSamplerBinding sb[4] = {{g.tex ? g.tex : white_, g.point ? nearest_ : linear_},
+                                                  {f.shroud ? f.shroud : white_, f.linearClamp ? f.linearClamp : linear_},
+                                                  {f.shadowMap, f.shadowSampler},
+                                                  ao};
+            SDL_BindGPUFragmentSamplers(pass, 0, sb, f.shadowMap ? 4 : 2);
+        }
     };
-    auto drawRange = [&](const Range& r, const Mat4& m, int palette) {
+    // The parts drawn for a draw: the simplified version when it is small on screen.
+    auto bodyOf = [&](const GpuModel& g, const Draw& d) -> const Range& {
+        return d.lod ? g.lodBody : d.bodyPose >= 0 ? g.bodyPoses[std::size_t(d.bodyPose)] : g.body;
+    };
+    auto drawRange = [&](const Range& r, const Mat4& m, int palette, const float* unfold = nullptr, const float* drive = nullptr) {
         if (!r.count) return;
         std::memcpy(vu.model, m.m, sizeof vu.model);
+        for (int k = 0; k < 3; ++k) vu.drive[k] = drive ? drive[k] : 0.0f;
         vu.skin[0] = float(palette);
+        vu.skin[1] = unfold ? unfold[0] : 0.0f;  // drop-in unfold (model_vs)
+        vu.skin[2] = unfold ? unfold[1] : 0.0f;
+        vu.skin[3] = unfold ? unfold[2] : 0.0f;  // Assemble progress 1 + p (model_vs)
         SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof vu);
         SDL_DrawGPUIndexedPrimitives(pass, r.count, 1, r.first, 0, 0);
         ++calls;
@@ -2104,38 +3083,55 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
         su.sun[2] = f.sun.z;
         su.sun[3] = 0;
         std::memcpy(su.plane, d.plane, sizeof su.plane);
-        auto one = [&](const Range& r, const Mat4& m, int palette) {
+        auto one = [&](const Range& r, const Mat4& m, int palette, bool gear = false) {
             if (!r.count) return;
+            for (int k = 0; k < 3; ++k) su.drive[k] = gear ? d.drive[k] : 0.0f;
             std::memcpy(su.model, m.m, sizeof su.model);
             su.skin[0] = float(palette);
+            su.skin[1] = d.unfold[0];
+            su.skin[2] = d.unfold[1];
+            su.skin[3] = d.unfold[2];
             SDL_PushGPUVertexUniformData(cmd, 0, &su, sizeof su);
             SDL_DrawGPUIndexedPrimitives(pass, r.count, 1, r.first, 0, 0);
             ++calls;
         };
         const Mat4 sq = squashAbove(d.plane[3], d.buildK);
-        one(d.bodyPose >= 0 ? g.bodyPoses[std::size_t(d.bodyPose)] : g.body, sq * d.bodyM, d.palette);
-        if (d.turret) one(g.turret, sq * d.turretM, -1);
+        if (d.parts & 1) one(bodyOf(g, d), sq * d.bodyM, d.palette, true);
+        if (d.turret && (d.parts & 2)) one(d.lod ? g.lodTurret : g.turret, sq * d.turretM, -1);
     }
     SDL_BindGPUGraphicsPipeline(pass, meshPipe_);
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
     SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
     bindPalette();
+    const bool gradeOn = f.lights && f.lights->grade[0] > 0;  // docs/3d-mode.md "Realistic grade"
     auto drawMesh = [&](const Draw& d, float walkMode) {
         const GpuModel& g = gpu_[std::size_t(d.model)];
         fu.house[0] = d.house[0];
         fu.house[1] = d.house[1];
         fu.house[2] = d.house[2];
+        if (gradeOn) {  // Realistic grade: the house colour stays an accent (the picture's grade takes a quarter away)
+            const float hl = 0.299f * d.house[0] + 0.587f * d.house[1] + 0.114f * d.house[2];
+            for (int k = 0; k < 3; ++k) fu.house[k] = std::clamp(hl + (d.house[k] - hl) * 1.35f, 0.0f, 1.0f);
+        }
         fu.house[3] = d.flash;
         fu.sunDir[3] = d.alpha;
         fu.map[3] = d.emit;
         std::memcpy(fu.walk, d.walk, sizeof fu.walk);
         fu.walkMode[0] = walkMode;
         std::memcpy(fu.walkMode + 1, d.build, sizeof d.build);
+        std::memcpy(fu.gplane, d.plane, sizeof fu.gplane);
+        fu.dust[0] = d.dustBand > 0 ? 1.0f / d.dustBand : 0.0f;
+        fu.dust[1] = d.wreck[0] > 0 ? 0.25f : 1.0f;  // (a hulk: soot, hardly any sand yet)
+        fu.dust[2] = d.wreck[0];  // vehicle wrecks: a hulk's char / embers (0, 0 = a live model)
+        fu.dust[3] = d.wreck[1];
         SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof fu);
         bind(g);
-        drawRange(d.bodyPose >= 0 ? g.bodyPoses[std::size_t(d.bodyPose)] : g.body, d.bodyM, d.palette);
-        drawRange(g.house, g.houseOnTurret && d.turret ? d.turretM : d.bodyM, g.houseOnTurret && d.turret ? -1 : d.palette);
-        if (d.turret) drawRange(g.turret, d.turretM, -1);
+        const bool houseOnTurret = g.houseOnTurret && d.turret;
+        if (d.parts & 1) drawRange(bodyOf(g, d), d.bodyM, d.palette, d.unfold, d.drive);
+        if (d.parts & (houseOnTurret ? 2 : 1))
+            drawRange(d.lod ? g.lodHouse : g.house, houseOnTurret ? d.turretM : d.bodyM, houseOnTurret ? -1 : d.palette, d.unfold,
+                      houseOnTurret ? nullptr : d.drive);
+        if (d.turret && (d.parts & 2)) drawRange(d.lod ? g.lodTurret : g.turret, d.turretM, -1, d.unfold);
     };
     // Walkable cells (docs/3d-models.md "Walkable cells"; the original draws units over the building
     // sprite): a building with units on its walkable cells (walkRef > 0, walk[2] = its cell mask)
@@ -2155,6 +3151,19 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
         SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
         bindPalette();
     }
+    // model_pbr_fs tuning: fragment uniform buffer 2 (only pushed when such a model is drawn).
+    bool anyPbr = false;
+    for (const Draw& d : draws_) anyPbr |= pbr(gpu_[std::size_t(d.model)]);
+    if (anyPbr) SDL_PushGPUFragmentUniformData(cmd, 2, pbrK_, sizeof pbrK_);
+    SDL_GPUGraphicsPipeline* bound = meshOpaquePipe_ ? meshOpaquePipe_ : nullptr;
+    auto use = [&](SDL_GPUGraphicsPipeline* p) {
+        if (!p || p == bound) return;
+        SDL_BindGPUGraphicsPipeline(pass, p);
+        SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+        SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        bindPalette();
+        bound = p;
+    };
     bool blendBound = !meshOpaquePipe_;
     for (int pass2 = 0; pass2 < 3; ++pass2)
         for (const Draw& d : draws_) {
@@ -2166,6 +3175,11 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
                 SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
                 bindPalette();
                 blendBound = true;
+                bound = meshPipe_;
+            }
+            if (anyPbr) {  // (Reimagined) switch between the plain and the PBR pipeline of the group
+                const bool p = pbr(gpu_[std::size_t(d.model)]);
+                use(group == 0 ? (p ? pbrOpaquePipe_ : meshOpaquePipe_) : (p ? pbrPipe_ : meshPipe_));
             }
             const bool walkBuilding = d.walkRef > 0 && d.walk[2] > 0;
             walking |= walkBuilding;
@@ -2181,8 +3195,10 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
         SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
         SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
         bindPalette();
+        bound = walkPipe_;
         for (const Draw& d : draws_) {
             if (d.walkRef <= 0 || d.walk[2] <= 0) continue;
+            if (anyPbr) use(pbr(gpu_[std::size_t(d.model)]) && pbrWalkPipe_ ? pbrWalkPipe_ : walkPipe_);
             stencilRef(d.walkRef);
             drawMesh(d, 2.0f);
         }
@@ -2194,10 +3210,12 @@ int ModelRenderer::draw(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, cons
 // The meshes as casters of the sun shadow map (docs/3d-mode.md "Sun shadows"): depth only,
 // opaque models only (stealthed ones cast nothing).
 int ModelRenderer::drawShadowDepth(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer* cmd, const ModelFrame& f) {
-    if (draws_.empty() || !vb_ || !meshPipe_ || !dev_ || !palette_) return 0;
+    if (draws_.empty() || pages_.empty() || !meshPipe_ || !dev_ || !palette_) return 0;
     if (!depthPipe_ || depthPipeFmt_ != f.shadowFormat) {
-        if (depthPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, depthPipe_);
-        depthPipe_ = nullptr;
+        for (SDL_GPUGraphicsPipeline** p : {&depthPipe_, &viewDepthPipe_}) {
+            if (*p) SDL_ReleaseGPUGraphicsPipeline(dev_, *p);
+            *p = nullptr;
+        }
         depthPipeFmt_ = f.shadowFormat;
         SDL_GPUShader* vs = createShader(dev_, ShaderId::ModelVs, 0, 1, 1);
         SDL_GPUShader* fs = createShader(dev_, ShaderId::DepthFs, 0, 0);
@@ -2222,34 +3240,61 @@ int ModelRenderer::drawShadowDepth(SDL_GPURenderPass* pass, SDL_GPUCommandBuffer
             pi.target_info.has_depth_stencil_target = true;
             depthPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
             if (!depthPipe_) SDL_Log("3D models: shadow pipeline failed: %s", SDL_GetError());
+            // The same without the bias, for a depth seen from the camera (ModelFrame::depthBias false).
+            pi.rasterizer_state.enable_depth_bias = false;
+            pi.rasterizer_state.depth_bias_constant_factor = 0;
+            pi.rasterizer_state.depth_bias_slope_factor = 0;
+            viewDepthPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
         }
         for (SDL_GPUShader* s2 : {vs, fs})
             if (s2) SDL_ReleaseGPUShader(dev_, s2);
     }
-    if (!depthPipe_) return 0;
-    SDL_BindGPUGraphicsPipeline(pass, depthPipe_);
-    SDL_GPUBufferBinding vb{vb_, 0}, ib{ib_, 0};
+    SDL_GPUGraphicsPipeline* pipe = f.depthBias || !viewDepthPipe_ ? depthPipe_ : viewDepthPipe_;
+    if (!pipe) return 0;
+    SDL_BindGPUGraphicsPipeline(pass, pipe);
+    SDL_GPUBufferBinding vb{pages_.front().vb, 0}, ib{pages_.front().ib, 0};
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
     SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
     SDL_BindGPUVertexStorageBuffers(pass, 0, &palette_, 1);
+    auto usePage = [&](const GpuModel& g) {
+        if (!g.vb || g.vb == vb.buffer) return;
+        vb.buffer = g.vb;
+        ib.buffer = g.ib;
+        SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+        SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+    };
     ModelVU vu;
     std::memcpy(vu.viewProj, f.lightViewProj.m, sizeof vu.viewProj);
     int calls = 0;
-    auto drawRange = [&](const Range& r, const Mat4& m, int palette) {
+    auto drawRange = [&](const Range& r, const Mat4& m, int palette, const float* unfold = nullptr, const float* drive = nullptr) {
         if (!r.count) return;
         std::memcpy(vu.model, m.m, sizeof vu.model);
+        for (int k = 0; k < 3; ++k) vu.drive[k] = drive ? drive[k] : 0.0f;
         vu.skin[0] = float(palette);
+        vu.skin[1] = unfold ? unfold[0] : 0.0f;  // drop-in unfold (model_vs)
+        vu.skin[2] = unfold ? unfold[1] : 0.0f;
+        vu.skin[3] = unfold ? unfold[2] : 0.0f;  // Assemble progress 1 + p (model_vs)
         SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof vu);
         SDL_DrawGPUIndexedPrimitives(pass, r.count, 1, r.first, 0, 0);
         ++calls;
     };
+    const bool cull = f.depthCull[0] <= f.depthCull[2];
     for (const Draw& d : draws_) {
         if (d.alpha < 1) continue;
+        if (cull && (d.bodyM.m[12] < f.depthCull[0] || d.bodyM.m[12] > f.depthCull[2] || d.bodyM.m[14] < f.depthCull[1] ||
+                     d.bodyM.m[14] > f.depthCull[3]))
+            continue;
         const GpuModel& g = gpu_[std::size_t(d.model)];
+        usePage(g);
         const Mat4 sq = squashAbove(d.plane[3], d.buildK), body = sq * d.bodyM, turret = sq * d.turretM;
-        drawRange(d.bodyPose >= 0 ? g.bodyPoses[std::size_t(d.bodyPose)] : g.body, body, d.palette);
-        drawRange(g.house, g.houseOnTurret && d.turret ? turret : body, g.houseOnTurret && d.turret ? -1 : d.palette);
-        if (d.turret) drawRange(g.turret, turret, -1);
+        const bool houseOnTurret = g.houseOnTurret && d.turret;
+        if (d.parts & 1)
+            drawRange(d.lod ? g.lodBody : d.bodyPose >= 0 ? g.bodyPoses[std::size_t(d.bodyPose)] : g.body, body, d.palette, d.unfold,
+                      d.drive);
+        if (d.parts & (houseOnTurret ? 2 : 1))
+            drawRange(d.lod ? g.lodHouse : g.house, houseOnTurret ? turret : body, houseOnTurret ? -1 : d.palette, d.unfold,
+                      houseOnTurret ? nullptr : d.drive);
+        if (d.turret && (d.parts & 2)) drawRange(d.lod ? g.lodTurret : g.turret, turret, -1, d.unfold);
     }
     return calls;
 }

@@ -1,4 +1,5 @@
 #include "render/art_pack.hpp"
+#include "formats/utf8_bom.hpp"
 
 #include "platform/user_data.hpp"
 #include "render/mod_art.hpp"
@@ -98,12 +99,8 @@ std::string ArtPack::userDir() {
         const std::string w = platform::portableWritableDir();
         return w.empty() ? std::string() : (fs::path(w) / "artpacks").string();
     }
-    std::string dir;
-    if (char* pref = SDL_GetPrefPath("d2k-mac", "Dune 2000")) {
-        dir = (fs::path(pref) / "artpacks").string();
-        SDL_free(pref);
-    }
-    return dir;
+    const std::string pref = platform::prefPath();  // (moves a pre-0.0.3 folder first, user_data.hpp)
+    return pref.empty() ? std::string() : (fs::path(pref) / "artpacks").string();
 }
 
 void ArtPack::setUserDirOverride(const std::string& dir) { userDirOverride() = dir; }
@@ -192,6 +189,7 @@ bool ArtPack::isRedesign(const std::string& name) {
         std::error_code ec;
         if (!fs::exists(ini, ec)) continue;
         std::ifstream in(ini);
+        formats::skipUtf8Bom(in);
         std::string line;
         while (std::getline(in, line)) {
             const std::string l = lower(trim(line));
@@ -218,6 +216,7 @@ std::unique_ptr<ArtPack> ArtPack::open(const std::string& name) {
         p->title_ = name;
         p->root_ = root.string();
         std::ifstream in(root / "pack.ini");
+        formats::skipUtf8Bom(in);
         std::string line;
         while (std::getline(in, line)) {
             line = trim(line);

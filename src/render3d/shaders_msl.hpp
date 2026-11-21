@@ -83,6 +83,7 @@ fragment float4 terrain_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], c
     const float vis = mix(u.light.w, 1.0, sm);
     const float3 shade = sunAmb(pl, u.light.x, u.light.y * ndl * vis) * u.light.z;
     float3 rgb = satur(pl, c.rgb) * shade + c.rgb * pointLights(pl, plg, in.wpos, n, 0.3);
+    rgb *= dustHaze(pl, in.wpos);  // Reimagined: drifting dust veils (0 strength = off)
     // Darkness: the shroud mask, and a thin fade into the black beyond the map edge. The haze
     // is darkened too, so shrouded ground stays black at any distance.
     float s = 0.0;
@@ -90,7 +91,7 @@ fragment float4 terrain_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], c
     const float2 e = min(in.wpos.xz, u.fog2.yz - in.wpos.xz);
     s = max(s, 1.0 - smoothstep(0.0, 8.0, min(e.x, e.y)));
     const float d = distance(in.wpos, u.fog.xyz);
-    const float f = smoothstep(u.fog.w, u.fog2.x, d);
+    const float f = smoothstep(u.fog.w, u.fog2.x, d) * aerialK(pl);
     rgb = mix(rgb, u.fogColor.rgb, f) * (1.0 - s);
     return float4(rgb, 1.0);
 }
@@ -167,12 +168,30 @@ fragment float4 sprite_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], co
                           sampler texSamp [[sampler(0)]], sampler shroudSamp [[sampler(1)]],
                           sampler shadowSamp [[sampler(2)]]) {
     float4 c = tex.sample(texSamp, in.uv);
+    const float fogA = in.fog * aerialK(pl);  // the fog at the anchor (Aerial haze: capped)
+    if (u.mode.x > 2.5) {
+        // Relief decal (track marks, render3d/track_marks.hpp; blend dst * 2 * src): the texture's normal
+        // (rg: x across, y along) lit by the sun given in the strip's frame in the vertex colour, relative
+        // to flat ground (the same ambient + sun split as the terrain), times its tone (b); coverage in a.
+        const float2 nxy = c.rg * 2.0 - 1.0;
+        const float3 n = float3(nxy, sqrt(saturate(1.0 - dot(nxy, nxy))));
+        const float3 L = normalize(in.color.rgb * 2.0 - 1.0);
+        float sunVis = 1.0;
+        if (u.shadow.x > 0.5) sunVis = shadowPCF(shadowMap, shadowSamp, in.lpos, u.shadow);
+        const float amb = 0.62, dif = 0.55 * sunVis;
+        const float lit = (amb * (0.55 + 0.45 * n.z) + dif * max(dot(n, L), 0.0)) / (amb + dif * max(L.z, 0.0));
+        float dark = 0.0;
+        if (u.mode.y > 0.5) dark = shroudAt(pl, shroud, shroudSamp, in.ground, u.mode.zw);
+        const float k = c.a * in.color.a * (1.0 - dark) * (1.0 - fogA);
+        const float f = mix(1.0, clamp(lit * c.b * 2.0, 0.0, 2.0), k);
+        return float4(float3(0.5 * f), 1.0);
+    }
     c *= in.color;
     c.rgb = min(c.rgb + in.flash * c.a, 1.0);
     // Darkness of the map point this pixel covers in the 2D view (decals: the ground under it);
     // nothing outside the map is ever visible.
     float dark = 0.0;
-    if (u.mode.y > 0.5) dark = shroud.sample(shroudSamp, in.ground / u.mode.zw).a;
+    if (u.mode.y > 0.5) dark = shroudAt(pl, shroud, shroudSamp, in.ground, u.mode.zw);
     if (any(in.ground < float2(0.0)) || any(in.ground >= u.mode.zw)) dark = 1.0;
     if (u.mode.x < 0.5) {
         if (c.a < 0.004 || dark > 0.996) discard_fragment();
@@ -183,11 +202,12 @@ fragment float4 sprite_fs(VOut in [[stage_in]], constant FU& u [[buffer(0)]], co
         c.rgb = satur(pl, c.rgb) * pl.spriteTint.rgb;
         // Dynamic lights (explosions, muzzle flashes, fires, lamps) on units, buildings and smoke.
         c.rgb += alb * pointLights(pl, plg, in.wpos, float3(0.0, 1.0, 0.0), 0.8);
-        c.rgb = mix(c.rgb, u.fogColor.rgb, in.fog) * (1.0 - dark);
+        c.rgb *= dustHaze(pl, float3(in.ground.x, 0.0, in.ground.y));  // Reimagined: drifting dust veils
+        c.rgb = mix(c.rgb, u.fogColor.rgb, fogA) * (1.0 - dark);
     } else if (u.mode.x < 1.5) {
-        c.rgb *= (1.0 - dark) * (1.0 - in.fog);
+        c.rgb *= (1.0 - dark) * (1.0 - fogA);
     } else {
-        c.rgb = mix(c.rgb, float3(1.0), max(dark, in.fog));
+        c.rgb = mix(c.rgb, float3(1.0), max(dark, fogA));
     }
     return c;
 }
@@ -207,8 +227,9 @@ struct TmIn {
 };
 // a = (exposure, peak, knee, bloom strength), b = (bloom uv scale x, y, input linear, output linear),
 // c = (highlight desaturation, display adjustments on, -, -),
-// d = display adjustments (brightness -0.5..0.5, contrast -0.5..0.5, gamma 0.8..1.4, saturation -0.5..0.5)
-struct TmU { float4 a; float4 b; float4 c; float4 d; };
+// d = display adjustments (brightness -0.5..0.5, contrast -0.5..0.5, gamma 0.8..1.4, saturation -0.5..0.5),
+// e = the Reimagined "Realistic grade" (render/hdr.hpp Grade): desaturation (0 = off), toe, cooler shadows, highlight lift
+struct TmU { float4 a; float4 b; float4 c; float4 d; float4 e; };
 static float3 toLin(float3 c) {
     c = max(c, float3(0.0));
     return select(pow((c + 0.055) / 1.055, float3(2.4)), c / 12.92, c <= float3(0.04045));
@@ -233,6 +254,18 @@ static float3 displayAdjust(float3 c, float4 d) {
     // brightness: lifts towards white (keeps white) or scales towards black (keeps black)
     e = d.x >= 0.0 ? e + d.x * (1.0 - e) : e * (1.0 + d.x);
     return toLin(e) + over;
+}
+// The Reimagined "Realistic grade" (docs/3d-mode.md "Realistic grade"; render/hdr.hpp Grade), on the tone-mapped
+// linear light of the 3D picture: less saturation, a filmic toe (the darks sink: y (y + 0.35 t) / (y + t); the mids
+// and the lights keep their place), the shadows a little cooler, the highlights lifted a little. Hue-preserving
+// (one luminance curve); values above SDR white (EDR) keep their ratio.
+static float3 naturalGrade(float3 c, float4 g) {
+    const float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    c = max(float3(y) + (c - float3(y)) * (1.0 - g.x), float3(0.0));
+    const float yt = y * (y + 0.35 * g.y) / (y + g.y) * (1.0 + g.w * smoothstep(0.2, 0.85, y));
+    c *= yt / max(y, 1e-5);
+    const float sh = (1.0 - smoothstep(0.0, 0.2, y)) * g.z;
+    return c * float3(1.0 - 0.07 * sh, 1.0 - 0.015 * sh, 1.0 + 0.07 * sh);
 }
 fragment float4 tonemap_fs(TmIn in [[stage_in]], constant TmU& u [[buffer(0)]], texture2d<float> scene [[texture(0)]],
                            sampler sceneSamp [[sampler(0)]], texture2d<float> bloom [[texture(1)]],
@@ -262,6 +295,7 @@ fragment float4 tonemap_fs(TmIn in [[stage_in]], constant TmU& u [[buffer(0)]], 
             c = mix(t, pc, w);
         }
     }
+    if (u.e.x > 0.0) c = naturalGrade(c, u.e);
     if (u.c.y > 0.5) c = displayAdjust(c, u.d);
     return float4(u.b.w > 0.5 ? c : toSrgb(c), 1.0);
 }

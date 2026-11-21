@@ -3,6 +3,78 @@
 All notable changes to OpenD2K. Versions follow `MAJOR.MINOR.PATCH`; while the major version is 0,
 any release may change settings or save games (old saves keep loading where possible).
 
+## 0.0.3 — 2026-11-21
+
+### Graphics presets
+- **New preset line-up** (Options → Graphics): *Original* / *Enhanced* / *3D (Reimagined)* / *3D Classic*
+  (the original 1998 tiles on the 3D battlefield) / *Custom*. The welcome page shows the same four looks.
+- **3D (Reimagined)**, the new 3D look: taller sculpted sandstone cliffs, a low warm sun with soft long
+  shadows, detailed terrain, cinematic fireballs, smoke and craters. Everything is render-only: the game
+  itself plays exactly as before.
+
+### 3D Reimagined
+- **Realistic grade** (optional; vivid colours are the default): a desaturated, filmic look with khaki sand and
+  cinnamon spice — a switch on the Options → Graphics → 3D tab.
+- **Photo terrain**: the ground made from photographed sand, rock and cliff scans (free CC0 scans from
+  Poly Haven), without visible tiling.
+- **Ambient occlusion**: soft contact shadows where buildings, units and rocks meet the ground.
+- **Lit smoke**: smoke lit by the sun, the sky and the fire under it, ageing from brown to grey; dust takes the
+  colour of the ground.
+- **Vehicle wrecks** and **aircraft crashes**: destroyed vehicles burn out as charred hulks (turrets pop off),
+  shot-down aircraft spin and dive into the ground, their cargo falls too.
+- **Ground marks on slopes**: scorch marks, craters and track marks follow the terrain instead of floating over
+  slopes and cliff edges, and fade on steep faces.
+- **Track marks** in the sand (tread and tyre imprints that slowly fade), **dust trails** behind vehicles.
+- **Spice relief**: spice fields as wind-shaped mounds and drifts with cinnamon clumps; the spice sparkle stays
+  on the ground (no more flicker while scrolling).
+- **Ground clutter**: boulders, rubble, pebbles, gravel and dry scrub on the ground.
+- **Building life**: wind trap turbines and fans spin, turrets scan, stacks and vents steam, beacons blink at night.
+- **World beyond the map**: the landscape continues past the map edge — *Off*, *Near* (the explored edge for a
+  few cells, then dark) or *Full*.
+- **Dust haze**: drifting dust in the air and a depth haze (setting *Aerial haze*).
+- **Redesigned buildings**: the wind traps of all three houses, the Atreides refinery and construction yard (with
+  its working crane) and a new, bigger harvester — with real materials and human-scale detail (doors, ladders,
+  railings, lamps). Wheels and tracks turn while driving.
+- New buildings can **assemble** from the ground up or **drop in** and unfold (placement setting).
+- 3D uses far less memory (about 1.4 GB instead of 8 GB with Reimagined).
+
+### Getting the 3D content
+- **Options → Art pack** now lists the extras for 3D (Reimagined) — the redesigned 3D models, the photo terrain
+  and the ground clutter — each with its size and its own Download button, plus **Get all for 3D**. Choosing the
+  3D preset (on the Graphics page or the welcome page) offers whatever is still missing in one download. Each
+  extra is optional; the game works without them.
+
+### Languages
+- **Russian AI voices** as an optional download (Options → Art pack → Extras, about 4 MB): Russian voices created
+  with AI, similar to the original — an unofficial fan work — for the language *Русский (AI, оригинальные голоса)*.
+  The pack has voices only: Russian text needs your own Russian translation, otherwise the text stays English.
+
+### Smoother play
+- **Smoother units at lower game speeds**: infantry walk smoothly between steps, vehicles drive round corners,
+  flyers keep one cruising height (no bobbing over hills, no clipping through cliffs) and turn smoothly.
+- **Smooth camera** option: camera inertia, eased zoom and glides.
+- **Effects intensity**: *Clean* (default) / *Balanced* / *Cinematic*.
+
+### Controls and game rules (all optional)
+- **Unit movement: Modern** (not original, a per-game rule; the Enhanced and 3D presets use it): ground vehicles
+  move at any angle, slide along edges and avoid each other; Original stays bit-exact. Vehicles meeting head-on
+  no longer get stuck facing each other.
+- **Attack-move**: hold A and click — units walk there and fight what they meet on the way.
+- Letter hotkeys work with any keyboard layout (for example Russian).
+- The Enhanced pause menu shows the **mission briefing**.
+
+### Fixes
+- Crushed infantry lie flat on the ground in 3D; smoke no longer flickers; artillery hits throw up earth instead
+  of a fireball; the zoom carries over between missions.
+- Direct3D 12 (Windows): no more black or dark battlefield with the Reimagined grade or the display adjustments
+  (Brightness / Contrast / Gamma / Saturation are not available on Direct3D 12 for now; Vulkan has them).
+  <!-- Windows fullscreen freeze (ModDB report): not reproduced on the Legion - pending (Legion); add a line here if a fix lands. -->
+
+### Your files
+- The settings / saves folder is now called **OpenD2K** (it was `d2k-mac`); your settings, saves and imported
+  game data are **moved automatically** on the first start. Where it is: README "Where are my settings and saves?".
+- **Open data folder** button (Options → Game data folder) opens that folder.
+
 ## 0.0.2 — 2026-11-14
 
 ### Original game behaviour

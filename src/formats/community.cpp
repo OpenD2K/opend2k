@@ -1,4 +1,5 @@
 #include "formats/community.hpp"
+#include "formats/utf8_bom.hpp"
 
 #include "formats/io.hpp"
 #include "formats/mission_ini.hpp"
@@ -189,6 +190,7 @@ std::vector<CommunityCampaign> buildCommunityCampaigns(const std::vector<Communi
             const std::string arcPath = findFileNoCase(splash, "arc" + std::to_string(arc) + ".txt");
             if (arcPath.empty()) continue;
             std::ifstream in(arcPath);
+            skipUtf8Bom(in);
             std::string line;
             while (std::getline(in, line)) {
                 const std::string stem = trim(line);

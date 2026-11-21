@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <string>
@@ -18,8 +19,35 @@ namespace d2k::render {
 namespace {
 
 using namespace fx;
-constexpr std::size_t kMaxTreads = 4000;
+// Track marks: a ring of trail nodes (one every 4 px driven or ~7 degrees turned; about 1100 B per
+// 100 nodes). 2D stamps its marks for 9 s; 3D keeps the trails longer (render3d/track_marks.hpp).
+constexpr std::size_t kMaxTreads = 8192;
 constexpr float kTreadLife = 9.0f;
+constexpr float kTrailStep = 4.0f, kTrailTurnStep = 0.12f;
+constexpr float kTau = 6.2831853f;
+
+float wrapPi(float a) {
+    while (a > 3.14159265f) a -= kTau;
+    while (a <= -3.14159265f) a += kTau;
+    return a;
+}
+
+// How soft the ground is at (x, y) for track marks: sand (dunes, spice) 1, rock / concrete 0, bilinear
+// between the cell centres so a trail fades over the edge of a sand patch instead of stopping on a tile line.
+float groundSoftness(const game::World& w, float x, float y) {
+    const float fx = x / 32 - 0.5f, fy = y / 32 - 0.5f;
+    const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
+    const float ax = fx - float(x0), ay = fy - float(y0);
+    auto soft = [&](int cx, int cy) {
+        cx = std::clamp(cx, 0, std::max(0, w.width() - 1));
+        cy = std::clamp(cy, 0, std::max(0, w.height() - 1));
+        const std::uint32_t f = w.cell(cx, cy).flags;
+        return (f & game::cell_flags::kSand) && !(f & game::cell_flags::kConcrete) ? 1.0f : 0.0f;
+    };
+    const float a = soft(x0, y0) + (soft(x0 + 1, y0) - soft(x0, y0)) * ax;
+    const float b = soft(x0, y0 + 1) + (soft(x0 + 1, y0 + 1) - soft(x0, y0 + 1)) * ax;
+    return a + (b - a) * ay;
+}
 
 float wrap32(float d) {  // facing difference into (-16, 16]
     while (d > 16) d -= 32;
@@ -46,7 +74,7 @@ Effects::Effects(SDL_Renderer* r, const formats::Templates& templates) : r_(r), 
     buildCraterTexture();
     classify();
     particles_.reserve(kMaxParticles);
-    treads_.reserve(kMaxTreads);
+    treads_.assign(kMaxTreads, Tread{});
 }
 
 Effects::~Effects() {
@@ -57,8 +85,10 @@ Effects::~Effects() {
 
 void Effects::reset() {
     particles_.clear();
-    treads_.clear();
-    treadHead_ = 0;
+    treads_.assign(kMaxTreads, Tread{});
+    treadSerial_ = 0;
+    for (auto& side : units_)
+        for (UnitVisual& v : side) v.trail = 0, v.pend = false, v.angleSet = false;
     lights_.clear();
     beams_.clear();
     sonic_.clear();
@@ -69,6 +99,9 @@ void Effects::reset() {
     flashes_.clear();
     scorch_.clear();
     worms_.clear();
+    dropIns_.clear();
+    dropInImpacts_.clear();
+    assemblies_.clear();
     marks_.clear();
     pending_.clear();
     for (auto& v : lastShot_) v.clear();
@@ -78,9 +111,11 @@ void Effects::reset() {
     bloomSeen_ = {};
     blooms_.clear();
     spiceTargets_.clear();
+    grenadeTargets_.clear();
     captures_.clear();
     primed_ = false;
     trauma_ = shakeX_ = shakeY_ = 0;
+    budget_.reset();
 }
 
 float Effects::rnd() {
@@ -322,14 +357,18 @@ void Effects::classify() {
         else if (n == "EX_BANG13") { c = ExClass::Big; scale = 1.0f; }   // tank deaths
         else if (n == "EX_BANG14") { c = ExClass::Big; scale = 1.15f; }  // heavy vehicles, bombs, BULLET14
         else if (startsWith(n, "EX_BANG")) c = ExClass::Big;
-        else if (n == "EX_155MMGUN") { c = ExClass::Big; scale = 0.85f; }  // howitzer, grenades
+        // The siege tank's 155 mm howitzer (and the grenadier's grenade, the crate trap): an artillery
+        // impact - a fountain of earth, a brief flash, dust and smoke - not a fireball (owner 2026-11-16).
+        else if (n == "EX_155MMGUN") c = ExClass::Artillery;
         // The deviator: EX_GREENEXP is its per-tick trail (the bullet trail below draws the gas
         // instead), EX_DEVIATE the hit: a gas cloud, not a fireball.
         else if (n == "EX_GREENEXP") c = ExClass::None;
         else if (n == "EX_DEVIATE") c = ExClass::Gas;
         else if (n == "EX_DEVASTATOR") c = ExClass::Plasma;
         else if (n == "EX_NEW ROCKET") { c = ExClass::Medium; scale = 1.25f; }  // missile tank, hydra
-        else if (n == "EX_TANKGUN") { c = ExClass::Medium; scale = 1.05f; }     // 80 / 110 mm shells
+        // 80 / 110 mm tank shells are kinetic rounds (owner 2026-11-16: "tanks fire big bullets"): a
+        // hit throws up a dust burst on the ground and sparks / a short flash on armour, no fireball.
+        else if (n == "EX_TANKGUN") c = ExClass::Shell;
         else if (n == "EX_ROCKET" || n == "EX_BAZOOKA") { c = ExClass::Medium; scale = 0.9f; }
         else if (n == "EX_GRENADE") { c = ExClass::Medium; scale = 0.9f; }
         else if (n == "EX_WALL") { c = ExClass::Medium; scale = 1.1f; }
@@ -381,6 +420,10 @@ void Effects::classify() {
     }
     // The spice bloom's shells (SpiceMound: groupIds[50], SPICEEXPL): globs of spice, not artillery.
     spiceWeapon_ = t_.bin.groupIds[50];
+    grenadeWeapon_ = -1;
+    for (int i = 0; i < formats::kMaxWeapons && grenadeWeapon_ < 0; ++i)
+        if (std::string(t_.bin.weaponNames[i], strnlen(t_.bin.weaponNames[i], sizeof t_.bin.weaponNames[i])) == "GRENADE")
+            grenadeWeapon_ = i;
     if (spiceWeapon_ >= 0 && spiceWeapon_ < formats::kMaxWeapons) weaponClass_[std::size_t(spiceWeapon_)] = WeaponClass::Spice;
     wheeled_.assign(formats::kMaxUnitTypes, 0);
     for (int i = 0; i < formats::kMaxUnitTypes; ++i) {
@@ -423,11 +466,57 @@ const Effects::UnitVisual* Effects::unitVisual(int side, int index) const {
 
 void Effects::add(const Particle& p) {
     if (particles_.size() >= kMaxParticles) {
-        // Full: replace a random old one rather than growing (keeps the cost bounded).
-        particles_[std::size_t(rnd() * float(particles_.size() - 1))] = p;
+        // Full (spawns already thin out from 2/5 of the budget, load()): the new particle is dropped.
+        // Replacing a live one made a visible puff vanish and another pop up mid-stack (flicker).
+        return;
+    }
+    if (eventDepth_ > 0 && budget_.on()) {
+        Particle q = p;
+        if (!budgetSpawn(q)) return;
+        particles_.push_back(q);
         return;
     }
     particles_.push_back(p);
+}
+
+bool Effects::hideParticles() {
+    static const bool hide = [] {
+        const char* e = std::getenv("D2K_FX_HIDE");
+        return e && *e && *e != '0';
+    }();
+    return hide;
+}
+
+// Effects intensity (render/fx_budget.hpp): an event's particle (a hit, a blast, its debris) as the budget wants
+// it. Smoke and dust (alpha-blended puffs) are capped in time - the look up to the cap is the spawned one, then
+// it fades out (FxBudget::capAlpha) - and, as the view gets busy, smaller, thinner and fewer; sparks and debris
+// only get fewer. Flashes, flames and glows are left alone. The thinning hashes a counter, so the effects' own
+// RNG streams (and with them every calm scene) stay exactly as they were.
+bool Effects::budgetSpawn(Particle& p) {
+    const bool puff = p.blend == Blend::Alpha && (p.tex == kSmoke || p.tex == kSoft || p.tex == kFire) && p.len <= 0 && !p.streak;
+    const float level = budget_.level();
+    if (puff || p.tex == kSpark || p.tex == kDebris) {
+        const float keep = budget_.countMul();
+        if (keep < 0.999f && FxBudget::hash01(++thinN_ * 2654435761u) > keep) return false;
+    }
+    if (!puff || p.tex == kFire) {
+        // Fireball flame / soot puffs: only the cap (a soot puff can linger); sizes stay.
+        if (p.tex == kFire && p.blend == Blend::Alpha) {
+            const float cap = budget_.smokeCap();
+            if (cap > 0 && p.life > cap) p.cut = cap;
+        }
+        return true;
+    }
+    const float cap = budget_.smokeCap();
+    if (cap > 0 && p.life > cap) p.cut = cap;
+    if (level > 0) {
+        const float sm = budget_.sizeMul(), am = budget_.alphaMul();
+        p.size0 *= sm;
+        p.size1 *= sm;
+        p.c0 = withAlpha(p.c0, int(float(p.c0 >> 24) * am + 0.5f));
+        p.c1 = withAlpha(p.c1, int(float(p.c1 >> 24) * am + 0.5f));
+    }
+    return true;
 }
 
 std::uint32_t Effects::terrainColour(const game::World& w, const TileAtlas& atlas, float x, float y) const {
@@ -521,19 +610,74 @@ void Effects::emitContinuous(const game::World& w, const TileAtlas& atlas, float
             v.x = x;
             v.y = y;
             if (dt <= 0) continue;
-            if (dist > 48) continue;  // teleport / reused slot
+            if (dist > 48) {  // teleport / reused slot
+                v.trail = 0, v.pend = false, v.angleSet = false;
+                continue;
+            }
             auto approach = [&](float& f, int target) {
                 const float d = wrap32(float(target & 31) - f);
                 f = std::abs(d) > 6 ? float(target & 31) : f + d * ease;
                 if (f < 0) f += 32;
                 if (f >= 32) f -= 32;
             };
-            approach(v.facing, u.facing);
-            approach(v.turret, u.facingTurret);
+            if (const SmoothDrive::Out* d = drive_ ? drive_->out(s, i) : nullptr) {
+                v.facing = d->facing;  // Smooth driving: the drawn path's facings
+                v.turret = d->turret;
+            } else {
+                approach(v.facing, u.facing);
+                approach(v.turret, u.facingTurret);
+            }
             v.moving = dist > 0.02f;
             const bool setOff = v.moving && v.still > 0.6f;  // after standing a while
             v.still = v.moving ? 0.0f : v.still + dt;
             const bool wheels = wheeled_[u.type] != 0;
+            // Track marks: a trail node every 4 px driven or ~7 degrees turned (on the spot too: a scuffed
+            // ring), near the view; on rock / concrete the trail ends and starts afresh on the next sand.
+            if (x >= vx0 - 512 && x <= vx1 + 512 && y >= vy0 - 512 && y <= vy1 + 512) {
+                const float ang = v.facing * (kTau / 32) - kTau / 4;  // drawn hull heading
+                if (!v.angleSet) v.lastAngle = v.nodeAngle = ang, v.angleSet = true;
+                const float dAng = wrapPi(ang - v.lastAngle);
+                v.lastAngle = ang;
+                v.trailOdo += dist;
+                v.trailTurn += dAng;
+                v.treadDist += dist;
+                const bool stepped = v.treadDist >= kTrailStep;
+                const float turned = std::abs(wrapPi(ang - v.nodeAngle));
+                if (stepped || turned >= kTrailTurnStep) {
+                    const bool spin = !stepped && !v.moving;
+                    if (stepped) v.treadDist = std::fmod(v.treadDist, kTrailStep);
+                    v.nodeAngle = ang;
+                    Tread t;
+                    t.x = x, t.y = y, t.angle = ang, t.odo = v.trailOdo, t.turn = v.trailTurn;
+                    t.depth = groundSoftness(w, x, y);
+                    t.type = std::int16_t(u.type);
+                    t.spin = spin;
+                    t.stamp = stepped && t.depth >= 0.999f;
+                    t.wheels = wheels;
+                    if (t.depth <= 0) {
+                        // Hard ground: end the trail with this node, then hold the newest point back.
+                        if (v.trail && !v.pend) {
+                            t.prev = v.trail;
+                            addTread(t);
+                        }
+                        v.trail = 0;
+                        v.pend = true;
+                        v.pendX = x, v.pendY = y, v.pendAngle = ang, v.pendOdo = v.trailOdo, v.pendTurn = v.trailTurn;
+                    } else {
+                        if (!v.trail && v.pend) {  // back on sand: start from the last hard point (depth 0)
+                            Tread p = t;
+                            p.x = v.pendX, p.y = v.pendY, p.angle = v.pendAngle, p.odo = v.pendOdo, p.turn = v.pendTurn;
+                            p.depth = 0, p.spin = false, p.stamp = false, p.prev = 0;
+                            v.trail = addTread(p);
+                        }
+                        v.pend = false;
+                        t.prev = v.trail;
+                        v.trail = addTread(t);
+                    }
+                }
+            } else {
+                v.trail = 0, v.pend = false, v.angleSet = false;
+            }
             if (!inView(x, y) || shrouded(x, y)) continue;
             const int tx = int(x) >> 5, ty = int(y) >> 5;
             const std::uint32_t cf = w.inBounds(tx, ty) ? w.cell(tx, ty).flags : 0;
@@ -569,15 +713,6 @@ void Effects::emitContinuous(const game::World& w, const TileAtlas& atlas, float
             }
             if (v.moving && !concrete) {
                 const float ux = dx / dist, uy = dy / dist;
-                if (!wheels && sand) {
-                    v.treadDist += dist;
-                    while (v.treadDist >= 4) {
-                        v.treadDist -= 4;
-                        const Tread t{x - ux * 6, y - uy * 6, std::atan2(uy, ux), 0};
-                        if (treads_.size() < kMaxTreads) treads_.push_back(t);
-                        else treads_[treadHead_++ % kMaxTreads] = t;
-                    }
-                }
                 v.dustDist += dist;
                 // Sand throws up more dust than rock.
                 const float every = (wheels ? 5.0f : 7.0f) * (sand ? 1.0f : 2.2f);
@@ -839,6 +974,7 @@ void Effects::updateWrecks(const game::World& w, const TileAtlas& atlas, float d
                 n.sand = terrainColour(w, atlas, (n.x0 + n.x1) * 0.5f, n.y1 + 8);
                 wrecks_.push_back(n);
                 k = &wrecks_.back();
+                note(FxEvent::BuildingDeath, w, (n.x0 + n.x1) * 0.5f, (n.y0 + n.y1) * 0.5f, 0, n.lite ? 0.0f : 0.35f + 0.65f * n.big);
             }
             k->seen = true;
         }
@@ -898,7 +1034,8 @@ void Effects::updateWrecks(const game::World& w, const TileAtlas& atlas, float d
             p.size1 = rnd(3, 5) * sz;
             // The same flame tongues as the building fires (render/effects_fire.cpp).
             flameLick(p.x, p.y, 1, std::max(0.3f, sz * 0.75f), 0.3f);
-            if (rnd() < f.smoke) {  // a little smoke (burning wrecks: a column)
+            // (Effects intensity: a burning wreck's column thins out on a busy screen / on Clean.)
+            if (rnd() < f.smoke * (f.smoke > 0.3f ? budget_.columnRate() : 1.0f)) {  // a little smoke (burning wrecks: a column)
                 Particle q = p;
                 q.tex = kSmoke;
                 q.blend = Blend::Alpha;
@@ -913,13 +1050,15 @@ void Effects::updateWrecks(const game::World& w, const TileAtlas& atlas, float d
                 q.c0 = rgba(44, 40, 36, 140);
                 q.c1 = rgba(105, 100, 95, 0);
                 if (f.smoke > 0.3f) {  // a burning wreck: thicker, darker, taller
-                    q.life *= 1.5f;
+                    q.life *= 1.5f * budget_.columnLife();
                     q.size1 *= 1.3f;
                     q.vz *= 1.2f;
                     q.c0 = rgba(30, 28, 26, 165);
                 }
                 q.vrot = rnd(-0.5f, 0.5f);
+                if (recordEvents_) q.fx |= kFxBlast;  // Reimagined: the cinematic particles draw this smoke, lit
                 add(q);
+                if (f.smoke <= 0.3f) note(FxEvent::Smoke, w, q.x, q.y, q.z, 0.6f);  // (a burning wreck: their column)
             }
         }
         lights_.push_back({f.x, f.y - 4, 50 * sz + 14, rgba(255, 120, 40, int(66 * k * (0.8f + 0.2f * std::sin(time_ * 19 + f.x)))), 4});
@@ -1114,6 +1253,7 @@ void Effects::runWreck(Wreck& k, float from, float to, const game::World& w, con
         p.blend = Blend::Alpha;
         p.rot = rnd(0, 6.28f);
         p.vrot = rnd(-0.4f, 0.4f);
+        if (recordEvents_) p.fx |= kFxBlast;  // Reimagined: the cinematic particles draw this smoke, lit
         add(p);
     });
     // Sparks rising from the ruin for a while.
@@ -1152,6 +1292,8 @@ void Effects::buildMarks() {
     bloomMarks();  // spice bloom mounds (under every other mark)
     wormMarks();   // the sand humps of moving worms
     burnMarks();   // soot around burning buildings (render/effects_fire.cpp)
+    dropInMarks(); // drop-in build-up: the shadow under a falling building, the dark sand of its landing
+    assemblyMarks(); // assemble build-up: the survey outline (render/effects_assemble.cpp)
     for (const Wreck& k : wrecks_) {
         const float e = time_ - k.start;
         const float cx = (k.x0 + k.x1) * 0.5f, cy = (k.y0 + k.y1) * 0.5f;
@@ -1397,15 +1539,16 @@ void Effects::buildHaze(std::vector<SDL_Vertex>& v, std::vector<int>& idx, const
 }
 
 void Effects::step(float dt) {
-    for (std::size_t i = 0; i < particles_.size();) {
+    // Dead particles are dropped with the survivors kept in order: the draw order is the spawn order
+    // (2D draws the list as it is; 3D breaks depth ties by it). Moving the last particle into a dead
+    // one's slot (swap-remove) put a fresh puff under older ones from one frame to the next - with
+    // many overlapping smoke puffs dying every frame, the smoke flickered.
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < particles_.size(); ++i) {
         Particle& p = particles_[i];
         const float before = p.age;
         p.age += dt;
-        if (p.age >= p.life) {
-            p = particles_.back();
-            particles_.pop_back();
-            continue;
-        }
+        if (p.age >= p.life || (p.cut > 0 && p.age >= p.cut)) continue;
         if (p.age >= 0) {
             // A delayed particle that starts within this step moves only for the part of the step
             // after its start (a staggered stream stays a stream at low frame rates, not clumps).
@@ -1452,6 +1595,7 @@ void Effects::step(float dt) {
                     q.blend = Blend::Alpha;
                     q.rot = float(i % 7);
                     q.vrot = 0.6f;
+                    q.fx = p.fx & kFxBlast;
                     pending_.push_back(q);
                     q.tex = kFlame;
                     q.blend = Blend::Add;
@@ -1465,11 +1609,24 @@ void Effects::step(float dt) {
                 }
             }
         }
-        ++i;
+        if (keep != i) particles_[keep] = p;
+        ++keep;
     }
-    for (const Particle& q : pending_) add(q);
+    particles_.resize(keep);
+    {
+        EventScope ev(*this);  // landings and trails of thrown debris: transient
+        for (const Particle& q : pending_) add(q);
+    }
     pending_.clear();
     for (auto& t : treads_) t.age += dt;
+}
+
+std::uint32_t Effects::addTread(Tread t) {
+    if (++treadSerial_ == 0) treadSerial_ = 1;  // (wraps after ~4e9 nodes)
+    t.serial = treadSerial_;
+    t.age = 0;
+    treads_[t.serial % treads_.size()] = t;
+    return t.serial;
 }
 
 // A debris chunk hit the ground: a dust puff, and sometimes a small fire that burns on.
@@ -1492,14 +1649,41 @@ void Effects::landed(const Particle& p) {
         d.blend = Blend::Alpha;
         d.rot = rnd(0, 6.28f);
         d.vrot = rnd(-1, 1);
+        d.fx = p.fx & kFxBlast;
         pending_.push_back(d);
     }
     if ((p.fx & kFxLandFire) && fires_.size() < 160) fires_.push_back({p.x, p.y, 0, rnd(2.5f, 6.0f), rnd(0.3f, 0.45f), 0});
 }
 
+void Effects::note(FxEvent::Kind k, const game::World& w, float x, float y, float z, float scale, bool armour) {
+    if (!recordEvents_ || events_.size() >= kMaxEvents) return;
+    const int tx = int(x) >> 5, ty = int(y) >> 5;
+    FxEvent e;
+    e.kind = k;
+    e.x = x;
+    e.y = y;
+    e.z = z;
+    e.scale = scale;
+    e.armour = armour;
+    e.sand = w.inBounds(tx, ty) && (w.cell(tx, ty).flags & game::cell_flags::kSand) != 0;
+    events_.push_back(e);
+}
+
+void Effects::smokeSources(std::vector<SmokeSource>& out) const {
+    out.clear();
+    for (const BurnSite& s : burns_)
+        for (int i = 0; i < s.points; ++i) {
+            const BurnPoint& p = s.pt[i];
+            if (p.heat <= 0.02f) continue;
+            out.push_back({s.gx[i], s.gy[i], s.gz[i], p.heat * (p.flame ? 1.0f : 0.7f), p.seed ^ std::uint32_t(i * 7919)});
+        }
+}
+
 void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, const Camera& cam, int viewW, int viewH,
                      bool showShroud) {
     craterAtlas_ = &atlas;
+    areaK_ = FxBudget::areaK(float(viewW) / cam.zoom, float(viewH) / cam.zoom);
+    events_.clear();
     lights_.clear();
     beams_.clear();  // per-frame strips: projectiles (projectileLook) and sonic ribbons (buildBeams)
     time_ += dt;
@@ -1525,12 +1709,15 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
         return showShroud && w.inBounds(tx, ty) && (w.cell(tx, ty).shroud & 0xF) == 1;
     };
 
+    capColumns(dt, cam, viewW, viewH);
     updateWrecks(w, atlas, dt, cam, viewW, viewH, showShroud);
     updateBlooms(w, atlas, dt, cam, viewW, viewH, showShroud, first);
     updateWorms(w, atlas, dt, cam, viewW, viewH, showShroud);  // (render/effects_events.cpp)
     updateRefineryVents(w, dt, cam, viewW, viewH, showShroud);  // (render/effects_events.cpp)
     updateWeldSparks(w, dt, cam, viewW, viewH, showShroud);     // (render/effects_events.cpp)
     updateBurns(w, dt, cam, viewW, viewH, showShroud);          // (render/effects_fire.cpp)
+    updateDropIns(w, atlas, dt, cam, viewW, viewH, showShroud); // (render/effects_dropin.cpp)
+    updateAssemblies(w, atlas, dt, cam, viewW, viewH, showShroud); // (render/effects_assemble.cpp)
     // The death explosions of a wrecked building (EX_BUILDING, 2 per solid tile) do not shake on
     // their own: the wreck shakes by the building's size.
     auto inWreck = [&](float x, float y) -> const Wreck* {
@@ -1629,7 +1816,7 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
                     spawnWormDust(w, atlas, x, y);
                     continue;
                 }
-                if (c == ExClass::Medium && spiceWeapon_ >= 0 && nearSpiceTarget(x, y)) {
+                if ((c == ExClass::Medium || c == ExClass::Shell) && spiceWeapon_ >= 0 && nearSpiceTarget(x, y)) {
                     // A spice shell of a bursting bloom came down (its hit explosion is EX_TANKGUN):
                     // a splash of spice, not a fireball.
                     spawnSpiceSplash(w, atlas, x, y);
@@ -1644,7 +1831,8 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
                     age = std::clamp(float(e.frame) / float(frames), 0.0f, 1.0f) * 0.6f;
                 }
                 const bool big = c == ExClass::Huge || c == ExClass::Big || c == ExClass::Medium;
-                const float scale = e.type < int(exScale_.size()) ? exScale_[e.type] : 1.0f;
+                float scale = e.type < int(exScale_.size()) ? exScale_[e.type] : 1.0f;
+                if (c == ExClass::Artillery && nearGrenadeTarget(x, y)) scale *= 0.6f;  // a grenade
                 if (wreck && wk->lite) {
                     // A wall (or another small non-repairable structure) breaking: small bursts.
                     spawnExplosion(ExClass::Medium, x + rnd(-4, 4), y + rnd(-4, 4), z + rnd(0, 4), age, cam, viewW, viewH, atlas, w,
@@ -1656,7 +1844,18 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
                     spawnExplosion(ExClass::Big, x + rnd(-4, 4), y + rnd(-4, 4), z + rnd(0, 10), age, cam, viewW, viewH, atlas, w,
                                    crowd(bursts, x, y) && rnd() < 0.6f, side.house, rnd(0.7f, 1.05f), 0.0f);
                 } else {
-                    spawnExplosion(c, x, y, z, age, cam, viewW, viewH, atlas, w, big && crowd(bursts, x, y), side.house, scale, 0.0f);  // no shake: the original shakes only for buildings (owner 2026-11-14)
+                    flyerFlash_ = airCrashes_ && (e.flags & game::explosion_flags::kDrift) != 0;
+                    if (airCrashes_ && !flyerFlash_ && c == ExClass::Whiten) {
+                        // ... or what a carryall carried (destroyed with it, no drift): a dead carried unit there.
+                        for (int ui = side.firstUnit; ui >= 0 && !flyerFlash_; ui = side.nextObject(ui)) {
+                            const game::Unit& cu = side.units[std::size_t(ui)];
+                            flyerFlash_ = cu.alive && cu.state == game::UnitState::Dead && (cu.flags & game::unit_flags::kCarried) &&
+                                          !(cu.flags & game::unit_flags::kFlying) && std::abs(float(cu.posX) / 65536.0f - x) < 2.5f &&
+                                          std::abs(float(cu.posY) / 65536.0f - y) < 2.5f;
+                        }
+                    }
+                    spawnExplosion(c, x, y, z, age, cam, viewW, viewH, atlas, w, big && crowd(bursts, x, y), side.house, scale, 0.0f);
+                    flyerFlash_ = false;  // no shake: the original shakes only for buildings (owner 2026-11-14)
                 }
             }
             if (ss.done) continue;
@@ -1668,9 +1867,9 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
                 const float fade = 1 - 0.7f * std::clamp(float(e.frame) / float(frames), 0.0f, 1.0f);
                 const float sc = e.type < int(exScale_.size()) ? exScale_[e.type] : 1.0f;
                 switch (c) {
-                case ExClass::Huge: lights_.push_back({x, y - z, 170 * sc, rgba(255, 130, 45, int(64 * flick * fade)), z}); break;
-                case ExClass::Big: lights_.push_back({x, y - z, 115 * sc, rgba(255, 130, 45, int(52 * flick * fade)), z}); break;
-                case ExClass::Medium: lights_.push_back({x, y - z, 66 * sc, rgba(255, 150, 60, int(48 * flick * fade)), z}); break;
+                case ExClass::Huge: lights_.push_back({x, y - z, 170 * sc, rgba(255, 130, 45, int(64 * flick * fade)), z, true}); break;
+                case ExClass::Big: lights_.push_back({x, y - z, 115 * sc, rgba(255, 130, 45, int(52 * flick * fade)), z, true}); break;
+                case ExClass::Medium: lights_.push_back({x, y - z, 66 * sc, rgba(255, 150, 60, int(48 * flick * fade)), z, true}); break;
                 case ExClass::Flame: lights_.push_back({x, y - z, 46, rgba(255, 140, 50, int(60 * flick)), z}); break;
                 case ExClass::Spark: lights_.push_back({x, y - z, 30, rgba(120, 255, 150, 90), z}); break;
                 case ExClass::Gas: lights_.push_back({x, y - z, 60, withAlpha(gasBody(side.house), int(40 * flick)), z}); break;
@@ -1785,6 +1984,16 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
             }
             ss.visible = true;
             ss.done = true;  // muzzle flash / tracer: from the shot log (spawnShot)
+            if (recordEvents_ && c != WeaponClass::Gun && c != WeaponClass::Sonic) {  // the cinematic particles
+                FxEvent fe;
+                fe.kind = FxEvent::Projectile;
+                fe.x = x;
+                fe.y = y;
+                fe.z = z;
+                fe.weapon = c;
+                fe.key = std::uint32_t(s) << 16 | std::uint32_t(i);
+                noteEvent(fe);
+            }
             // Trails by distance travelled this frame.
             const float sy = y - z, dist = std::hypot(x - ss.lx, sy - ss.ly);
             if (dt > 0 && dist < 200) ss.acc += dist;
@@ -2079,6 +2288,13 @@ void Effects::update(const game::World& w, const TileAtlas& atlas, float dt, con
     }
     buildBeams();
     if (dt > 0) step(dt);
+    budget_.step(dt, areaK_);  // effects intensity: the busy level (render/fx_budget.hpp)
+    // D2K_FX_BUDGET_LOG=1: the busy level once a second (effect time).
+    static const bool budgetLog = std::getenv("D2K_FX_BUDGET_LOG") != nullptr;
+    if (budgetLog && dt > 0 && int(time_) != int(time_ - dt))
+        SDL_Log("fx budget: t %.0f s, %s, load %.1f x area %.2f, busy %.2f, particles %zu", double(time_),
+                fxIntensityName(budget_.intensity), double(budget_.load), double(areaK_), double(budget_.busy), particles_.size());
+    updateSeeThrough(w, dt);
     // Timed lights: flashes (instant or with a short attack, then a quadratic fade).
     for (std::size_t i = 0; i < flashes_.size();) {
         Flash& f = flashes_[i];
@@ -2178,12 +2394,13 @@ bool Effects::particleLook(const Particle& p, float& size, std::uint32_t& c) {
     c = (p.fx & kFxLateFade) ? withAlpha(p.c0, int(float(p.c0 >> 24) * std::min(1.0f, (1 - t) * 4)))
                              : lerpColour(p.c0, p.c1, (p.fx & kFxHot) ? t * t : t);
     if (p.tex == kSmoke && t < 0.12f) c = withAlpha(c, int(float(c >> 24) * t / 0.12f));
+    if (p.cut > 0 || p.clear > 0) c = withAlpha(c, int(float(c >> 24) * budgetAlpha(p) + 0.5f));
     if (p.blend == Blend::Light) c = premultiplied(c, 1.0f);
     return true;
 }
 
 float Effects::treadAlpha(const Tread& t) {
-    if (t.age >= kTreadLife) return 0;
+    if (t.serial == 0 || t.age >= kTreadLife) return 0;
     const float a = 1 - t.age / kTreadLife;
     return 0.28f * a * a;
 }
@@ -2193,13 +2410,14 @@ std::uint32_t Effects::treadColour() { return rgba(48, 36, 24, 255); }
 std::uint32_t Effects::lightColour(const Light& l) { return premultiplied(l.c, 1.6f); }
 
 void Effects::drawGround(const Camera& cam) {
-    if (treads_.empty()) return;
+    if (treadSerial_ == 0) return;
     const float z = cam.zoom, ox = std::round(cam.x * z), oy = std::round(cam.y * z);
     vGround_.clear();
     for (const auto& t : treads_) {
-        if (t.age >= kTreadLife) continue;
+        // 2D: the tracked vehicles' stamps on sand, a little behind the hull's centre.
+        if (t.serial == 0 || t.age >= kTreadLife || !t.stamp || t.wheels) continue;
         const float a = 1 - t.age / kTreadLife;
-        const float sx = t.x * z - ox, sy = t.y * z - oy;
+        const float sx = (t.x - std::cos(t.angle) * 6) * z - ox, sy = (t.y - std::sin(t.angle) * 6) * z - oy;
         const float px = -std::sin(t.angle) * 5 * z, py = std::cos(t.angle) * 5 * z;
         const std::uint32_t c = rgba(48, 36, 24, 255);
         quad(vGround_, sx + px, sy + py, 2.6f * z, 1.5f * z, t.angle, c, 0.28f * a * a, kSoft);
@@ -2232,6 +2450,7 @@ void Effects::drawAir(const Camera& cam) {
                                                : lerpColour(p.c0, p.c1, (p.fx & kFxHot) ? t * t : t);
         float am = 1;
         if (p.tex == kSmoke && t < 0.12f) am = t / 0.12f;  // soft fade-in for smoke
+        if (p.cut > 0 || p.clear > 0) am *= budgetAlpha(p);  // effects intensity: capped / see-through over units
         // (Glow: over-blended like Alpha, in the same batch so the draw order holds, but not graded.)
         auto& dst = p.blend == Blend::Add ? vAdd_ : p.blend == Blend::Light ? vLight_ : vAlpha_;
         if (p.blend == Blend::Light) c = premultiplied(c, 1.0f);
@@ -2254,8 +2473,10 @@ void Effects::drawAir(const Camera& cam) {
                 dst[k].color.b *= grade_[2];
             }
     };
-    for (const auto& p : beams_) one(p);
-    for (const auto& p : particles_) one(p);
+    if (!hideParticles()) {
+        for (const auto& p : beams_) one(p);
+        for (const auto& p : particles_) one(p);
+    }
     // The light glows: dst * (1 + c) over the picture the time of day already darkened by the grade.
     // A light lights the ground's own colour, so its colour is divided by the grade (as the lamps do,
     // render/scene_lights.cpp) - in up to three passes of at most x2 (vertex colours stop at 1).

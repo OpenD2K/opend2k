@@ -9,7 +9,7 @@
 //
 // Sources, first match wins (0-byte placeholder files are skipped):
 //   1. <data>/../movies/<file>.VQA         (an installed game with the cutscene pack)
-//   2. appMoviesDir()/<file>.VQA           (~/Library/Application Support/d2k-mac/Dune 2000/Movies,
+//   2. appMoviesDir()/<file>.VQA           (~/Library/Application Support/OpenD2K/Dune 2000/Movies,
 //                                           filled by importing a Gruntmods cutscene installer)
 //   3. iPad: the app's Documents and its folders holding *.VQA (documentsMovieDirs(): files put
 //      there with the Files app / Finder)
