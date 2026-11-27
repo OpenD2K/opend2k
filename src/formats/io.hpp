@@ -25,8 +25,16 @@ inline std::string findFileNoCase(const std::string& dir, const std::string& nam
     std::error_code ec;
     if (fs::exists(exact, ec)) return exact.string();
     const std::string want = lower(name);
-    for (const auto& e : fs::directory_iterator(dir, ec))
+    // Directory discovery may probe paths that are missing, inaccessible, or change while
+    // the app is starting (for example, during automatic game-data discovery). Use the
+    // error_code iterator overload for both construction and increment so those paths do
+    // not turn into a filesystem_error and terminate the app.
+    fs::directory_iterator it(dir, ec), end;
+    while (!ec && it != end) {
+        const auto& e = *it;
         if (lower(e.path().filename().string()) == want) return e.path().string();
+        it.increment(ec);
+    }
     return {};
 }
 
